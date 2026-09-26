@@ -108,7 +108,7 @@ opentelemetry-otlp = { version = "0.32.0", features = [
     "grpc-tonic",
     "metrics",
 ] }
-opentelemetry_sdk = { version = "0.32.0", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.33.0", features = ["rt-tokio"] }
 parking_lot = "0.12.5"
 process_control = "5.2.0"
 proptest = "1.7"
