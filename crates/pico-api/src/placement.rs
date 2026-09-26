@@ -797,7 +797,7 @@ mod tests {
         let gate = PlacementGate::new(Arc::clone(&registry));
         gate.report_host(&report, now);
 
-        let mut admit = || {
+        let admit = || {
             gate.admit(
                 "sbx_1",
                 &TenantId::from_string("tnt_1"),
