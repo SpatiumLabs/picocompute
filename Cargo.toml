@@ -104,7 +104,7 @@ nix = { version = "0.31.3", features = [
     "user",
 ] }
 opentelemetry = "0.32.0"
-opentelemetry-otlp = { version = "0.32.0", features = [
+opentelemetry-otlp = { version = "0.33.0", features = [
     "grpc-tonic",
     "metrics",
 ] }
