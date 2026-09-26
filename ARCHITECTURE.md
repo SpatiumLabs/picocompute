@@ -344,6 +344,17 @@ share one filter-score-select engine: constraints evaluate once per
 candidate through a single check function, scores compute once per
 survivor with breakdowns reused for observability, and rejection
 classification derives typed errors from those single-pass rejections.
+Each scheduler instance hardens bursts locally without cross-instance
+coordination: an opt-in power-of-k winner policy samples `k` eligible
+candidates and picks the best of the sample so concurrent bursts diverge
+instead of herding onto one stale-snapshot winner, and an in-flight
+overlay folds that instance's recent placements back into the snapshot
+before filtering and scoring. Overlay entries expire on a TTL matched to
+inventory staleness and release early when an assignment settles, and the
+winner policy plus overlay state ride the placement spans and responses.
+The host keeps final admission authority: boot revalidates assignment,
+fencing, policy epoch, and live capacity, and rejects stale estimates
+with typed errors.
 
 ### 5.2 Lifecycle API
 

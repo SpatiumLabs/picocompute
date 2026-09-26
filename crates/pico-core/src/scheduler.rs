@@ -18,10 +18,14 @@
 //! 3. **Selection** - the highest-scoring cell is chosen; ties are broken
 //!    deterministically by cell ID for reproducibility.
 
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::identity::{CellId, RegionId, TenantId};
+use crate::in_flight::InFlightOverlay;
 use crate::metadata::PlacementInfo;
+use crate::placement_engine::{SelectionDetail, SelectionMode};
 use crate::runtime::RuntimeType;
 
 // ---- Cell Model ----
@@ -686,6 +690,10 @@ pub struct SchedulerResponse {
     pub candidate_scores: Vec<ScoreBreakdown>,
     /// Backpressure signal for the API admission path.
     pub backpressure: BackpressureSignal,
+    /// How the winner was chosen (full best or power-of-k sample).
+    pub selection: SelectionDetail,
+    /// Whether any candidate capacity was adjusted by the in-flight overlay.
+    pub overlay_adjusted: bool,
 }
 
 /// Backpressure signal from the scheduler to the API admission path.
@@ -775,6 +783,12 @@ impl SchedulerError {
 /// a snapshot of cell information at scheduling time and produces a
 /// placement decision. Cell state is managed externally and passed
 /// in on each scheduling call.
+///
+/// Burst hardening is local to each instance: the winner policy
+/// ([`SelectionMode`], default full best) and an [`InFlightOverlay`] of this
+/// instance's recent placements fold unreported load back into the snapshot
+/// before filtering and scoring. Instances never coordinate with each other;
+/// the host keeps final admission authority over stale estimates.
 pub struct RegionalScheduler {
     /// Scoring weights.
     weights: ScoringWeights,
@@ -784,6 +798,12 @@ pub struct RegionalScheduler {
     audit_sink: Option<std::sync::Arc<dyn crate::event_bus::AuditEventSink>>,
     /// HLC generator for event timestamps.
     hlc: std::sync::Arc<crate::identity::Hlc>,
+    /// How the winning cell is chosen from scored survivors.
+    selection: SelectionMode,
+    /// This instance's recent placements, folded into snapshots.
+    overlay: parking_lot::Mutex<InFlightOverlay>,
+    /// Instance RNG for power-of-k sampling (OS-seeded; tests override).
+    rng: parking_lot::Mutex<rand::rngs::SmallRng>,
 }
 
 impl RegionalScheduler {
@@ -794,6 +814,9 @@ impl RegionalScheduler {
             max_admission_pressure: 0.85,
             audit_sink: None,
             hlc: std::sync::Arc::new(crate::identity::Hlc::new()),
+            selection: SelectionMode::Best,
+            overlay: parking_lot::Mutex::new(InFlightOverlay::new()),
+            rng: parking_lot::Mutex::new(rand::make_rng()),
         }
     }
 
@@ -804,6 +827,9 @@ impl RegionalScheduler {
             max_admission_pressure: 0.85,
             audit_sink: None,
             hlc: std::sync::Arc::new(crate::identity::Hlc::new()),
+            selection: SelectionMode::Best,
+            overlay: parking_lot::Mutex::new(InFlightOverlay::new()),
+            rng: parking_lot::Mutex::new(rand::make_rng()),
         }
     }
 
@@ -811,6 +837,70 @@ impl RegionalScheduler {
     pub fn with_max_admission_pressure(mut self, threshold: f64) -> Self {
         self.max_admission_pressure = threshold;
         self
+    }
+
+    /// Sets how the winning cell is chosen from scored survivors.
+    ///
+    /// [`SelectionMode::Best`] keeps full scoring with deterministic
+    /// tie-break. [`SelectionMode::PowerOfK`] samples `k` eligible cells
+    /// and picks the best of the sample to spread bursty placements.
+    pub fn with_selection(mut self, selection: SelectionMode) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    /// Seeds the sampling RNG deterministically (tests).
+    ///
+    /// Production instances keep the OS seed from construction so
+    /// concurrent schedulers diverge instead of herding.
+    pub fn with_sampling_seed(mut self, seed: u64) -> Self {
+        *self.rng.get_mut() = rand::rngs::SmallRng::seed_from_u64(seed);
+        self
+    }
+
+    /// Overrides the in-flight overlay entry lifetime and bound.
+    ///
+    /// A zero bound disables overlay recording, which restores the old
+    /// stale-snapshot herding behavior; prefer the default outside tests
+    /// that pin the pre-overlay baseline.
+    pub fn with_overlay_limits(mut self, ttl_secs: i64, max_entries: usize) -> Self {
+        *self.overlay.get_mut() = InFlightOverlay::with_limits(ttl_secs, max_entries);
+        self
+    }
+
+    /// Drops the in-flight entry for a cell whose assignment settled.
+    ///
+    /// Call when the downstream placement is accepted and reflected in a
+    /// fresh snapshot, or finally rejected, so later decisions stop
+    /// double-counting it ahead of the overlay TTL. Returns true when an
+    /// entry existed.
+    pub fn acknowledge_placement(&self, cell_id: &str) -> bool {
+        self.overlay.lock().release(cell_id)
+    }
+
+    /// Folds this instance's unreported placements into a cell snapshot.
+    fn apply_overlay(
+        cell: &CellInfo,
+        overlay: &InFlightOverlay,
+        now: OffsetDateTime,
+    ) -> (CellInfo, bool) {
+        let Some(reserved) = overlay.reserved_for(cell.cell_id.as_str(), now) else {
+            return (cell.clone(), false);
+        };
+        let mut adjusted = cell.clone();
+        adjusted.capacity.allocated_vcpus = adjusted
+            .capacity
+            .allocated_vcpus
+            .saturating_add(reserved.vcpus);
+        adjusted.capacity.allocated_memory_mb = adjusted
+            .capacity
+            .allocated_memory_mb
+            .saturating_add(reserved.memory_mb);
+        adjusted.capacity.current_sandboxes = adjusted
+            .capacity
+            .current_sandboxes
+            .saturating_add(reserved.count);
+        (adjusted, true)
     }
 
     /// Set an audit event sink for emitting placement outcome events.
@@ -846,9 +936,11 @@ impl RegionalScheduler {
     ///
     /// Constraints are evaluated once per candidate via
     /// [`Self::check_constraints`]; scores are computed once per survivor via
-    /// [`Self::score_cell`] through `place_with_breakdown` (no second pass to
-    /// rebuild breakdowns, no separate headroom recompute).
-    #[tracing::instrument(skip(self, request, cells, context), fields(sandbox_id = %request.sandbox_id, trace_id = tracing::field::Empty))]
+    /// [`Self::score_cell`] through `place_sampled_with_breakdown` (no second
+    /// pass to rebuild breakdowns, no separate headroom recompute). Before
+    /// evaluation, this instance's in-flight overlay folds unreported
+    /// placements into the snapshot; the winner policy then applies.
+    #[tracing::instrument(skip(self, request, cells, context), fields(sandbox_id = %request.sandbox_id, trace_id = tracing::field::Empty, sampled_k = tracing::field::Empty, overlay_adjusted = tracing::field::Empty))]
     pub fn schedule_with_context(
         &self,
         request: &SchedulerRequest,
@@ -860,21 +952,48 @@ impl RegionalScheduler {
         {
             tracing::Span::current().record("trace_id", trace_id.as_str());
         }
+        let sampled_k = match self.selection {
+            SelectionMode::Best => None,
+            SelectionMode::PowerOfK { k } => Some(k),
+        };
         if cells.is_empty() {
+            tracing::Span::current().record("sampled_k", sampled_k);
+            tracing::Span::current().record("overlay_adjusted", false);
             self.emit_outcome_with_context(request, None, "no_cell_available", None, 0, context);
             return Err(SchedulerError::NoCellsAvailable);
         }
 
+        // Fold this instance's recent placements into the snapshot so a
+        // burst spread across consecutive decisions even when the snapshot
+        // does not move. Adjusted rows are scheduler-local; the input slice
+        // is never mutated.
+        let now = OffsetDateTime::now_utc();
+        let overlay = self.overlay.lock();
+        let mut overlay_adjusted = false;
+        let adjusted: Vec<CellInfo> = cells
+            .iter()
+            .map(|cell| {
+                let (row, hit) = Self::apply_overlay(cell, &overlay, now);
+                overlay_adjusted |= hit;
+                row
+            })
+            .collect();
+        drop(overlay);
+
         // Single evaluation point: one constraint check and one scoring pass
         // per candidate. Headroom derives from the stored breakdown.
-        let outcome = crate::placement_engine::place_with_breakdown(
-            cells,
+        let outcome = crate::placement_engine::place_sampled_with_breakdown(
+            &adjusted,
             |cell| self.check_constraints(cell, request),
             |cell| self.score_cell(cell, request),
             Self::headroom_from_breakdown,
             |cell| cell.cell_id.as_str(),
             |breakdown| breakdown.total_score,
+            self.selection,
+            &mut *self.rng.lock(),
         );
+        tracing::Span::current().record("sampled_k", sampled_k);
+        tracing::Span::current().record("overlay_adjusted", overlay_adjusted);
 
         if outcome.selected.is_none() {
             let err = self.classify_rejection(request, &outcome.rejections);
@@ -954,6 +1073,19 @@ impl RegionalScheduler {
             total_cells: backpressure_cached.total_candidates,
             eligible_cells: backpressure_cached.eligible_candidates,
         };
+        let selection = outcome.selection;
+
+        // Record this decision locally so the next decision from this
+        // instance sees the load even when the snapshot has not refreshed.
+        // The host keeps final admission authority; a stale estimate that
+        // slips through fails closed at boot with a typed reason.
+        self.overlay.lock().record(
+            selected_cell.cell_id.as_str(),
+            u64::from(request.vcpus),
+            request.memory_mb,
+            0,
+            now,
+        );
 
         let response = SchedulerResponse {
             scheduled: true,
@@ -963,12 +1095,17 @@ impl RegionalScheduler {
             score_breakdown: Some(best.clone()),
             candidate_scores: scores,
             backpressure,
+            selection,
+            overlay_adjusted,
         };
 
         tracing::info!(
             cell_id = ?response.cell_id,
             reason = ?reason,
             score = best_score,
+            sampled = selection.sampled,
+            sample_size = selection.sample_size,
+            overlay_adjusted = overlay_adjusted,
             "regional placement admitted"
         );
         self.emit_outcome_with_context(
@@ -1520,16 +1657,21 @@ mod tests {
 
     #[test]
     fn schedule_breaks_ties_deterministically_by_cell_id() {
-        let scheduler = RegionalScheduler::new();
+        // Two fresh instances see the same snapshot with no overlay history,
+        // so the tie-break must not depend on input order. (Consecutive
+        // decisions on one instance intentionally diverge via the in-flight
+        // overlay.)
+        let first = RegionalScheduler::new();
+        let second = RegionalScheduler::new();
         let request = make_request();
 
         let cell_a = make_cell("cel_a", "rgn_us-east-1", CellHealth::Healthy);
         let cell_b = make_cell("cel_b", "rgn_us-east-1", CellHealth::Healthy);
 
-        let result1 = scheduler
+        let result1 = first
             .schedule(&request, &[cell_a.clone(), cell_b.clone()])
             .unwrap();
-        let result2 = scheduler.schedule(&request, &[cell_b, cell_a]).unwrap();
+        let result2 = second.schedule(&request, &[cell_b, cell_a]).unwrap();
 
         assert_eq!(result1.cell_id, result2.cell_id);
     }
@@ -1936,6 +2078,12 @@ mod tests {
                 total_cells: 5,
                 eligible_cells: 5,
             },
+            selection: SelectionDetail {
+                sampled: false,
+                sample_size: 5,
+                eligible: 5,
+            },
+            overlay_adjusted: false,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -2370,5 +2518,109 @@ mod tests {
             SnapshotTimingHint::InsufficientData
         );
         assert!((cell.snapshot_timing_hint.as_score() - 0.5).abs() < f64::EPSILON);
+    }
+
+    // ================================================================
+    // Burst hardening: sampling and in-flight overlay
+    // ================================================================
+
+    /// Cells that each fit exactly one request shape, for spread tests.
+    fn make_tight_cell(id: &str) -> CellInfo {
+        let mut cell = make_cell(id, "rgn_us-east-1", CellHealth::Healthy);
+        cell.failure_domain = "fd-shared".into();
+        cell.capacity = CellCapacity {
+            total_vcpus: 2,
+            allocated_vcpus: 0,
+            total_memory_mb: 512,
+            allocated_memory_mb: 0,
+            max_sandboxes: 1,
+            current_sandboxes: 0,
+        };
+        cell
+    }
+
+    #[test]
+    fn default_selection_reports_full_best() {
+        let scheduler = RegionalScheduler::new();
+        let request = make_request();
+        let cells = vec![make_cell("cel_1", "rgn_us-east-1", CellHealth::Healthy)];
+        let response = scheduler.schedule(&request, &cells).unwrap();
+        assert!(!response.selection.sampled);
+        assert_eq!(response.selection.eligible, 1);
+        assert!(!response.overlay_adjusted);
+    }
+
+    #[test]
+    fn sampled_selection_reports_sample_detail() {
+        let scheduler = RegionalScheduler::new()
+            .with_selection(SelectionMode::PowerOfK { k: 1 })
+            .with_sampling_seed(9);
+        let request = make_request();
+        let cells = vec![
+            make_cell("cel_1", "rgn_us-east-1", CellHealth::Healthy),
+            make_cell("cel_2", "rgn_us-east-1", CellHealth::Healthy),
+        ];
+        let response = scheduler.schedule(&request, &cells).unwrap();
+        assert!(response.selection.sampled);
+        assert_eq!(response.selection.sample_size, 1);
+        assert_eq!(response.selection.eligible, 2);
+        assert!(!response.overlay_adjusted);
+    }
+
+    #[test]
+    fn in_flight_overlay_spreads_identical_cells() {
+        let scheduler = RegionalScheduler::new();
+        let request = make_request();
+        let cells = vec![
+            make_tight_cell("cel_1"),
+            make_tight_cell("cel_2"),
+            make_tight_cell("cel_3"),
+        ];
+        // Identical snapshots would herd every decision onto cel_1; the
+        // overlay folds each placement back in, so consecutive decisions
+        // fill each tight cell exactly once.
+        let mut winners = Vec::new();
+        for _ in 0..3 {
+            let response = scheduler.schedule(&request, &cells).unwrap();
+            winners.push(response.cell_id.unwrap().as_str().to_string());
+        }
+        winners.sort();
+        assert_eq!(winners, vec!["cel_1", "cel_2", "cel_3"]);
+        // The fourth placement no longer fits anywhere: typed retryable
+        // shed, not a silent over-admission.
+        let shed = scheduler.schedule(&request, &cells).unwrap_err();
+        assert!(matches!(shed, SchedulerError::InsufficientCapacity { .. }));
+        assert!(shed.is_throttled());
+    }
+
+    #[test]
+    fn acknowledge_placement_releases_overlay() {
+        let scheduler = RegionalScheduler::new();
+        let request = make_request();
+        let cells = vec![make_tight_cell("cel_1")];
+        let first = scheduler.schedule(&request, &cells).unwrap();
+        assert_eq!(first.cell_id.as_ref().unwrap().as_str(), "cel_1");
+        // Overlay now covers the only cell, so the next decision sheds.
+        assert!(scheduler.schedule(&request, &cells).is_err());
+        // Settling the assignment releases the reservation.
+        assert!(scheduler.acknowledge_placement("cel_1"));
+        assert!(!scheduler.acknowledge_placement("cel_1"));
+        let retry = scheduler.schedule(&request, &cells).unwrap();
+        assert_eq!(retry.cell_id.as_ref().unwrap().as_str(), "cel_1");
+    }
+
+    #[test]
+    fn disabled_overlay_restores_herding_baseline() {
+        let scheduler = RegionalScheduler::new().with_overlay_limits(60, 0);
+        let request = make_request();
+        let cells = vec![make_tight_cell("cel_1"), make_tight_cell("cel_2")];
+        // Without the overlay the stale snapshot never moves, so every
+        // decision herds onto the tie-break winner. This pins the baseline
+        // the overlay fixes; production keeps the overlay enabled.
+        for _ in 0..4 {
+            let response = scheduler.schedule(&request, &cells).unwrap();
+            assert_eq!(response.cell_id.as_ref().unwrap().as_str(), "cel_1");
+            assert!(!response.overlay_adjusted);
+        }
     }
 }
