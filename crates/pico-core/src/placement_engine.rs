@@ -16,8 +16,20 @@
 //! callers that already folded headroom into the breakdown ignore the
 //! candidate argument. Legacy [`place`] delegates to [`place_with_breakdown`]
 //! so sort and backpressure logic live once.
+//!
+//! ## Burst selection
+//!
+//! Scoring every candidate and always picking the global best herds bursty
+//! callers onto one candidate when snapshots go stale: identical snapshots
+//! produce identical winners. [`place_sampled_with_breakdown`] adds a
+//! power-of-k-choices option ([`SelectionMode::PowerOfK`]) that samples `k`
+//! eligible candidates uniformly at random and picks the best of the sample.
+//! Sampling only changes which candidate is selected; scoring, sort order,
+//! rejection reporting, and backpressure stay identical to the full path.
 
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 /// Result of a hard-constraint check.
 #[derive(Debug, Clone)]
@@ -88,6 +100,41 @@ pub struct PlacementOutcome<'a, C> {
     pub backpressure: PlacementBackpressure,
 }
 
+/// How the winning candidate is chosen from the scored survivors.
+///
+/// [`SelectionMode::Best`] preserves the historical behavior: score every
+/// eligible candidate and select the global best with deterministic ID
+/// tie-break. [`SelectionMode::PowerOfK`] samples `k` eligible candidates
+/// uniformly at random and selects the best of the sample, which spreads
+/// bursty placements that would otherwise herd onto one winner from a stale
+/// snapshot. Sampling never changes scores, sort order, rejections, or
+/// backpressure; it only changes which candidate is reported as selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SelectionMode {
+    /// Select the global best across all eligible candidates.
+    #[default]
+    Best,
+    /// Sample `k` eligible candidates uniformly and select the best of the
+    /// sample by score with deterministic ID tie-break. `k` clamps to at
+    /// least 1; `k` at or above the eligible count behaves as [`Self::Best`].
+    PowerOfK {
+        /// Number of eligible candidates to sample per decision.
+        k: usize,
+    },
+}
+
+/// Records how a placement winner was chosen, for spans and audit payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionDetail {
+    /// True when the winner came from a strict random subset of eligible.
+    pub sampled: bool,
+    /// Size of the subset the winner was chosen from (`eligible` when the
+    /// full set was considered).
+    pub sample_size: usize,
+    /// Eligible candidates considered for this decision.
+    pub eligible: usize,
+}
+
 /// Outcome of [`place_with_breakdown`] carrying full breakdowns.
 ///
 /// `scored` is sorted by total descending then ID ascending and already
@@ -103,6 +150,8 @@ pub struct PlacementOutcomeWithBreakdown<'a, C, B> {
     pub rejections: Vec<(&'a C, String)>,
     /// Backpressure signal.
     pub backpressure: PlacementBackpressure,
+    /// How the winner was chosen (full best or power-of-k sample).
+    pub selection: SelectionDetail,
 }
 
 /// Execute the filter-score-select placement algorithm.
@@ -171,6 +220,9 @@ where
 /// not by re-evaluating candidate fields. `headroom` receives the candidate
 /// for legacy callers; single-pass schedulers derive headroom from the stored
 /// breakdown and ignore the candidate argument.
+///
+/// Always selects the global best. For burst spreading, use
+/// [`place_sampled_with_breakdown`] with [`SelectionMode::PowerOfK`].
 pub fn place_with_breakdown<'a, C, B, F, S, H, I, T>(
     candidates: &'a [C],
     filter: F,
@@ -186,8 +238,119 @@ where
     I: Fn(&C) -> &str,
     T: Fn(&B) -> f64,
 {
-    let total_candidates = candidates.len();
+    let evaluated = evaluate(candidates, filter, score, id, total);
+    let eligible = evaluated.scored.len();
+    let selected = evaluated.scored.first().map(|s| s.candidate);
+    finish(
+        evaluated,
+        selected,
+        SelectionDetail {
+            sampled: false,
+            sample_size: eligible,
+            eligible,
+        },
+        headroom,
+    )
+}
 
+/// Execute filter-score-select with a selectable winner policy.
+///
+/// Filter, scoring, sort order, rejections, and backpressure are identical to
+/// [`place_with_breakdown`]. Only the winner differs: [`SelectionMode::Best`]
+/// selects the global best, while [`SelectionMode::PowerOfK`] samples `k`
+/// eligible candidates uniformly at random via `rng` and selects the best of
+/// the sample by score with deterministic ID tie-break. Because `scored` is
+/// sorted by exactly that order, the winner is the sampled entry earliest in
+/// `scored`, so tie-break behavior matches the full path restricted to the
+/// sample. Pass a seeded RNG for deterministic tests; pass an OS-seeded RNG
+/// in production so concurrent schedulers diverge instead of herding.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the six-closure single-evaluation engine signature plus winner policy and RNG; bundling the closures would hide the evaluation contract"
+)]
+pub fn place_sampled_with_breakdown<'a, C, B, F, S, H, I, T, R>(
+    candidates: &'a [C],
+    filter: F,
+    score: S,
+    headroom: H,
+    id: I,
+    total: T,
+    mode: SelectionMode,
+    rng: &mut R,
+) -> PlacementOutcomeWithBreakdown<'a, C, B>
+where
+    F: Fn(&C) -> ConstraintResult,
+    S: Fn(&C) -> B,
+    H: Fn(&C, &B) -> f64,
+    I: Fn(&C) -> &str,
+    T: Fn(&B) -> f64,
+    R: rand::Rng + ?Sized,
+{
+    let evaluated = evaluate(candidates, filter, score, id, total);
+    let eligible = evaluated.scored.len();
+    let (selected, selection) = match mode {
+        SelectionMode::Best => (
+            evaluated.scored.first().map(|s| s.candidate),
+            SelectionDetail {
+                sampled: false,
+                sample_size: eligible,
+                eligible,
+            },
+        ),
+        SelectionMode::PowerOfK { k } => {
+            let sample_size = k.max(1).min(eligible);
+            if sample_size >= eligible {
+                (
+                    evaluated.scored.first().map(|s| s.candidate),
+                    SelectionDetail {
+                        sampled: false,
+                        sample_size: eligible,
+                        eligible,
+                    },
+                )
+            } else {
+                // Uniform sample over eligible; `scored` is sorted by the
+                // winner order, so the earliest sampled position wins.
+                let mut earliest = usize::MAX;
+                for position in rand::seq::index::sample(rng, eligible, sample_size).iter() {
+                    earliest = earliest.min(position);
+                }
+                let selected = if earliest == usize::MAX {
+                    None
+                } else {
+                    evaluated.scored.get(earliest).map(|s| s.candidate)
+                };
+                (
+                    selected,
+                    SelectionDetail {
+                        sampled: true,
+                        sample_size,
+                        eligible,
+                    },
+                )
+            }
+        }
+    };
+    finish(evaluated, selected, selection, headroom)
+}
+
+/// Shared filter plus single scoring pass plus deterministic sort.
+///
+/// Both [`place_with_breakdown`] and [`place_sampled_with_breakdown`] run
+/// through this so constraint and scoring logic live once.
+fn evaluate<'a, C, B, F, S, I, T>(
+    candidates: &'a [C],
+    filter: F,
+    score: S,
+    id: I,
+    total: T,
+) -> Evaluated<'a, C, B>
+where
+    F: Fn(&C) -> ConstraintResult,
+    S: Fn(&C) -> B,
+    I: Fn(&C) -> &str,
+    T: Fn(&B) -> f64,
+{
     let mut passed: Vec<&C> = Vec::new();
     let mut rejections: Vec<(&C, String)> = Vec::new();
 
@@ -197,8 +360,6 @@ where
             ConstraintResult::Fail(reason) => rejections.push((candidate, reason)),
         }
     }
-
-    let eligible_candidates = passed.len();
 
     let mut scored: Vec<ScoredWithBreakdown<'a, C, B>> = passed
         .iter()
@@ -220,7 +381,32 @@ where
             .then_with(|| id(a.candidate).cmp(id(b.candidate)))
     });
 
-    let selected = scored.first().map(|s| s.candidate);
+    Evaluated { scored, rejections }
+}
+
+/// Filtered plus scored candidates awaiting winner selection.
+struct Evaluated<'a, C, B> {
+    scored: Vec<ScoredWithBreakdown<'a, C, B>>,
+    rejections: Vec<(&'a C, String)>,
+}
+
+/// Shared backpressure derivation plus outcome assembly.
+///
+/// Backpressure always covers the full eligible set, even when the winner
+/// came from a power-of-k sample, so throttle signals stay comparable
+/// across selection modes.
+fn finish<'a, C, B, H>(
+    evaluated: Evaluated<'a, C, B>,
+    selected: Option<&'a C>,
+    selection: SelectionDetail,
+    headroom: H,
+) -> PlacementOutcomeWithBreakdown<'a, C, B>
+where
+    H: Fn(&C, &B) -> f64,
+{
+    let Evaluated { scored, rejections } = evaluated;
+    let total_candidates = scored.len() + rejections.len();
+    let eligible_candidates = scored.len();
 
     let admission_rate = if total_candidates > 0 {
         eligible_candidates as f64 / total_candidates as f64
@@ -252,6 +438,7 @@ where
             total_candidates,
             eligible_candidates,
         },
+        selection,
     }
 }
 
@@ -287,6 +474,7 @@ pub fn aggregate_rejections(rejections: &[(&impl fmt::Debug, String)]) -> Vec<(S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{SeedableRng, TryRng};
 
     #[derive(Debug, Clone)]
     struct TestCandidate {
@@ -483,5 +671,154 @@ mod tests {
         assert_eq!(outcome.selected.unwrap().id, "c1");
         // Breakdowns travel with the outcome; no rebuild needed.
         assert_eq!(outcome.scored[0].breakdown.total, 100.0);
+    }
+
+    fn sampled_outcome<'a, R>(
+        candidates: &'a [TestCandidate],
+        mode: SelectionMode,
+        rng: &mut R,
+    ) -> PlacementOutcomeWithBreakdown<'a, TestCandidate, f64>
+    where
+        R: rand::Rng + ?Sized,
+    {
+        place_sampled_with_breakdown(
+            candidates,
+            |c| {
+                if c.healthy {
+                    ConstraintResult::Pass
+                } else {
+                    ConstraintResult::Fail("unhealthy".into())
+                }
+            },
+            |c| c.capacity as f64,
+            |_, total| total / 200.0,
+            |c| &c.id,
+            |total| *total,
+            mode,
+            rng,
+        )
+    }
+
+    #[test]
+    fn sampled_best_mode_matches_full_path() {
+        let candidates = make_candidates();
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
+        let outcome = sampled_outcome(&candidates, SelectionMode::Best, &mut rng);
+        assert_eq!(outcome.selected.unwrap().id, "c1");
+        assert_eq!(outcome.scored.len(), 2);
+        assert_eq!(outcome.rejections.len(), 1);
+        assert!(!outcome.selection.sampled);
+        assert_eq!(outcome.selection.sample_size, 2);
+        assert_eq!(outcome.selection.eligible, 2);
+    }
+
+    #[test]
+    fn sampled_power_of_k_covering_eligible_behaves_as_best() {
+        let candidates = make_candidates();
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
+        let outcome = sampled_outcome(&candidates, SelectionMode::PowerOfK { k: 5 }, &mut rng);
+        assert_eq!(outcome.selected.unwrap().id, "c1");
+        assert!(!outcome.selection.sampled);
+        assert_eq!(outcome.selection.sample_size, 2);
+    }
+
+    #[test]
+    fn sampled_power_of_k_is_deterministic_for_seed() {
+        let candidates = make_candidates();
+        let mut first = rand::rngs::SmallRng::seed_from_u64(42);
+        let mut second = rand::rngs::SmallRng::seed_from_u64(42);
+        let a = sampled_outcome(&candidates, SelectionMode::PowerOfK { k: 1 }, &mut first);
+        let b = sampled_outcome(&candidates, SelectionMode::PowerOfK { k: 1 }, &mut second);
+        assert_eq!(
+            a.selected.unwrap().id,
+            b.selected.unwrap().id,
+            "same seed must sample the same winner"
+        );
+        assert!(a.selection.sampled);
+        assert_eq!(a.selection.sample_size, 1);
+        assert_eq!(a.selection.eligible, 2);
+        // Rejections and backpressure match the full path; sampling only
+        // changes the winner.
+        assert_eq!(a.rejections.len(), 1);
+        assert_eq!(
+            a.backpressure.eligible_candidates,
+            b.backpressure.eligible_candidates
+        );
+    }
+
+    /// Fixed-output RNG that pins which sample index wins without depending
+    /// on any real RNG stream. Constant zero always draws the lowest index
+    /// (the global best of the sorted survivors); constant max always draws
+    /// the highest index.
+    struct FixedRng(u64);
+
+    impl TryRng for FixedRng {
+        type Error = core::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.0 as u32)
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(self.0)
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            for chunk in dst.chunks_mut(8) {
+                let bytes = self.0.to_le_bytes();
+                let len = chunk.len().min(bytes.len());
+                chunk.copy_from_slice(&bytes[..len]);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sampled_power_of_k_elects_best_of_sample() {
+        let candidates = make_candidates();
+        // k=1 over two eligible survivors: the stub draws one fixed index,
+        // and the winner is that entry, proving selection follows the
+        // sample rather than always taking the global best.
+        let mut low = FixedRng(0);
+        let first = sampled_outcome(&candidates, SelectionMode::PowerOfK { k: 1 }, &mut low);
+        assert_eq!(first.selected.unwrap().id, "c1");
+        assert!(first.selection.sampled);
+
+        let mut high = FixedRng(u64::MAX);
+        let second = sampled_outcome(&candidates, SelectionMode::PowerOfK { k: 1 }, &mut high);
+        assert_eq!(second.selected.unwrap().id, "c2");
+        assert!(second.selection.sampled);
+        assert_eq!(second.selection.sample_size, 1);
+        assert_eq!(second.selection.eligible, 2);
+    }
+
+    #[test]
+    fn sampled_power_of_k_zero_k_clamps_to_one() {
+        let candidates = make_candidates();
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(3);
+        let outcome = sampled_outcome(&candidates, SelectionMode::PowerOfK { k: 0 }, &mut rng);
+        assert!(outcome.selected.is_some());
+        assert!(outcome.selection.sampled);
+        assert_eq!(outcome.selection.sample_size, 1);
+    }
+
+    #[test]
+    fn sampled_selection_reports_none_without_eligible() {
+        let candidates = make_candidates();
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(3);
+        let outcome = place_sampled_with_breakdown(
+            &candidates,
+            |_| ConstraintResult::Fail("all fail".into()),
+            |c: &TestCandidate| c.capacity as f64,
+            |_: &TestCandidate, _| 0.0,
+            |c| &c.id,
+            |total: &f64| *total,
+            SelectionMode::PowerOfK { k: 2 },
+            &mut rng,
+        );
+        assert!(outcome.selected.is_none());
+        assert!(!outcome.selection.sampled);
+        assert_eq!(outcome.selection.sample_size, 0);
+        assert_eq!(outcome.rejections.len(), 3);
     }
 }

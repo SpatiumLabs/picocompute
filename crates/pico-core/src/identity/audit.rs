@@ -189,6 +189,18 @@ pub enum AuditEventDetails {
         reason: String,
         score: Option<f64>,
         candidates_evaluated: usize,
+        /// Whether the winner came from a power-of-k sample.
+        #[serde(default)]
+        sampled: bool,
+        /// Size of the sampled subset (eligible count when un-sampled).
+        #[serde(default)]
+        sample_size: usize,
+        /// Eligible candidates considered.
+        #[serde(default)]
+        eligible: usize,
+        /// Whether any candidate capacity was adjusted by the in-flight overlay.
+        #[serde(default)]
+        overlay_adjusted: bool,
     },
     /// Runtime operation outcome details.
     RuntimeOutcome {

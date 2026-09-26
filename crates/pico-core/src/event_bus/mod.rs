@@ -71,6 +71,14 @@ pub struct PlacementOutcomeParams {
     pub reason: String,
     pub score: Option<f64>,
     pub candidates_evaluated: usize,
+    /// Whether the winner came from a power-of-k sample.
+    pub sampled: bool,
+    /// Size of the sampled subset (eligible count when un-sampled).
+    pub sample_size: usize,
+    /// Eligible candidates considered.
+    pub eligible: usize,
+    /// Whether any candidate capacity was adjusted by the in-flight overlay.
+    pub overlay_adjusted: bool,
     /// Request trace for create-path correlation. `None` for standalone
     /// scheduler calls that are not on the API create path.
     pub trace_id: Option<String>,
@@ -114,6 +122,10 @@ pub fn emit_placement_outcome(
                 reason: params.reason,
                 score: params.score,
                 candidates_evaluated: params.candidates_evaluated,
+                sampled: params.sampled,
+                sample_size: params.sample_size,
+                eligible: params.eligible,
+                overlay_adjusted: params.overlay_adjusted,
             })
             .build(),
     );
@@ -495,6 +507,10 @@ mod tests {
                 reason: "best_score".into(),
                 score: Some(0.85),
                 candidates_evaluated: 3,
+                sampled: false,
+                sample_size: 3,
+                eligible: 3,
+                overlay_adjusted: false,
             })
             .build();
 

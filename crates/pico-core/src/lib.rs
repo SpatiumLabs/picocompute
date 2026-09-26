@@ -18,6 +18,7 @@ mod fs_retry;
 mod host_quarantine;
 pub mod identity;
 pub mod image_cache;
+pub mod in_flight;
 pub mod lease_token;
 pub mod leases;
 mod lifecycle;
@@ -65,6 +66,9 @@ pub use host_quarantine::{
     AlertCondition, AlertSeverity, AlertStateManager, HostAlert, HostAlertEvaluation,
 };
 pub use identity::*;
+pub use in_flight::{
+    DEFAULT_IN_FLIGHT_MAX_ENTRIES, DEFAULT_IN_FLIGHT_TTL_SECS, InFlightOverlay, InFlightReservation,
+};
 pub use lease_token::*;
 pub use leases::*;
 pub use lifecycle::{
@@ -85,7 +89,8 @@ pub use operator::{
 };
 pub use placement_engine::{
     ConstraintResult, PlacementBackpressure, PlacementOutcome, PlacementOutcomeWithBreakdown,
-    ScoredCandidate, ScoredWithBreakdown, place, place_with_breakdown,
+    ScoredCandidate, ScoredWithBreakdown, SelectionDetail, SelectionMode, place,
+    place_sampled_with_breakdown, place_with_breakdown,
 };
 pub use policy::*;
 pub use quota::*;

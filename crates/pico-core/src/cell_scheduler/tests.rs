@@ -270,16 +270,20 @@ fn schedule_prefers_host_with_more_disk() {
 
 #[test]
 fn schedule_breaks_ties_deterministically_by_host_id() {
-    let scheduler = CellScheduler::new();
+    // Two fresh instances see the same snapshot with no overlay history, so
+    // the tie-break must not depend on input order. (Consecutive decisions
+    // on one instance intentionally diverge via the in-flight overlay.)
+    let first = CellScheduler::new();
+    let second = CellScheduler::new();
     let request = make_request();
 
     let host_a = make_host("hst_a", HostHealth::Healthy);
     let host_b = make_host("hst_b", HostHealth::Healthy);
 
-    let result1 = scheduler
+    let result1 = first
         .schedule(&request, &[host_a.clone(), host_b.clone()])
         .unwrap();
-    let result2 = scheduler.schedule(&request, &[host_b, host_a]).unwrap();
+    let result2 = second.schedule(&request, &[host_b, host_a]).unwrap();
 
     assert_eq!(result1.host_id, result2.host_id);
 }
@@ -1217,6 +1221,12 @@ fn cell_scheduler_response_serializes() {
             rejection_counts: vec![],
             avg_capacity_pressure: 0.15,
         },
+        selection: SelectionDetail {
+            sampled: false,
+            sample_size: 5,
+            eligible: 5,
+        },
+        overlay_adjusted: false,
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -1365,4 +1375,123 @@ fn weights_weight_for_returns_correct_values() {
     assert!((weights.weight_for(HostScoreDimension::Pressure) - 0.20).abs() < f64::EPSILON);
     assert!((weights.weight_for(HostScoreDimension::SandboxSpread) - 0.10).abs() < f64::EPSILON);
     assert!((weights.weight_for(HostScoreDimension::DiskAvailability) - 0.15).abs() < f64::EPSILON);
+}
+
+// ================================================================
+// Burst hardening: sampling and in-flight overlay
+// ================================================================
+
+/// Hosts that each fit exactly two request shapes, for spread tests.
+fn make_tight_host(id: &str) -> HostInfo {
+    let mut host = make_host(id, HostHealth::Healthy);
+    host.capacity = HostCapacity {
+        total_vcpus: 4,
+        allocated_vcpus: 0,
+        total_memory_mb: 1024,
+        allocated_memory_mb: 0,
+        total_disk_mb: 500_000,
+        used_disk_mb: 0,
+        total_network_mbps: 10_000,
+        allocated_network_mbps: 0,
+        max_process_slots: 100,
+        used_process_slots: 0,
+    };
+    host.pressure = HostPressure {
+        in_flight_creates: 0,
+        in_flight_restores: 0,
+        max_concurrent_creates: 10,
+        max_concurrent_restores: 5,
+    };
+    host.current_sandboxes = 0;
+    host
+}
+
+#[test]
+fn default_selection_reports_full_best() {
+    let scheduler = CellScheduler::new();
+    let request = make_request();
+    let hosts = vec![make_tight_host("hst_1")];
+    let response = scheduler.schedule(&request, &hosts).unwrap();
+    assert!(!response.selection.sampled);
+    assert_eq!(response.selection.eligible, 1);
+    assert!(!response.overlay_adjusted);
+}
+
+#[test]
+fn sampled_selection_reports_sample_detail() {
+    let scheduler = CellScheduler::new()
+        .with_selection(SelectionMode::PowerOfK { k: 1 })
+        .with_sampling_seed(9);
+    let request = make_request();
+    let hosts = vec![make_tight_host("hst_1"), make_tight_host("hst_2")];
+    let response = scheduler.schedule(&request, &hosts).unwrap();
+    assert!(response.selection.sampled);
+    assert_eq!(response.selection.sample_size, 1);
+    assert_eq!(response.selection.eligible, 2);
+    assert!(!response.overlay_adjusted);
+}
+
+#[test]
+fn in_flight_overlay_spreads_identical_hosts() {
+    let scheduler = CellScheduler::new();
+    let request = make_request();
+    let hosts = vec![
+        make_tight_host("hst_1"),
+        make_tight_host("hst_2"),
+        make_tight_host("hst_3"),
+    ];
+    // Each tight host fits exactly two requests. Identical snapshots would
+    // herd every decision onto hst_1; the overlay folds each placement back
+    // in, so six consecutive decisions fill every host exactly twice.
+    let mut counts = [0u32; 3];
+    for _ in 0..6 {
+        let response = scheduler.schedule(&request, &hosts).unwrap();
+        match response.host_id.as_ref().unwrap().as_str() {
+            "hst_1" => counts[0] += 1,
+            "hst_2" => counts[1] += 1,
+            "hst_3" => counts[2] += 1,
+            other => panic!("unexpected host {other}"),
+        }
+    }
+    assert_eq!(counts, [2, 2, 2]);
+    // The seventh placement no longer fits anywhere: typed retryable shed,
+    // not a silent over-admission.
+    let shed = scheduler.schedule(&request, &hosts).unwrap_err();
+    assert!(matches!(
+        shed,
+        CellSchedulerError::InsufficientCapacity { .. }
+    ));
+    assert!(shed.is_throttled());
+}
+
+#[test]
+fn acknowledge_placement_releases_overlay() {
+    let scheduler = CellScheduler::new();
+    let request = make_request();
+    let hosts = vec![make_tight_host("hst_1")];
+    for _ in 0..2 {
+        let response = scheduler.schedule(&request, &hosts).unwrap();
+        assert_eq!(response.host_id.as_ref().unwrap().as_str(), "hst_1");
+    }
+    // Overlay now covers the only host, so the next decision sheds.
+    assert!(scheduler.schedule(&request, &hosts).is_err());
+    assert!(scheduler.acknowledge_placement("hst_1"));
+    assert!(!scheduler.acknowledge_placement("hst_1"));
+    let retry = scheduler.schedule(&request, &hosts).unwrap();
+    assert_eq!(retry.host_id.as_ref().unwrap().as_str(), "hst_1");
+}
+
+#[test]
+fn disabled_overlay_restores_herding_baseline() {
+    let scheduler = CellScheduler::new().with_overlay_limits(60, 0);
+    let request = make_request();
+    let hosts = vec![make_tight_host("hst_1"), make_tight_host("hst_2")];
+    // Without the overlay the stale snapshot never moves, so every decision
+    // herds onto the tie-break winner. This pins the baseline the overlay
+    // fixes; production keeps the overlay enabled.
+    for _ in 0..4 {
+        let response = scheduler.schedule(&request, &hosts).unwrap();
+        assert_eq!(response.host_id.as_ref().unwrap().as_str(), "hst_1");
+        assert!(!response.overlay_adjusted);
+    }
 }

@@ -504,6 +504,11 @@ fn scheduler_ramp_matches_advertised_vcpu_packing() {
             Ok(response) => {
                 assert!(response.placed);
                 occupy(&mut host, &req);
+                // The snapshot now reflects the placement, so release the
+                // overlay entry that covered the reporting gap. Without this
+                // acknowledgement the overlay and the refreshed snapshot
+                // would double-count the same load.
+                assert!(scheduler.acknowledge_placement(host.host_id.as_str()));
                 measured += 1;
                 let mut obs = DensityObservation::at_active(measured);
                 obs.advertised_remaining = remaining.saturating_sub(1);

@@ -548,6 +548,20 @@ impl PlacementGate {
         &self.registry
     }
 
+    /// Ingests a host-agent capacity report.
+    ///
+    /// All report ingestion funnels through here: the report refreshes the
+    /// registry snapshot, then releases this gate's overlay entries for the
+    /// reported host and cell, since the fresh snapshot supersedes the
+    /// placements the overlays covered. Writing to the registry directly
+    /// leaves overlay entries live for the full TTL and under-admits until
+    /// they expire.
+    pub fn report_host(&self, report: &HostCapacityReport, now: OffsetDateTime) {
+        self.registry.report_host(report, now);
+        self.cell.acknowledge_placement(&report.host_id);
+        self.regional.acknowledge_placement(&report.cell_id);
+    }
+
     /// Returns the explicit default runtime used when `spec.runtime` is `None`.
     pub fn default_runtime(&self) -> RuntimeType {
         self.default_runtime
@@ -765,6 +779,41 @@ mod tests {
             0,
             "stale host reports must expire after TTL 60s"
         );
+    }
+
+    #[test]
+    fn report_through_gate_releases_overlay_entries() {
+        // A host that fits exactly one request: the first admit records
+        // overlay entries, the second sheds against them, and a fresh report
+        // through the gate releases them so the third admits again. This
+        // pins the report funnel: snapshots that already reflect a placement
+        // must not double-count it until the TTL.
+        let registry = Arc::new(PlacementRegistry::new());
+        let now = OffsetDateTime::now_utc();
+        let mut report = test_report("hst_1", "cel_1");
+        report.capacity.total_vcpus = 2;
+        report.capacity.total_memory_mb = 512;
+        report.capacity.max_process_slots = 1;
+        let gate = PlacementGate::new(Arc::clone(&registry));
+        gate.report_host(&report, now);
+
+        let admit = || {
+            gate.admit(
+                "sbx_1",
+                &TenantId::from_string("tnt_1"),
+                2,
+                512,
+                Some(RuntimeType::Firecracker),
+                "img:1",
+            )
+        };
+        admit().expect("first admit must place");
+        assert!(
+            matches!(admit(), Err(PlacementError::Throttled { .. })),
+            "second admit must shed against the overlay"
+        );
+        gate.report_host(&report, now);
+        admit().expect("fresh report must release the overlay");
     }
 
     #[test]

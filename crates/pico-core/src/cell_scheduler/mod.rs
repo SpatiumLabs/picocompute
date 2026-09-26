@@ -27,10 +27,13 @@ use hashbrown::HashMap;
 use pico_telemetry::metrics::Labels;
 
 use parking_lot::RwLock;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::identity::HostId;
+use crate::in_flight::InFlightOverlay;
+use crate::placement_engine::{SelectionDetail, SelectionMode};
 use crate::runtime::RuntimeType;
 use crate::scheduler::SnapshotTimingHint;
 
@@ -443,6 +446,10 @@ pub struct CellSchedulerResponse {
     pub backpressure: CellBackpressureSignal,
     /// Placement metrics for observability.
     pub metrics: PlacementMetrics,
+    /// How the winner was chosen (full best or power-of-k sample).
+    pub selection: SelectionDetail,
+    /// Whether any candidate capacity was adjusted by the in-flight overlay.
+    pub overlay_adjusted: bool,
 }
 
 /// Backpressure signal from the cell scheduler.
@@ -727,11 +734,23 @@ impl Default for HostInventory {
 /// a snapshot of host information at scheduling time and produces a
 /// placement decision. Host state is managed by [`HostInventory`] and
 /// passed in on each scheduling call.
+///
+/// Burst hardening is local to each instance: the winner policy
+/// ([`SelectionMode`], default full best) and an [`InFlightOverlay`] of this
+/// instance's recent placements fold unreported load back into the snapshot
+/// before filtering and scoring. Instances never coordinate with each other;
+/// the host keeps final admission authority over stale estimates.
 pub struct CellScheduler {
     weights: CellScoringWeights,
     max_pressure: f64,
     audit_sink: Option<std::sync::Arc<dyn crate::event_bus::AuditEventSink>>,
     hlc: std::sync::Arc<crate::identity::Hlc>,
+    /// How the winning host is chosen from scored survivors.
+    selection: SelectionMode,
+    /// This instance's recent placements, folded into snapshots.
+    overlay: parking_lot::Mutex<InFlightOverlay>,
+    /// Instance RNG for power-of-k sampling (OS-seeded; tests override).
+    rng: parking_lot::Mutex<rand::rngs::SmallRng>,
 }
 
 impl CellScheduler {
@@ -742,6 +761,9 @@ impl CellScheduler {
             max_pressure: 0.90,
             audit_sink: None,
             hlc: std::sync::Arc::new(crate::identity::Hlc::new()),
+            selection: SelectionMode::Best,
+            overlay: parking_lot::Mutex::new(InFlightOverlay::new()),
+            rng: parking_lot::Mutex::new(rand::make_rng()),
         }
     }
 
@@ -752,6 +774,9 @@ impl CellScheduler {
             max_pressure: 0.90,
             audit_sink: None,
             hlc: std::sync::Arc::new(crate::identity::Hlc::new()),
+            selection: SelectionMode::Best,
+            overlay: parking_lot::Mutex::new(InFlightOverlay::new()),
+            rng: parking_lot::Mutex::new(rand::make_rng()),
         }
     }
 
@@ -759,6 +784,80 @@ impl CellScheduler {
     pub fn with_max_pressure(mut self, threshold: f64) -> Self {
         self.max_pressure = threshold;
         self
+    }
+
+    /// Sets how the winning host is chosen from scored survivors.
+    ///
+    /// [`SelectionMode::Best`] keeps full scoring with deterministic
+    /// tie-break. [`SelectionMode::PowerOfK`] samples `k` eligible hosts
+    /// and picks the best of the sample to spread bursty placements.
+    pub fn with_selection(mut self, selection: SelectionMode) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    /// Seeds the sampling RNG deterministically (tests).
+    ///
+    /// Production instances keep the OS seed from construction so
+    /// concurrent schedulers diverge instead of herding.
+    pub fn with_sampling_seed(mut self, seed: u64) -> Self {
+        *self.rng.get_mut() = rand::rngs::SmallRng::seed_from_u64(seed);
+        self
+    }
+
+    /// Overrides the in-flight overlay entry lifetime and bound.
+    ///
+    /// A zero bound disables overlay recording, which restores the old
+    /// stale-snapshot herding behavior; prefer the default outside tests
+    /// that pin the pre-overlay baseline.
+    pub fn with_overlay_limits(mut self, ttl_secs: i64, max_entries: usize) -> Self {
+        *self.overlay.get_mut() = InFlightOverlay::with_limits(ttl_secs, max_entries);
+        self
+    }
+
+    /// Drops the in-flight entry for a host whose assignment settled.
+    ///
+    /// Call when the downstream placement is accepted and reflected in a
+    /// fresh snapshot, or finally rejected, so later decisions stop
+    /// double-counting it ahead of the overlay TTL. Returns true when an
+    /// entry existed.
+    pub fn acknowledge_placement(&self, host_id: &str) -> bool {
+        self.overlay.lock().release(host_id)
+    }
+
+    /// Folds this instance's unreported placements into a host snapshot.
+    fn apply_overlay(
+        host: &HostInfo,
+        overlay: &InFlightOverlay,
+        now: OffsetDateTime,
+    ) -> (HostInfo, bool) {
+        let Some(reserved) = overlay.reserved_for(host.host_id.as_str(), now) else {
+            return (host.clone(), false);
+        };
+        let mut adjusted = host.clone();
+        adjusted.capacity.allocated_vcpus = adjusted
+            .capacity
+            .allocated_vcpus
+            .saturating_add(reserved.vcpus);
+        adjusted.capacity.allocated_memory_mb = adjusted
+            .capacity
+            .allocated_memory_mb
+            .saturating_add(reserved.memory_mb);
+        adjusted.capacity.used_disk_mb = adjusted
+            .capacity
+            .used_disk_mb
+            .saturating_add(reserved.disk_mb);
+        adjusted.capacity.used_process_slots = adjusted
+            .capacity
+            .used_process_slots
+            .saturating_add(reserved.count);
+        adjusted.current_sandboxes = adjusted.current_sandboxes.saturating_add(reserved.count);
+        // Create/restore pressure is intentionally left to the reported
+        // snapshot: it measures ops in progress, while the overlay reserves
+        // capacity for placements whose reports have not arrived yet. Folding
+        // reservations into pressure would shed on hosts that already
+        // finished booting but whose reports are still in flight.
+        (adjusted, true)
     }
 
     /// Set an audit event sink for emitting placement outcome events.
@@ -789,8 +888,10 @@ impl CellScheduler {
     /// Carries trace, operation, and idempotency identity into placement
     /// audit events. Rejection reasons stay typed in the error; the audit
     /// event carries the same reason. Emission is best-effort and never
-    /// fails placement.
-    #[tracing::instrument(skip(self, request, hosts, context), fields(sandbox_id = %request.sandbox_id))]
+    /// fails placement. Before evaluation, this instance's in-flight
+    /// overlay folds unreported placements into the snapshot; the winner
+    /// policy then applies.
+    #[tracing::instrument(skip(self, request, hosts, context), fields(sandbox_id = %request.sandbox_id, sampled_k = tracing::field::Empty, overlay_adjusted = tracing::field::Empty))]
     pub fn schedule_with_context(
         &self,
         request: &CellSchedulerRequest,
@@ -798,19 +899,58 @@ impl CellScheduler {
         context: Option<&crate::scheduler::ScheduleTraceContext>,
     ) -> Result<CellSchedulerResponse, CellSchedulerError> {
         let start = OffsetDateTime::now_utc();
+        let sampled_k = match self.selection {
+            SelectionMode::Best => None,
+            SelectionMode::PowerOfK { k } => Some(k),
+        };
 
         if hosts.is_empty() {
-            self.emit_outcome_with_context(request, None, "no_host_available", None, 0, context);
+            tracing::Span::current().record("sampled_k", sampled_k);
+            tracing::Span::current().record("overlay_adjusted", false);
+            self.emit_outcome_with_context(
+                request,
+                None,
+                "no_host_available",
+                None,
+                0,
+                SelectionDetail {
+                    sampled: false,
+                    sample_size: 0,
+                    eligible: 0,
+                },
+                false,
+                context,
+            );
             return Err(CellSchedulerError::NoHostsAvailable);
         }
 
+        // Fold this instance's recent placements into the snapshot so a
+        // burst spreads across consecutive decisions even when the snapshot
+        // does not move. Adjusted rows are scheduler-local; the input slice
+        // is never mutated.
+        let overlay = self.overlay.lock();
+        let mut overlay_adjusted = false;
+        let adjusted: Vec<HostInfo> = hosts
+            .iter()
+            .map(|host| {
+                let (row, hit) = Self::apply_overlay(host, &overlay, start);
+                overlay_adjusted |= hit;
+                row
+            })
+            .collect();
+        drop(overlay);
+
         // Compute max_sandboxes for spread scoring
-        let max_sandboxes = hosts.iter().map(|h| h.current_sandboxes).max().unwrap_or(0);
+        let max_sandboxes = adjusted
+            .iter()
+            .map(|h| h.current_sandboxes)
+            .max()
+            .unwrap_or(0);
 
         // Single evaluation point: one constraint check and one scoring pass
         // per candidate. Headroom derives from the stored breakdown.
-        let outcome = crate::placement_engine::place_with_breakdown(
-            hosts,
+        let outcome = crate::placement_engine::place_sampled_with_breakdown(
+            &adjusted,
             |host| match self.check_hard_constraints(host, request) {
                 Ok(()) => crate::placement_engine::ConstraintResult::Pass,
                 Err(reason) => crate::placement_engine::ConstraintResult::Fail(reason),
@@ -819,7 +959,11 @@ impl CellScheduler {
             Self::headroom_from_breakdown,
             |host| host.host_id.as_str(),
             |breakdown| breakdown.total_score,
+            self.selection,
+            &mut *self.rng.lock(),
         );
+        tracing::Span::current().record("sampled_k", sampled_k);
+        tracing::Span::current().record("overlay_adjusted", overlay_adjusted);
 
         if outcome.selected.is_none() {
             let rejections: Vec<HostRejection> = outcome
@@ -848,6 +992,8 @@ impl CellScheduler {
                 format!("{err:?}"),
                 None,
                 outcome.backpressure.total_candidates,
+                outcome.selection,
+                overlay_adjusted,
                 context,
             );
             return Err(err);
@@ -864,6 +1010,8 @@ impl CellScheduler {
                 format!("{err:?}"),
                 None,
                 outcome.backpressure.total_candidates,
+                outcome.selection,
+                overlay_adjusted,
                 context,
             );
             return Err(err);
@@ -883,6 +1031,8 @@ impl CellScheduler {
                 format!("{err:?}"),
                 None,
                 outcome.backpressure.total_candidates,
+                outcome.selection,
+                overlay_adjusted,
                 context,
             );
             return Err(err);
@@ -928,6 +1078,19 @@ impl CellScheduler {
             rejection_counts,
             avg_capacity_pressure: avg_pressure,
         };
+        let selection = outcome.selection;
+
+        // Record this decision locally so the next decision from this
+        // instance sees the load even when the snapshot has not refreshed.
+        // The host keeps final admission authority; a stale estimate that
+        // slips through fails closed at boot with a typed reason.
+        self.overlay.lock().record(
+            selected_host.host_id.as_str(),
+            u64::from(request.vcpus),
+            request.memory_mb,
+            request.disk_mb,
+            start,
+        );
 
         let response = CellSchedulerResponse {
             placed: true,
@@ -938,6 +1101,8 @@ impl CellScheduler {
             rejections: host_rejections,
             backpressure,
             metrics,
+            selection,
+            overlay_adjusted,
         };
 
         response.metrics.record();
@@ -945,6 +1110,9 @@ impl CellScheduler {
             host_id = ?response.host_id,
             reason = ?reason,
             score = best_score,
+            sampled = selection.sampled,
+            sample_size = selection.sample_size,
+            overlay_adjusted = overlay_adjusted,
             "cell placement admitted"
         );
         self.emit_outcome_with_context(
@@ -953,12 +1121,22 @@ impl CellScheduler {
             format!("{reason:?}"),
             Some(best_score),
             backpressure_cached.eligible_candidates,
+            selection,
+            overlay_adjusted,
             context,
         );
 
         Ok(response)
     }
 
+    /// Emits the placement outcome audit event when a sink is attached.
+    ///
+    /// Carries the winner policy and overlay state so sampled placements
+    /// stay reconstructible from audit alone.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private audit-emission sink; every argument maps to one audit field and bundling would hide the event contract"
+    )]
     fn emit_outcome_with_context(
         &self,
         request: &CellSchedulerRequest,
@@ -966,6 +1144,8 @@ impl CellScheduler {
         reason: impl Into<String>,
         score: Option<f64>,
         candidates_evaluated: usize,
+        selection: SelectionDetail,
+        overlay_adjusted: bool,
         context: Option<&crate::scheduler::ScheduleTraceContext>,
     ) {
         if let Some(ref sink) = self.audit_sink {
@@ -980,6 +1160,10 @@ impl CellScheduler {
                     reason: reason.into(),
                     score,
                     candidates_evaluated,
+                    sampled: selection.sampled,
+                    sample_size: selection.sample_size,
+                    eligible: selection.eligible,
+                    overlay_adjusted,
                     trace_id: context.and_then(|c| c.trace_id.clone()),
                     operation_id: context.and_then(|c| c.operation_id.clone()),
                     idempotency_key: context.and_then(|c| c.idempotency_key.clone()),

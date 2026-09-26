@@ -1390,12 +1390,20 @@ fn regional_scheduler_places_on_healthy_cell_with_evidence() {
             reason,
             score,
             candidates_evaluated,
+            sampled,
+            sample_size,
+            eligible,
+            overlay_adjusted,
         }) => {
             assert!(cell_id.is_some());
             assert!(host_id.is_none(), "regional stage selects cells, not hosts");
             assert!(!reason.is_empty());
             assert!(score.is_some());
             assert_eq!(*candidates_evaluated, 3);
+            assert!(!sampled, "default scheduler takes the full best");
+            assert_eq!(*sample_size, 3);
+            assert_eq!(*eligible, 3);
+            assert!(!overlay_adjusted);
         }
         d => panic!("placement outcome details missing, got {d:?}"),
     }

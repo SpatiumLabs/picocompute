@@ -95,12 +95,12 @@ impl PolicyEnforcingAgent {
     /// Ingests a host-agent capacity report into the placement registry.
     ///
     /// Multi-host deployments call this when a host-agent pushes capacity;
-    /// the report refreshes `HostInventory` with a 60s TTL. No-op when no
-    /// placement gate is attached.
+    /// the report refreshes `HostInventory` with a 60s TTL and releases the
+    /// overlay entries it supersedes. No-op when no placement gate is
+    /// attached.
     pub fn report_capacity(&self, report: &HostCapacityReport) {
         if let Some(ref gate) = self.placement {
-            gate.registry()
-                .report_host(report, time::OffsetDateTime::now_utc());
+            gate.report_host(report, time::OffsetDateTime::now_utc());
         }
     }
 
