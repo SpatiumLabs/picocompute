@@ -1,0 +1,198 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "barWidthFactor": 0.6, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_create_events_total{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",operation=~\"$operation\",workload_class=~\"$workload_class\"}[$__rate_interval])",
+          "legendFormat": "admission - {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_credential_issued_total{region=~\"$region\",cell=~\"$cell\"}[$__rate_interval])",
+          "legendFormat": "credential issued",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_credential_denied_total{region=~\"$region\",cell=~\"$cell\"}[$__rate_interval])",
+          "legendFormat": "credential denied",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_credential_refreshed_total{region=~\"$region\",cell=~\"$cell\"}[$__rate_interval])",
+          "legendFormat": "credential refreshed",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_credential_revoked_total{region=~\"$region\",cell=~\"$cell\"}[$__rate_interval])",
+          "legendFormat": "credential revoked",
+          "refId": "E"
+        }
+      ],
+      "title": "Admission & Auth Rates",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "hideFrom": { "legend": false, "tooltip": false, "viz": false } },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 9 },
+      "id": 2,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, rate(pico_create_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "admission p50",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, rate(pico_create_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "admission p95",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, rate(pico_create_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "admission p99",
+          "refId": "C"
+        }
+      ],
+      "title": "Admission Latency (p50/p95/p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "orange", "value": 0.5 }, { "color": "green", "value": 0.9 }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 9 },
+      "id": 3,
+      "options": { "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "values": false }, "showThresholdLabels": false, "showThresholdMarkers": true, "text": {} },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(pico_credential_issued_total{region=~\"$region\",cell=~\"$cell\"}[$__rate_interval])) / (sum(rate(pico_credential_issued_total{region=~\"$region\",cell=~\"$cell\"}[$__rate_interval])) + sum(rate(pico_credential_denied_total{region=~\"$region\",cell=~\"$cell\"}[$__rate_interval])))",
+          "refId": "A"
+        }
+      ],
+      "title": "Credential Issue Success Rate",
+      "type": "gauge"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["owner:sre-team", "runbook:docs/runbooks/control-plane.md"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values(region)",
+        "includeAll": true,
+        "label": "Region",
+        "multi": true,
+        "name": "region",
+        "query": { "query": "label_values(region)", "refId": "StandardVariableQuery" },
+        "refresh": 1,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values({region=~\"$region\"}, cell)",
+        "includeAll": true,
+        "label": "Cell",
+        "multi": true,
+        "name": "cell",
+        "query": { "query": "label_values({region=~\"$region\"}, cell)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values({region=~\"$region\"}, backend)",
+        "includeAll": true,
+        "label": "Backend",
+        "multi": true,
+        "name": "backend",
+        "query": { "query": "label_values({region=~\"$region\"}, backend)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values({region=~\"$region\"}, operation)",
+        "includeAll": true,
+        "label": "Operation",
+        "multi": true,
+        "name": "operation",
+        "query": { "query": "label_values({region=~\"$region\"}, operation)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values({region=~\"$region\"}, workload_class)",
+        "includeAll": true,
+        "label": "Workload Class",
+        "multi": true,
+        "name": "workload_class",
+        "query": { "query": "label_values({region=~\"$region\"}, workload_class)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "PicoCompute - Control Plane",
+  "uid": "pico-control-plane",
+  "version": 1,
+  "weekStart": ""
+}

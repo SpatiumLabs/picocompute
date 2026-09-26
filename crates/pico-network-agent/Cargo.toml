@@ -1,0 +1,49 @@
+[package]
+name = "pico-network-agent"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Per-sandbox TAP, veth, namespace, route, and cleanup provisioning"
+build = "build.rs"
+
+[features]
+default = []
+ebpf-networking = []
+
+[dependencies]
+pico-core = { workspace = true }
+pico-seccomp = { workspace = true }
+pico-telemetry = { workspace = true }
+chrono = { workspace = true }
+hashbrown = { workspace = true }
+heapless = { workspace = true }
+hickory-proto = { workspace = true }
+hickory-resolver = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.14.0", optional = true }
+netlink-packet-route = "0.33.0"
+nix = { workspace = true }
+rtnetlink = { version = "0.23.0", default-features = false, features = [
+    "tokio_socket",
+] }
+rustix = { workspace = true }
+tun = "0.8.14"
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[[bench]]
+harness = false
+name = "ebpf_benchmark"
+required-features = ["ebpf-networking"]

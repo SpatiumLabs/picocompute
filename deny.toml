@@ -1,0 +1,113 @@
+# cargo-deny dependency policy for PicoCompute.
+#
+# Owner: Security. Review: 2027-01-01 or on new critical/high advisory.
+# See docs/security/dependency-policy.md for exception register and runbook.
+# Advisory DB source is pinned below and refreshed on every CI run.
+
+[graph]
+# Check the full workspace graph with all features so feature-gated
+# dependencies (e.g. pico-core/secrets-http) are also covered.
+all-features = true
+
+[advisories]
+# Pinned RustSec advisory source. CI fetches fresh on every run
+# (refreshable); pinning the URL prevents silent source substitution.
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# Fail on yanked crates; no yanked crates are in the current graph.
+yanked = "deny"
+# Fail on unmaintained and unsound advisories, including transitive deps.
+# Transitive-only coverage is intentional: most PicoCompute advisories arrive
+# via pingora, hickory, and sqlx dependency trees.
+unmaintained = "all"
+unsound = "all"
+# Warn (do not fail) when an ignore entry no longer matches, so stale
+# exceptions are visible but do not block unrelated PRs.
+unused-ignored-advisory = "warn"
+ignore = [
+    # RUSTSEC-2024-0388: `derivative` 2.2.0 is unmaintained with no safe upgrade.
+    # Transitive via: pico-edge -> pingora-core 0.9.0 -> derivative 2.2.0.
+    # Justification: no upstream fix available; pingora has not migrated.
+    # Owner: Security. Next review: 2027-01-01.
+    { id = "RUSTSEC-2024-0388", reason = "unmaintained transitive via pingora-core, no safe upgrade available" },
+    # RUSTSEC-2023-0071: `rsa` 0.9.10 (optional unused transitive of ssh-key).
+    # Parity with .cargo/audit.toml. Currently not in the resolved deny graph,
+    # kept so a future feature resolution re-enables the exception.
+    # Owner: Security. Next review: 2027-01-01.
+    { id = "RUSTSEC-2023-0071", reason = "parity with cargo-audit policy, unused transitive of ssh-key" },
+    # RUSTSEC-2024-0437: `protobuf` 2.x crash via uncontrolled recursion.
+    # Parity with .cargo/audit.toml. Pingora requires prometheus ^0.13 which
+    # pins protobuf 2.x; used only for internal metrics, not untrusted input.
+    # Owner: Security. Next review: 2027-01-01.
+    { id = "RUSTSEC-2024-0437", reason = "parity with cargo-audit policy, pingora prometheus pin, metrics-only use" },
+]
+
+[licenses]
+# Allow-list is intentionally permissive-only. Copyleft (GPL/AGPL/LGPL/GFDL)
+# is denied by omission. r-efi declares MIT OR Apache-2.0 OR LGPL-2.1-or-later
+# and satisfies the check via MIT/Apache-2.0 without allowing LGPL globally.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "BSD-1-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "0BSD",
+    "MIT-0",
+    "CC0-1.0",
+    "Unlicense",
+    "Zlib",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "WTFPL",
+]
+confidence-threshold = 0.8
+unused-allowed-license = "warn"
+# Per-crate exceptions for licenses that are acceptable only in narrow scope.
+# Currently empty: every allowed license above is accepted workspace-wide.
+# WTFPL is allowed globally because `tun` 0.8.14 (direct dependency of
+# pico-network-agent for TAP provisioning) is WTFPL-only. If `tun` is
+# replaced, move WTFPL to a per-crate exception or remove it.
+# Owner: Security. Next review: 2027-01-01.
+exceptions = []
+
+[licenses.private]
+# Workspace crates declare MIT via workspace.package.license and are checked.
+# This ignores only unpublished private crates if any are added later.
+ignore = true
+
+[bans]
+# 43 duplicate versions exist in the current graph (hashbrown x5, syn x3,
+# rand/getrandom/rand_core/windows-sys x3, plus 30+ x2 from pingora/hickory
+# transitive trees). Set to warn so the gate is informative without blocking
+# on upstream-only duplicates. Do not promote to deny until duplicates are
+# triaged. Owner: Security. Next review: 2027-01-01.
+multiple-versions = "warn"
+# Wildcard version requirements are denied to keep resolution reproducible.
+# Path dependencies between private workspace crates are allowed: all
+# pico-* crates set publish = false and use workspace inheritance.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+    # AGENTS.md security rule: do not use openssl/openssl-sys, use boring,
+    # ring, or rustls instead. Enforced here so a PR adding either fails CI.
+    # Owner: Security. Next review: 2027-01-01.
+    { crate = "openssl", reason = "banned by security policy, use rustls/ring/boring instead" },
+    { crate = "openssl-sys", reason = "banned by security policy, use rustls/ring/boring instead" },
+]
+# Duplicate-version skip list. Empty: duplicates currently warn, no skips needed.
+# Add time-bound skips here with reason when promoting multiple-versions to deny.
+skip = []
+
+[sources]
+# Only crates.io is allowed. No git or alternate registry sources are in use.
+# Unknown registries and git sources fail the check.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

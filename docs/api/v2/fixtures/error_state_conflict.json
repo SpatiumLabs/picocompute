@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "state_conflict",
+    "message": "Sandbox must be Running to exec (current state: Suspended)",
+    "details": {
+      "current_state": "Suspended",
+      "required_states": ["Running"]
+    },
+    "request_id": "req_01JXYZ123456789"
+  }
+}

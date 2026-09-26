@@ -1,0 +1,334 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    { "title": "Snapshot & Fork", "url": "/d/pico-snapshot-fork", "type": "dashboards" },
+    { "title": "Host Health", "url": "/d/pico-host-health", "type": "dashboards" },
+    { "title": "SLO & Error Budget", "url": "/d/pico-slo-error-budget", "type": "dashboards" }
+  ],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "barWidthFactor": 0.6, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "legend": { "calcs": [], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_boot_events_total{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",operation=~\"$operation\",workload_class=~\"$workload_class\"}[$__rate_interval])",
+          "legendFormat": "boot",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_create_events_total{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",operation=~\"$operation\",workload_class=~\"$workload_class\"}[$__rate_interval])",
+          "legendFormat": "create",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_prepare_events_total{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",operation=~\"$operation\",workload_class=~\"$workload_class\"}[$__rate_interval])",
+          "legendFormat": "prepare",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_destroy_events_total{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",operation=~\"$operation\",workload_class=~\"$workload_class\"}[$__rate_interval])",
+          "legendFormat": "destroy",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_fork_events_total{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",operation=~\"$operation\",workload_class=~\"$workload_class\"}[$__rate_interval])",
+          "legendFormat": "fork",
+          "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_exec_events_total{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",operation=~\"$operation\",workload_class=~\"$workload_class\"}[$__rate_interval])",
+          "legendFormat": "exec",
+          "refId": "F"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(pico_quiesce_events_total{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",operation=~\"$operation\",workload_class=~\"$workload_class\"}[$__rate_interval])",
+          "legendFormat": "quiesce",
+          "refId": "G"
+        }
+      ],
+      "title": "Operation Volume by Phase",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "hideFrom": { "legend": false, "tooltip": false, "viz": false } },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 9 },
+      "id": 2,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, rate(pico_boot_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "boot p50",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, rate(pico_boot_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "boot p95",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, rate(pico_boot_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "boot p99",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, rate(pico_prepare_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "prepare p50",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, rate(pico_prepare_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "prepare p95",
+          "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, rate(pico_prepare_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "prepare p99",
+          "refId": "F"
+        }
+      ],
+      "title": "Boot & Prepare Latency (p50/p95/p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "hideFrom": { "legend": false, "tooltip": false, "viz": false } },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 9 },
+      "id": 3,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, rate(pico_fork_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "fork p50",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, rate(pico_fork_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "fork p95",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, rate(pico_fork_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "fork p99",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, rate(pico_destroy_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "destroy p50",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, rate(pico_destroy_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "destroy p95",
+          "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, rate(pico_destroy_latency_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "destroy p99",
+          "refId": "F"
+        }
+      ],
+      "title": "Fork & Destroy Latency (p50/p95/p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "hideFrom": { "legend": false, "tooltip": false, "viz": false } },
+          "mappings": [],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "id": 4,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, rate(pico_exec_duration_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "exec p50",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, rate(pico_exec_duration_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "exec p95",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, rate(pico_exec_duration_seconds_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "exec p99",
+          "refId": "C"
+        }
+      ],
+      "title": "Exec Duration (p50/p95/p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "hideFrom": { "legend": false, "tooltip": false, "viz": false } },
+          "mappings": [],
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "id": 5,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, rate(pico_exec_output_bytes_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "output p50",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, rate(pico_exec_output_bytes_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "output p95",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, rate(pico_exec_output_bytes_bucket{region=~\"$region\",cell=~\"$cell\",backend=~\"$backend\",workload_class=~\"$workload_class\"}[$__rate_interval]))",
+          "legendFormat": "output p99",
+          "refId": "C"
+        }
+      ],
+      "title": "Exec Output Bytes (p50/p95/p99)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["owner:sre-team", "runbook:docs/runbooks/lifecycle-operations.md"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values(region)",
+        "includeAll": true,
+        "label": "Region",
+        "multi": true,
+        "name": "region",
+        "query": { "query": "label_values(region)", "refId": "StandardVariableQuery" },
+        "refresh": 1,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values({region=~\"$region\"}, cell)",
+        "includeAll": true,
+        "label": "Cell",
+        "multi": true,
+        "name": "cell",
+        "query": { "query": "label_values({region=~\"$region\"}, cell)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values({region=~\"$region\"}, backend)",
+        "includeAll": true,
+        "label": "Backend",
+        "multi": true,
+        "name": "backend",
+        "query": { "query": "label_values({region=~\"$region\"}, backend)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values({region=~\"$region\"}, operation)",
+        "includeAll": true,
+        "label": "Operation",
+        "multi": true,
+        "name": "operation",
+        "query": { "query": "label_values({region=~\"$region\"}, operation)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values({region=~\"$region\"}, workload_class)",
+        "includeAll": true,
+        "label": "Workload Class",
+        "multi": true,
+        "name": "workload_class",
+        "query": { "query": "label_values({region=~\"$region\"}, workload_class)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "PicoCompute - Lifecycle Operations",
+  "uid": "pico-lifecycle-operations",
+  "version": 1,
+  "weekStart": ""
+}

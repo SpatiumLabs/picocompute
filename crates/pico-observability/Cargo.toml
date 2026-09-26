@@ -1,0 +1,26 @@
+[package]
+name = "pico-observability"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Userspace eBPF loader for per-sandbox CPU profiling and I/O observability"
+
+[package.metadata.cargo-udeps.ignore]
+normal = ["pico-core", "pico-telemetry"]
+
+[dependencies]
+pico-core = { workspace = true }
+pico-telemetry = { workspace = true }
+hashbrown = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.14.0"
+num_cpus = "1.17"
+
+[build-dependencies]
+pico-core = { workspace = true }

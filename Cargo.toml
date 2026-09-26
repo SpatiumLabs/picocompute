@@ -1,0 +1,177 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pico-api",
+    "crates/pico-cli",
+    "crates/pico-core",
+    "crates/pico-edge",
+    "crates/pico-guest-agent",
+    "crates/pico-guest-protocol",
+    "crates/pico-host-agent",
+    "crates/pico-image",
+    "crates/pico-network-agent",
+    "crates/pico-observability",
+    "crates/pico-runtime",
+    "crates/pico-runtime-hardening",
+    "crates/pico-sandboxd",
+    "crates/pico-sandboxd-proto",
+    "crates/pico-seccomp",
+    "crates/pico-telemetry",
+]
+exclude = [
+    "crates/pico-network-agent-ebpf",
+    "crates/pico-observability-ebpf",
+    "crates/pico-runtime-hardening-ebpf",
+    "crates/pico-snapshot-ebpf",
+    "fuzz",
+]
+default-members = [
+    "crates/pico-api",
+    "crates/pico-cli",
+    "crates/pico-core",
+    "crates/pico-edge",
+    "crates/pico-guest-agent",
+    "crates/pico-guest-protocol",
+    "crates/pico-host-agent",
+    "crates/pico-image",
+    "crates/pico-network-agent",
+    "crates/pico-observability",
+    "crates/pico-runtime",
+    "crates/pico-runtime-hardening",
+    "crates/pico-sandboxd",
+    "crates/pico-sandboxd-proto",
+    "crates/pico-seccomp",
+    "crates/pico-telemetry",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "A secure, low-latency sandbox execution platform for agentic workloads"
+
+[workspace.dependencies]
+aes-gcm = "0.11.1"
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.23.1"
+blake3 = "1.8.7"
+camino = "1.2.6"
+
+# Interdependencies
+pico-api = { path = "crates/pico-api" }
+pico-core = { path = "crates/pico-core" }
+pico-edge = { path = "crates/pico-edge" }
+pico-guest-agent = { path = "crates/pico-guest-agent" }
+pico-guest-protocol = { path = "crates/pico-guest-protocol" }
+pico-host-agent = { path = "crates/pico-host-agent" }
+pico-image = { path = "crates/pico-image" }
+pico-network-agent = { path = "crates/pico-network-agent" }
+pico-observability = { path = "crates/pico-observability" }
+pico-runtime = { path = "crates/pico-runtime" }
+pico-runtime-hardening = { path = "crates/pico-runtime-hardening" }
+pico-sandboxd = { path = "crates/pico-sandboxd" }
+pico-sandboxd-proto = { path = "crates/pico-sandboxd-proto" }
+pico-seccomp = { path = "crates/pico-seccomp" }
+pico-telemetry = { path = "crates/pico-telemetry" }
+
+cedar-policy = "4.13.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive"] }
+ed25519-dalek = "3.0.0"
+futures-util = "0.3.34"
+hashbrown = { version = "0.17.1", features = ["serde"] }
+heapless = { version = "0.9.3", features = ["serde"] }
+hickory-proto = "0.26.3"
+hickory-resolver = { version = "0.26.3", default-features = false, features = [
+    "system-config",
+    "tls-ring",
+    "tokio",
+] }
+hickory-server = { version = "0.26.3", default-features = false, features = [
+    "resolver",
+] }
+http = "1.5.0"
+libc = "0.2.189"
+metrics = "0.24.6"
+nix = { version = "0.31.3", features = [
+    "net",
+    "process",
+    "resource",
+    "sched",
+    "user",
+] }
+opentelemetry = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", features = [
+    "grpc-tonic",
+    "metrics",
+] }
+opentelemetry_sdk = { version = "0.32.0", features = ["rt-tokio"] }
+parking_lot = "0.12.5"
+process_control = "5.2.0"
+proptest = "1.7"
+prost = "0.14.4"
+prost-build = "0.14.4"
+prost-types = "0.14.4"
+rand = "0.10.2"
+reqwest = { version = "0.13.5", features = ["json", "rustls"] }
+rustix = { version = "1.1.5", features = ["mount", "thread"] }
+rustls = { version = "0.23.45" }
+rustls-native-certs = "0.8.4"
+seccompiler = { version = "0.5.0", features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+smallvec = "1.16.0"
+sqlx = { version = "0.9", features = [
+    "chrono",
+    "postgres",
+    "runtime-tokio",
+    "sqlite",
+    "tls-rustls",
+    "uuid",
+] }
+ssh-key = { version = "0.6.7", features = ["default", "ed25519", "getrandom"] }
+strum = { version = "0.28.0", features = ["derive"] }
+subtle = "2.6.1"
+sys-info = "0.9.1"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+time = { version = "0.3.55", features = [
+    "formatting",
+    "macros",
+    "parsing",
+    "serde",
+] }
+tokio = { version = "1.53.1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tokio-tungstenite = { version = "0.30.0", features = ["__rustls-tls"] }
+tokio-util = "0.7.19"
+tokio-vsock = "0.7.2"
+toml = "1.1.6"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["request-id", "trace", "util"] }
+tracing = "0.1.44"
+tracing-opentelemetry = "0.33.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+ulid = { version = "3.0.0", features = ["serde"] }
+ureq = "3.4.2"
+url = "2.5.8"
+uuid = { version = "1.26.1", features = ["serde", "v4"] }
+zeroize = "1.9.0"

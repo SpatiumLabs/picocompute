@@ -1,0 +1,14 @@
+[advisories]
+# rsa 0.9.10 is an optional (unused) transitive dependency of ssh-key.
+# It is never compiled or linked. No patched version exists as of writing.
+# https://rustsec.org/advisories/RUSTSEC-2023-0071
+#
+# RUSTSEC-2024-0437: protobuf 2.x crash due to uncontrolled recursion.
+# Transitive via: pico-edge -> pingora-core 0.8.1 -> prometheus 0.13.4 -> protobuf 2.28.0.
+# Pingora requires prometheus ^0.13 (incompatible with 0.14.0 which uses protobuf >=3.7.2).
+# protobuf is used only for internal prometheus metrics, not parsing untrusted data.
+# Tracked upstream: https://github.com/stepancheg/rust-protobuf/issues/749
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2024-0437",
+]

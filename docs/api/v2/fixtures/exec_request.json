@@ -1,0 +1,6 @@
+{
+  "command": "python",
+  "args": ["-c", "print('hello world')"],
+  "working_dir": "/home/user",
+  "timeout_secs": 30
+}

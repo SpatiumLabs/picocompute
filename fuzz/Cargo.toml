@@ -1,0 +1,50 @@
+[package]
+name = "pico-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pico-core = { path = "../crates/pico-core" }
+pico-guest-protocol = { path = "../crates/pico-guest-protocol" }
+pico-network-agent = { path = "../crates/pico-network-agent" }
+# Pinned to the workspace versions in the root Cargo.toml; keep these in
+# sync when the workspace upgrades prost, serde_json, or hashbrown so the
+# fuzz harness tests the same code that ships.
+prost = "0.14.4"
+serde_json = "1.0.151"
+hashbrown = "0.17.1"
+
+[[bin]]
+name = "fuzz_framing"
+path = "fuzz_targets/fuzz_framing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_handshake"
+path = "fuzz_targets/fuzz_handshake.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_snapshot_metadata"
+path = "fuzz_targets/fuzz_snapshot_metadata.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_backend_selection"
+path = "fuzz_targets/fuzz_backend_selection.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_network_policy"
+path = "fuzz_targets/fuzz_network_policy.rs"
+test = false
+doc = false

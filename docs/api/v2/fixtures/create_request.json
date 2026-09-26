@@ -1,0 +1,15 @@
+{
+  "runtime": "firecracker",
+  "image": "alpine-linux-6.1",
+  "vcpus": 2,
+  "memory_mb": 512,
+  "idle_timeout_secs": 300,
+  "ports": [8080],
+  "env": {
+    "NODE_ENV": "production"
+  },
+  "labels": {
+    "purpose": "ci-runner",
+    "team": "platform"
+  }
+}

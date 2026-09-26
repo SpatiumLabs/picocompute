@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "validation_error",
+    "message": "memory_mb must be at least 64",
+    "details": [
+      {"field": "memory_mb", "issue": "below_minimum", "minimum": 64, "received": 32}
+    ],
+    "request_id": "req_01JXYZ123456789"
+  }
+}

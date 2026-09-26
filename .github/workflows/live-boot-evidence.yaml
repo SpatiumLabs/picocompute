@@ -1,0 +1,297 @@
+name: Live Boot Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      backends:
+        description: Space-separated backends to walk (subset of firecracker qemu gvisor)
+        required: false
+        default: firecracker qemu gvisor
+      required_backends:
+        description: Backends that must pass for the gate (default firecracker qemu; gVisor stays optional)
+        required: false
+        default: firecracker qemu
+  pull_request:
+    branches: [main]
+    paths:
+      - crates/pico-runtime/src/firecracker/**
+      - crates/pico-runtime/src/qemu/**
+      - crates/pico-runtime/src/gvisor/**
+      - crates/pico-runtime/tests/live_boot.rs
+      - scripts/live-boot-evidence.sh
+      - .github/workflows/live-boot-evidence.yaml
+      - docs/robustness/live-boot-evidence/**
+  push:
+    branches: [main]
+    paths:
+      - crates/pico-runtime/src/firecracker/**
+      - crates/pico-runtime/src/qemu/**
+      - crates/pico-runtime/src/gvisor/**
+      - crates/pico-runtime/tests/live_boot.rs
+      - scripts/live-boot-evidence.sh
+      - .github/workflows/live-boot-evidence.yaml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Runs the live-boot collector on stock GitHub runners and uploads the
+  # per-revision bundle. Stock runners have no /dev/kvm, VMM binaries, or
+  # guest assets, so required walks record status=blocked (exit 2). That is
+  # informational, not a failure: it still attaches host profile, versions,
+  # digests, transport, and source revision to the tested revision.
+  #
+  # Promotion: to gate releases on a passing run, add a self-hosted Linux KVM
+  # runner matching docs/robustness/live-boot-evidence/README.md candidate
+  # profile, change runs-on to that label, and flip the BLOCKED_IS_FAILURE
+  # handling below (or add a second job) so exit 2 fails the workflow.
+  live-boot-evidence:
+    name: Live boot (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        uses: ./.github/actions/install-linux-deps
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml (the action requires an explicit
+        # input); keep both in sync so evidence builds reproduce exactly.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Record host preconditions
+        run: |
+          echo "uname: $(uname -a)"
+          echo "kernel: $(uname -r)"
+          if [ -f /etc/os-release ]; then cat /etc/os-release; fi
+          if [ -e /dev/kvm ]; then echo "kvm: present"; else echo "kvm: MISSING (blocked walks expected)"; fi
+          if [ -e /dev/vhost-vsock ]; then echo "vhost-vsock: present"; else echo "vhost-vsock: MISSING"; fi
+
+      - name: Run live-boot evidence collector
+        id: collect
+        env:
+          LIVE_BOOT_BACKENDS: ${{ inputs.backends || 'firecracker qemu gvisor' }}
+          LIVE_BOOT_REQUIRED_BACKENDS: ${{ inputs.required_backends || 'firecracker qemu' }}
+        run: |
+          set +e
+          scripts/live-boot-evidence.sh
+          RC=$?
+          echo "collector_rc=$RC" >> "$GITHUB_OUTPUT"
+          echo "required_backends=$LIVE_BOOT_REQUIRED_BACKENDS" >> "$GITHUB_OUTPUT"
+          # Exit 0 (required pass) and exit 2 (blocked off candidate host)
+          # both continue to upload + summary. Exit 1 (mock/failed walk)
+          # fails below after artifacts are uploaded.
+          exit 0
+
+      - name: Summarize evidence
+        if: always()
+        run: |
+          OUT_BASE="target/live-boot-evidence"
+          LATEST="$(ls -1dt $OUT_BASE/*/ 2>/dev/null | head -n 1 || true)"
+          echo "## Live-boot evidence" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Revision: \`$GITHUB_SHA\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Collector exit: \`${{ steps.collect.outputs.collector_rc }}\` (0=required pass, 2=blocked off candidate host, 1=mock/failed)" >> $GITHUB_STEP_SUMMARY
+          echo "- Required backends: \`${{ steps.collect.outputs.required_backends }}\`; gVisor is best-effort (trusted fast path only)" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$LATEST" ] && [ -f "$LATEST/summary.json" ]; then
+            echo "- Evidence dir: \`$LATEST\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat "$LATEST/summary.json" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- No summary.json found under $OUT_BASE" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-boot-evidence-${{ matrix.arch }}-${{ github.sha }}
+          path: target/live-boot-evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Gate on mock and failed walks
+        if: always()
+        run: |
+          RC="${{ steps.collect.outputs.collector_rc }}"
+          echo "collector exit: $RC"
+          if [ "$RC" = "1" ]; then
+            echo "Mock conformance failed or a live walk failed; failing the job."
+            exit 1
+          fi
+          echo "Pass (0) or blocked-off-candidate-host (2) both upload evidence without failing this informational job."
+
+  # Live-boot evidence on a KVM-capable host. Stock ubuntu-latest runners
+  # expose /dev/kvm and /dev/vhost-vsock; this job installs the VMMs, builds
+  # (or restores from cache) the guest assets, and runs the required walks
+  # for a real pass. Unlike the informational matrix above, any non-zero
+  # collector exit fails this job.
+  live-boot-kvm:
+    name: Live boot KVM (x86_64)
+    runs-on: ubuntu-latest
+    env:
+      FIRECRACKER_VERSION: 1.17.0
+      KERNEL_VERSION: v6.18
+      ASSET_ROOT: ${{ github.workspace }}/.assets
+      WORK_ROOT: ${{ github.workspace }}/.asset-work
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        uses: ./.github/actions/install-linux-deps
+
+      - name: Install KVM job dependencies
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 bc flex bison libelf-dev dwarves \
+            e2fsprogs musl-tools xz-utils file
+
+      - name: Install Rust toolchain
+        # Pinned to match rust-toolchain.toml (the action requires an explicit
+        # input); keep both in sync so evidence builds reproduce exactly.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: KVM preflight
+        run: |
+          for dev in /dev/kvm /dev/vhost-vsock; do
+            if [ -e "$dev" ]; then
+              echo "$dev: present"
+              sudo chmod 666 "$dev"
+            else
+              echo "$dev: MISSING (failing fast)" >&2
+              exit 1
+            fi
+          done
+          python3 -c "open('/dev/kvm','r+b'); print('kvm-open-ok')"
+          uname -r
+          nproc
+          free -g | head -2
+
+      - name: Install Firecracker
+        run: |
+          mkdir -p "$HOME/pico/vmm"
+          cd "$HOME/pico/vmm"
+          curl -fSL -O "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
+          curl -fSL -O "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz.sha256.txt"
+          sha256sum -c "firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz.sha256.txt"
+          tar -xzf "firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
+          cp "release-v${FIRECRACKER_VERSION}-x86_64/firecracker-v${FIRECRACKER_VERSION}-x86_64" firecracker
+          chmod +x firecracker
+          ./firecracker --version
+
+      - name: Restore guest kernel cache
+        id: kernel-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.assets/kernel
+          key: guest-kernel-x86_64-${{ env.KERNEL_VERSION }}-v2
+
+      - name: Restore guest rootfs cache
+        id: rootfs-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.assets/rootfs.ext4
+          key: guest-rootfs-x86_64-${{ hashFiles('crates/pico-guest-agent/**', 'scripts/guest-init.sh', 'scripts/build-linux-guest-assets.sh') }}
+
+      - name: Build guest kernel
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        env:
+          BUILD_ONLY: kernel
+        run: scripts/build-linux-guest-assets.sh
+
+      - name: Build guest rootfs
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        env:
+          BUILD_ONLY: rootfs
+        run: scripts/build-linux-guest-assets.sh
+
+      - name: Run live-boot evidence collector
+        id: collect
+        env:
+          LIVE_BOOT_BACKENDS: firecracker qemu
+          LIVE_BOOT_REQUIRED_BACKENDS: firecracker qemu
+          PICO_ROOTFS_PATH: ${{ env.ASSET_ROOT }}/rootfs.ext4
+          PICO_FIRECRACKER_KERNEL_PATH: ${{ env.ASSET_ROOT }}/kernel/x86_64/vmlinux
+          PICO_QEMU_KERNEL_PATH: ${{ env.ASSET_ROOT }}/kernel/x86_64/bzImage
+          PICO_QEMU_MODE: production
+          PICO_QEMU_HARDENING_ENABLED: 'false'
+        run: |
+          export PICO_FIRECRACKER_BIN="$HOME/pico/vmm/firecracker"
+          # TAP pre-provisioning (network-agent owns this in production).
+          bash scripts/live-boot-tap-watch.sh &
+          WATCHER_PID=$!
+          set +e
+          scripts/live-boot-evidence.sh
+          RC=$?
+          kill "$WATCHER_PID" 2>/dev/null || true
+          echo "collector_rc=$RC" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Summarize evidence
+        if: always()
+        run: |
+          OUT_BASE="target/live-boot-evidence"
+          LATEST="$(ls -1dt $OUT_BASE/*/ 2>/dev/null | head -n 1 || true)"
+          echo "## Live-boot evidence (KVM)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Revision: \`$GITHUB_SHA\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Collector exit: \`${{ steps.collect.outputs.collector_rc }}\` (0 required here)" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$LATEST" ] && [ -f "$LATEST/summary.json" ]; then
+            echo "- Evidence dir: \`$LATEST\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat "$LATEST/summary.json" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- No summary.json found under $OUT_BASE" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-boot-evidence-kvm-x86_64-${{ github.sha }}
+          path: target/live-boot-evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Gate on collector exit
+        if: always()
+        run: |
+          RC="${{ steps.collect.outputs.collector_rc }}"
+          echo "collector exit: $RC"
+          if [ "$RC" != "0" ]; then
+            echo "KVM evidence run did not pass (mock failure, failed walk, or host without KVM)."
+            exit 1
+          fi

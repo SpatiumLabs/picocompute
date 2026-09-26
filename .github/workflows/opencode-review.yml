@@ -1,0 +1,53 @@
+name: OpenCode AI Reviewer
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26
+
+      - name: Install Open Code Review CLI
+        run: npm install -g @alibaba-group/open-code-review
+
+      - name: Configure Modal Custom Provider & Run Review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODAL_KEY: ${{ secrets.MODAL_PROXY_TOKEN_ID }}
+          MODAL_SECRET: ${{ secrets.MODAL_PROXY_TOKEN_SECRET }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          ocr config set provider modal_backend
+          ocr config set custom_providers.modal_backend.url "https://stridebytes--ep-kimi-k3-server.us-west.modal.direct/v1"
+          ocr config set custom_providers.modal_backend.protocol "openai"
+          ocr config set custom_providers.modal_backend.model "moonshotai/Kimi-K3"
+          ocr config set custom_providers.modal_backend.api_key "unused"
+          # extra_headers is parsed as a comma-separated key=value list, not JSON.
+          ocr config set custom_providers.modal_backend.extra_headers "Modal-Key=${MODAL_KEY},Modal-Secret=${MODAL_SECRET}"
+
+          ocr review \
+            --background "$PR_TITLE" \
+            --from "origin/$BASE_REF" \
+            --to "${{ github.event.pull_request.head.sha }}" \
+            --format json --audience agent

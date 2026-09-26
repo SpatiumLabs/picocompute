@@ -1,0 +1,134 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: pico-x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: pico-aarch64-unknown-linux-gnu
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            artifact: pico-aarch64-apple-darwin
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/install-linux-deps
+
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew trust aws/tap azure/bicep hashicorp/tap
+          brew update
+          brew install cmake protobuf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --package pico-cli --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        run: cp target/${{ matrix.target }}/release/pc ${{ matrix.artifact }}
+
+      - name: Generate checksum (Linux)
+        if: runner.os == 'Linux'
+        run: sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+
+      - name: Generate checksum (macOS)
+        if: runner.os == 'macOS'
+        run: shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pico-*
+          merge-multiple: true
+
+      - name: Stage install script
+        run: |
+          install -m 0755 install.sh install-script
+
+      - name: Generate release body
+        run: |
+          {
+            echo "## Installation"
+            echo ""
+            echo '```sh'
+            echo "curl -fsSL https://github.com/SpatiumLabs/picocompute/releases/latest/download/install-script | sh"
+            echo '```'
+            echo ""
+            echo "Or download the binary directly:"
+            echo ""
+            echo '```sh'
+            echo "# Linux x86_64"
+            echo "chmod +x pico-x86_64-unknown-linux-gnu"
+            echo "sudo mv pico-x86_64-unknown-linux-gnu /usr/local/bin/pc"
+            echo ""
+            echo "# Linux aarch64"
+            echo "chmod +x pico-aarch64-unknown-linux-gnu"
+            echo "sudo mv pico-aarch64-unknown-linux-gnu /usr/local/bin/pc"
+            echo ""
+            echo "# macOS aarch64"
+            echo "chmod +x pico-aarch64-apple-darwin"
+            echo "sudo mv pico-aarch64-apple-darwin /usr/local/bin/pc"
+            echo '```'
+            echo ""
+            echo "## Checksums"
+            echo ""
+            echo '```'
+            cat pico-*.sha256
+            echo '```'
+          } > release-body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: release-body.md
+          files: |
+            pico-*
+            install-script
+          fail_on_unmatched_files: true

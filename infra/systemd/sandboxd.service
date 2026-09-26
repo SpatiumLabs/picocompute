@@ -1,0 +1,30 @@
+[Unit]
+Description=PicoCompute sandboxd (privileged runtime supervisor)
+Documentation=https://github.com/SpatiumLabs/picocompute
+After=network.target
+Requires=network.target
+
+[Service]
+Type=simple
+User=root
+Group=picocompute
+Environment=PICO_SANDBOXD_CONFIG=/etc/pico/sandboxd.toml
+# Set PICO_SANDBOXD_TOKEN via drop-in or EnvironmentFile (never commit secrets).
+EnvironmentFile=-/etc/pico/sandboxd.env
+ExecStart=/usr/local/bin/sandboxd
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+# sandboxd holds runtime backends and guest sessions; do not kill mid-destroy.
+TimeoutStopSec=120
+KillMode=mixed
+
+# Hardening (interim; full capability drop is applied in-process via seccomp).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pico /var/run/pico /run/pico
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[env]
+VM_USER = "your_vm_user"
+VM_HOST = "your_vm_ip"
+VM_INSTALL_PATH = "/home/your_vm_user/.local/bin/pico-agent"
+SKIP_INSTALL = "false"
+PICO_RUNTIME = "remote-firecracker"
+PICO_GUEST_AGENT_ADDR = "your_vm_ip:your_vm_port"
+PICO_REMOTE_SSH_USERNAME = "your_ssh_username"

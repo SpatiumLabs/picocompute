@@ -1,0 +1,219 @@
+syntax = "proto3";
+
+package pico.guest.bootstrap.v1;
+
+// ------------------------------------------------------------------
+// Bootstrap service
+// ------------------------------------------------------------------
+// The bootstrap service is the only service available before
+// version negotiation completes.  It remains additive and backward
+// compatible across operational protocol majors.  An implementation
+// that cannot serve this contract is incompatible with PicoCompute.
+//
+// The handshake establishes a mutually authenticated protocol
+// session bound to one transport connection.  Both sides exchange
+// identity claims, supported version ranges, and capabilities,
+// then prove possession of the per-boot shared secret via HMAC.
+//
+// After a successful handshake the operational services on the
+// negotiated version become available on the same connection.
+// Reconnect always repeats the full handshake.
+//
+// Idempotency: the handshake is idempotent per transport
+// connection.  A new transport always starts with a fresh
+// handshake.
+//
+// Retry: the caller opens a new transport and retries the full
+// handshake.  A failed handshake never leaves session state.
+// ------------------------------------------------------------------
+
+service Bootstrap {
+  // Performs a mutual authentication handshake and negotiates the
+  // operational protocol version and capability set.
+  //
+  // The handshake uses a fixed 4-message exchange over a
+  // bidirectional stream. The host initiates and completes the
+  // exchange. Each side sends exactly one message per round.
+  rpc Handshake(stream HandshakeRequest) returns (stream HandshakeResponse);
+}
+
+// ------------------------------------------------------------------
+// Version and capability types
+// ------------------------------------------------------------------
+
+// A semantic version component.
+message Version {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// An inclusive version range [min, max].
+message VersionRange {
+  Version min = 1;
+  Version max = 2;
+}
+
+// A set of capability identifiers.  Each identifier is a stable
+ // string that names a feature with documented request and response
+ // semantics.  A capability is enabled only when both peers advertise
+ // it.
+message CapabilitySet {
+  repeated string identifiers = 1;
+}
+
+// ------------------------------------------------------------------
+// Identity and proof types
+// ------------------------------------------------------------------
+
+// A 256-bit nonce encoded as 32 raw bytes.  Must never repeat for
+// the same boot secret.
+message Nonce {
+  bytes value = 1;  // exactly 32 bytes
+}
+
+// An HMAC-SHA256 proof over a domain-separated transcript.
+message Proof {
+  bytes value = 1;  // exactly 32 bytes
+}
+
+// A session ID: at least 128 random bits, bound to one connection.
+message SessionId {
+  bytes value = 1;  // at least 16 bytes
+}
+
+// ------------------------------------------------------------------
+// HostHello and GuestHello
+// ------------------------------------------------------------------
+
+// The host opens the transport and sends HostHello with its nonce,
+// expected identities, supported version ranges, and capabilities.
+message HostHello {
+  // Protocol name: "pico.guest"
+  string protocol_name = 1;
+
+  // Host-supported bootstrap version.
+  VersionRange bootstrap_version = 2;
+
+  // Host-supported operational version ranges, ordered by preference
+  // (highest major first).  Each range is an inclusive [min, max].
+  repeated VersionRange supported_versions = 3;
+
+  // Capabilities the host understands.
+  CapabilitySet host_capabilities = 4;
+
+  // Host-generated random nonce.
+  Nonce host_nonce = 5;
+
+  // Expected sandbox identity.
+  string sandbox_id = 6;
+
+  // Expected image identity.
+  string image_id = 7;
+
+  // Expected image manifest digest (hex-encoded SHA-256).
+  string image_digest = 8;
+}
+
+// The guest responds with its identity claims, supported versions,
+// capabilities, and an HMAC proof over the combined transcript.
+message GuestHello {
+  // Guest-supported operational version ranges, ordered by
+  // preference (highest major first).
+  repeated VersionRange supported_versions = 1;
+
+  // Capabilities the guest understands.
+  CapabilitySet guest_capabilities = 2;
+
+  // Guest-generated random nonce.
+  Nonce guest_nonce = 3;
+
+  // Guest-agent build version.
+  string agent_version = 4;
+
+  // Guest boot ID (unique per boot, not the session).
+  string boot_id = 5;
+
+  // Image ID from the running image manifest.
+  string image_id = 6;
+
+  // Image manifest digest that was verified at boot.
+  string image_digest = 7;
+
+  // HMAC proof over the concatenated HostHello + GuestHello
+  // transcript, labelled with the "guest" role.
+  Proof proof = 16;
+}
+
+// ------------------------------------------------------------------
+// Handshake protocol messages
+// ------------------------------------------------------------------
+
+// Wrapper for client-to-server messages in the handshake stream.
+// The host sends exactly one HostHello, then exactly one HostReply.
+message HandshakeRequest {
+  oneof message {
+    HostHello host_hello = 1;
+    HostReply host_reply = 2;
+  }
+}
+
+// Wrapper for server-to-client messages in the handshake stream.
+// The guest sends exactly one GuestHello, then exactly one
+// HandshakeResult.
+message HandshakeResponse {
+  oneof message {
+    GuestHello guest_hello = 1;
+    HandshakeResult result = 2;
+  }
+}
+
+// The terminal outcome of a handshake attempt.
+message HandshakeResult {
+  oneof outcome {
+    // The handshake completed and the operational session is
+    // established.
+    bool established = 1;
+    // The handshake failed with a typed error.
+    HandshakeError error = 2;
+  }
+}
+
+// The host's final message selecting the negotiated version,
+// capability intersection, and providing its HMAC proof.
+message HostReply {
+  // Negotiated operational protocol version.
+  Version selected_version = 1;
+
+  // Intersection of host and guest capabilities.
+  CapabilitySet selected_capabilities = 2;
+
+  // Random session ID bound to this connection.
+  SessionId session_id = 3;
+
+  // The host selects the policy epoch for the session.
+  uint64 policy_epoch = 4;
+
+  // Host HMAC proof over the complete transcript including the
+  // selection, labelled with the "host" role.
+  Proof proof = 16;
+}
+
+// ------------------------------------------------------------------
+// Handshake errors
+// ------------------------------------------------------------------
+
+// A typed error that aborts the handshake.
+message HandshakeError {
+  ErrorCode code = 1;
+  string message = 2;
+
+  enum ErrorCode {
+    ERROR_CODE_UNSPECIFIED = 0;
+    ERROR_CODE_PROTOCOL_MISMATCH = 1;
+    ERROR_CODE_AUTHENTICATION_FAILED = 2;
+    ERROR_CODE_IDENTITY_MISMATCH = 3;
+    ERROR_CODE_VERSION_MISMATCH = 4;
+    ERROR_CODE_CAPABILITY_MISMATCH = 5;
+    ERROR_CODE_INTERNAL = 6;
+  }
+}

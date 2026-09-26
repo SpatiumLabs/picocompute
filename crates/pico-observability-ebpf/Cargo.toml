@@ -1,0 +1,35 @@
+[package]
+name = "pico-observability-ebpf"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "eBPF perf-event and tracepoint probes for per-sandbox CPU profiling and I/O observability"
+
+[features]
+default = ["arch-x86_64"]
+arch-x86_64 = []
+arch-aarch64 = []
+
+[[bin]]
+name = "pico-observability-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+
+[package.metadata.cargo-udeps.ignore]
+development = ["pico-observability-ebpf"]
+
+[profile.dev]
+opt-level = 1
+debug = true
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+panic = "abort"
+strip = "symbols"
+codegen-units = 1

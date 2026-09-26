@@ -1,0 +1,68 @@
+name: Fuzz Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz-long:
+    name: Long Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_framing
+          - fuzz_handshake
+          - fuzz_snapshot_metadata
+          - fuzz_backend_selection
+          - fuzz_network_policy
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux system dependencies
+        uses: ./.github/actions/install-linux-deps
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        working-directory: fuzz
+        run: cargo fuzz build -O
+      - name: Long fuzz run with stored corpus
+        working-directory: fuzz
+        run: |
+          mkdir -p "corpus/${{ matrix.target }}" "artifacts/${{ matrix.target }}"
+          cargo fuzz run "${{ matrix.target }}" -- \
+            -max_total_time=600 \
+            -print_final_stats=1 \
+            "corpus/${{ matrix.target }}" 2>&1 | tee "../fuzz-${{ matrix.target }}.log"
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}/**
+            fuzz-${{ matrix.target }}.log
+          if-no-files-found: ignore
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/**/*
+          if-no-files-found: ignore

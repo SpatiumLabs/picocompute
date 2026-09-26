@@ -1,0 +1,37 @@
+# Nextest configuration for Bitstride workspace
+# https://nexte.st/docs/configuration/
+
+[profile.default]
+# Show all test outcomes (including passed tests)
+final-status-level = "slow"
+# Fail the test run if any test takes longer than 60s
+slow-timeout = "60s"
+# Retry failed tests once (helpful for flaky integration tests)
+retries = 1
+# Number of tests to run simultaneously
+# nextest auto-detects based on CPU cores, but we can override if needed
+# test-threads = "num-cpus"
+
+[profile.ci]
+# More concise output for CI
+final-status-level = "skip"
+# Show progress in CI
+status-level = "fail"
+# Disable retries in CI to surface real failures immediately
+retries = 0
+# Terminate on first failure for faster feedback
+fail-fast = true
+
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = true
+store-failure-output = true
+
+# Some tests may need to run serially (e.g., database tests that modify shared state)
+# Configure test groups if needed
+# [[profile.default.overrides]]
+# filter = 'test(~serial)'
+# test-group = 'serial'
+#
+# [test-groups.serial]
+# max-threads = 1

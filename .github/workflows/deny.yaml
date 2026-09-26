@@ -1,0 +1,51 @@
+name: Dependency Policy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/deny.yaml
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/deny.yaml
+  schedule:
+    - cron: "0 2 * * 0" # Run every sunday at 2AM UTC, matching audit.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deny-${{ github.event_name }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        # Pinned to the version validated in deny.toml header and docs.
+        run: cargo install cargo-deny --locked --version 0.20.2
+
+      - name: Check dependency policy
+        # Fetches the pinned RustSec advisory DB fresh on every run.
+        # Fails on license, advisory, source, or banned-crate violation.
+        run: cargo deny check --hide-inclusion-graph

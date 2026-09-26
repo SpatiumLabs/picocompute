@@ -1,0 +1,23 @@
+name: Install Linux system dependencies
+description: Install Ubuntu packages required to build and test the Rust workspace.
+runs:
+  using: composite
+  steps:
+    - name: Install packages
+      shell: bash
+      run: |
+        sudo apt update
+        sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            libclang-dev \
+            libpq-dev \
+            libprotobuf-dev \
+            libssl-dev \
+            lsb-release \
+            mold \
+            pkg-config \
+            protobuf-compiler \
+            wget

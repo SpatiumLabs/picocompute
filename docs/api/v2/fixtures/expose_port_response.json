@@ -1,0 +1,7 @@
+{
+  "sandbox_id": "sbx_01JXYZABCDEFGH",
+  "guest_port": 8080,
+  "host_port": 32001,
+  "host_address": "127.0.0.1",
+  "request_id": "req_01JXYZ123456789"
+}

@@ -1,0 +1,30 @@
+[package]
+name = "pico-guest-protocol"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Generated protobuf and gRPC bindings for the PicoCompute host-guest control protocol"
+
+[dependencies]
+pico-core = { workspace = true }
+hashbrown = { workspace = true }
+heapless = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+parking_lot = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }

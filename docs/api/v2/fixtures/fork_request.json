@@ -1,0 +1,9 @@
+{
+  "runtime": "firecracker",
+  "image": "alpine-linux-6.1",
+  "source_sandbox_id": "sbx_01JXYZAAAAAAAA",
+  "vcpus": 4,
+  "memory_mb": 1024,
+  "idle_timeout_secs": 600,
+  "ports": [3000]
+}

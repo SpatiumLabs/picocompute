@@ -1,0 +1,647 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: pico-recording-rules
+  namespace: monitoring
+  labels:
+    app: picocompute
+    role: recording-rules
+spec:
+  groups:
+    - name: pico.admission
+      interval: 60s
+      rules:
+        - record: pico:admission:rate5m
+          expr: rate(pico_create_events_total[5m])
+        - record: pico:admission:error_rate5m
+          expr: rate(pico_create_events_total{event="create_failed"}[5m])
+        - record: pico:admission:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_create_latency_seconds_bucket[5m]))
+        - record: pico:admission:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_create_latency_seconds_bucket[5m]))
+        - record: pico:admission:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_create_latency_seconds_bucket[5m]))
+
+    - name: pico.credentials
+      interval: 60s
+      rules:
+        - record: pico:credential:issued:rate5m
+          expr: rate(pico_credential_issued_total[5m])
+        - record: pico:credential:denied:rate5m
+          expr: rate(pico_credential_denied_total[5m])
+        - record: pico:credential:refreshed:rate5m
+          expr: rate(pico_credential_refreshed_total[5m])
+        - record: pico:credential:revoked:rate5m
+          expr: rate(pico_credential_revoked_total[5m])
+
+    - name: pico.lifecycle
+      interval: 60s
+      rules:
+        - record: pico:boot:rate5m
+          expr: rate(pico_boot_events_total[5m])
+        - record: pico:prepare:rate5m
+          expr: rate(pico_prepare_events_total[5m])
+        - record: pico:destroy:rate5m
+          expr: rate(pico_destroy_events_total[5m])
+        - record: pico:fork:rate5m
+          expr: rate(pico_fork_events_total[5m])
+        - record: pico:exec:rate5m
+          expr: rate(pico_exec_events_total[5m])
+        - record: pico:quiesce:rate5m
+          expr: rate(pico_quiesce_events_total[5m])
+        - record: pico:boot:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_boot_latency_seconds_bucket[5m]))
+        - record: pico:boot:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_boot_latency_seconds_bucket[5m]))
+        - record: pico:boot:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_boot_latency_seconds_bucket[5m]))
+        - record: pico:prepare:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_prepare_latency_seconds_bucket[5m]))
+        - record: pico:prepare:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_prepare_latency_seconds_bucket[5m]))
+        - record: pico:prepare:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_prepare_latency_seconds_bucket[5m]))
+        - record: pico:fork:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_fork_latency_seconds_bucket[5m]))
+        - record: pico:fork:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_fork_latency_seconds_bucket[5m]))
+        - record: pico:fork:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_fork_latency_seconds_bucket[5m]))
+        - record: pico:destroy:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_destroy_latency_seconds_bucket[5m]))
+        - record: pico:destroy:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_destroy_latency_seconds_bucket[5m]))
+        - record: pico:destroy:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_destroy_latency_seconds_bucket[5m]))
+        - record: pico:exec:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_exec_duration_seconds_bucket[5m]))
+        - record: pico:exec:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_exec_duration_seconds_bucket[5m]))
+        - record: pico:exec:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_exec_duration_seconds_bucket[5m]))
+
+    - name: pico.placement
+      interval: 60s
+      rules:
+        - record: pico:placement:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_placement_latency_seconds_bucket[5m]))
+        - record: pico:placement:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_placement_latency_seconds_bucket[5m]))
+        - record: pico:placement:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_placement_latency_seconds_bucket[5m]))
+        - record: pico:placement:efficiency:ratio5m
+          expr: |
+            sum(rate(pico_placement_hosts_passed_constraints_sum[5m]))
+              /
+            sum(rate(pico_placement_hosts_evaluated_sum[5m]))
+
+    - name: pico.runtime
+      interval: 60s
+      rules:
+        - record: pico:suspend:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_suspend_latency_seconds_bucket[5m]))
+        - record: pico:suspend:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_suspend_latency_seconds_bucket[5m]))
+        - record: pico:suspend:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_suspend_latency_seconds_bucket[5m]))
+        - record: pico:resume:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_resume_latency_seconds_bucket[5m]))
+        - record: pico:resume:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_resume_latency_seconds_bucket[5m]))
+        - record: pico:resume:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_resume_latency_seconds_bucket[5m]))
+        - record: pico:restore:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_restore_latency_seconds_bucket[5m]))
+        - record: pico:restore:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_restore_latency_seconds_bucket[5m]))
+        - record: pico:restore:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_restore_latency_seconds_bucket[5m]))
+        - record: pico:restore:latency:p50:by_type_tier:rate5m
+          expr: histogram_quantile(0.50, sum by (le, snapshot_type, cache_tier) (rate(pico_restore_latency_seconds_bucket[5m])))
+        - record: pico:restore:latency:p95:by_type_tier:rate5m
+          expr: histogram_quantile(0.95, sum by (le, snapshot_type, cache_tier) (rate(pico_restore_latency_seconds_bucket[5m])))
+        - record: pico:restore:latency:p99:by_type_tier:rate5m
+          expr: histogram_quantile(0.99, sum by (le, snapshot_type, cache_tier) (rate(pico_restore_latency_seconds_bucket[5m])))
+        - record: pico:quiesce:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_quiesce_duration_seconds_bucket[5m]))
+        - record: pico:quiesce:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_quiesce_duration_seconds_bucket[5m]))
+        - record: pico:quiesce:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_quiesce_duration_seconds_bucket[5m]))
+
+    - name: pico.cache
+      interval: 60s
+      rules:
+        - record: pico:snapshot:cache:hit_rate:ratio5m
+          expr: |
+            sum(rate(pico_snapshot_cache_hits[5m]))
+              /
+            (sum(rate(pico_snapshot_cache_hits[5m])) + sum(rate(pico_snapshot_cache_misses[5m])))
+        - record: pico:snapshot:cache:misses:rate5m
+          expr: rate(pico_snapshot_cache_misses[5m])
+        - record: pico:snapshot:eviction:count:rate5m
+          expr: rate(pico_snapshot_eviction_count[5m])
+        - record: pico:snapshot:eviction:bytes:rate5m
+          expr: rate(pico_snapshot_eviction_bytes[5m])
+
+    - name: pico.gc
+      interval: 60s
+      rules:
+        - record: pico:gc:orphans_detected:rate5m
+          expr: rate(pico_gc_orphans_detected[5m])
+        - record: pico:gc:resources_removed:rate5m
+          expr: rate(pico_gc_resources_removed[5m])
+        - record: pico:gc:review_required:rate5m
+          expr: rate(pico_gc_review_required[5m])
+        - record: pico:gc:cleanup_failed:rate5m
+          expr: rate(pico_gc_cleanup_failed[5m])
+        - record: pico:gc:pass_duration:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_gc_pass_duration_seconds_bucket[5m]))
+        - record: pico:gc:pass_duration:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_gc_pass_duration_seconds_bucket[5m]))
+        - record: pico:gc:pass_duration:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_gc_pass_duration_seconds_bucket[5m]))
+
+    - name: pico.cgroup
+      interval: 60s
+      rules:
+        - record: pico:cgroup:oom:rate5m
+          expr: rate(pico_cgroup_oom_events_total[5m])
+        - record: pico:cgroup:memory_high:rate5m
+          expr: rate(pico_cgroup_memory_high_events_total[5m])
+        - record: pico:cgroup:cpu_throttled:rate5m
+          expr: rate(pico_cgroup_cpu_throttled_total[5m])
+        - record: pico:cgroup:setup_errors:rate5m
+          expr: rate(pico_cgroup_setup_errors_total[5m])
+
+    - name: pico.network
+      interval: 60s
+      rules:
+        - record: pico:network:setup:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(network_setup_duration_seconds_bucket[5m]))
+        - record: pico:network:setup:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(network_setup_duration_seconds_bucket[5m]))
+        - record: pico:network:setup:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(network_setup_duration_seconds_bucket[5m]))
+        - record: pico:network:setup:rate5m
+          expr: rate(network_setup_completed[5m])
+
+    - name: pico.dns
+      interval: 60s
+      rules:
+        - record: pico:dns:cache:hit_rate:ratio5m
+          expr: |
+            sum(rate(network_dns_cache_hits[5m]))
+              /
+            (sum(rate(network_dns_cache_hits[5m])) + sum(rate(network_dns_cache_misses[5m])))
+        - record: pico:dns:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(network_dns_resolution_duration_seconds_bucket[5m]))
+        - record: pico:dns:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(network_dns_resolution_duration_seconds_bucket[5m]))
+        - record: pico:dns:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(network_dns_resolution_duration_seconds_bucket[5m]))
+
+    - name: pico.audit
+      interval: 60s
+      rules:
+        - record: pico:audit:delivery:rate5m
+          expr: rate(pico_audit_delivery_count[5m])
+        - record: pico:audit:lag:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_audit_delivery_lag_bucket[5m]))
+        - record: pico:audit:lag:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_audit_delivery_lag_bucket[5m]))
+
+    - name: pico.slo
+      interval: 30s
+      rules:
+        - record: pico:slo:availability_target
+          expr: |
+            label_replace(vector(0.995), "slo", "create", "", "")
+            or label_replace(vector(0.995), "slo", "boot", "", "")
+            or label_replace(vector(0.999), "slo", "exec", "", "")
+            or label_replace(vector(0.999), "slo", "destroy", "", "")
+            or label_replace(vector(0.995), "slo", "suspend", "", "")
+            or label_replace(vector(0.995), "slo", "resume", "", "")
+            or label_replace(vector(0.995), "slo", "fork", "", "")
+            or label_replace(vector(0.995), "slo", "restore", "", "")
+            or label_replace(vector(0.9999), "slo", "audit", "", "")
+        - record: pico:slo:bad:rate5m
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event="create_failed"}[5m])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event="boot_not_ready"}[5m])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"failed|timed_out|not_completed"}[5m])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event="destroy_failed"}[5m])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_failed|suspend_timed_out"}[5m])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_failed|resume_timed_out"}[5m])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event="fork_failed"}[5m])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_failed|restore_partial_cleanup"}[5m])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"dead_letter|dropped"}[5m])), "slo", "audit", "", "")
+        - record: pico:slo:valid:rate5m
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event=~"create_completed|create_failed"}[5m])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event=~"boot_ready|boot_not_ready"}[5m])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"succeeded|failed|timed_out|not_completed"}[5m])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event=~"destroy_completed|destroy_failed"}[5m])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_completed|suspend_failed|suspend_timed_out"}[5m])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_completed|resume_failed|resume_timed_out"}[5m])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event=~"fork_completed|fork_failed"}[5m])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_completed|restore_failed|restore_partial_cleanup"}[5m])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"delivered|dead_letter|dropped"}[5m])), "slo", "audit", "", "")
+        - record: pico:slo:bad:rate30m
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event="create_failed"}[30m])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event="boot_not_ready"}[30m])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"failed|timed_out|not_completed"}[30m])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event="destroy_failed"}[30m])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_failed|suspend_timed_out"}[30m])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_failed|resume_timed_out"}[30m])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event="fork_failed"}[30m])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_failed|restore_partial_cleanup"}[30m])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"dead_letter|dropped"}[30m])), "slo", "audit", "", "")
+        - record: pico:slo:valid:rate30m
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event=~"create_completed|create_failed"}[30m])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event=~"boot_ready|boot_not_ready"}[30m])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"succeeded|failed|timed_out|not_completed"}[30m])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event=~"destroy_completed|destroy_failed"}[30m])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_completed|suspend_failed|suspend_timed_out"}[30m])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_completed|resume_failed|resume_timed_out"}[30m])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event=~"fork_completed|fork_failed"}[30m])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_completed|restore_failed|restore_partial_cleanup"}[30m])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"delivered|dead_letter|dropped"}[30m])), "slo", "audit", "", "")
+        - record: pico:slo:bad:rate1h
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event="create_failed"}[1h])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event="boot_not_ready"}[1h])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"failed|timed_out|not_completed"}[1h])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event="destroy_failed"}[1h])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_failed|suspend_timed_out"}[1h])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_failed|resume_timed_out"}[1h])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event="fork_failed"}[1h])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_failed|restore_partial_cleanup"}[1h])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"dead_letter|dropped"}[1h])), "slo", "audit", "", "")
+        - record: pico:slo:valid:rate1h
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event=~"create_completed|create_failed"}[1h])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event=~"boot_ready|boot_not_ready"}[1h])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"succeeded|failed|timed_out|not_completed"}[1h])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event=~"destroy_completed|destroy_failed"}[1h])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_completed|suspend_failed|suspend_timed_out"}[1h])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_completed|resume_failed|resume_timed_out"}[1h])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event=~"fork_completed|fork_failed"}[1h])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_completed|restore_failed|restore_partial_cleanup"}[1h])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"delivered|dead_letter|dropped"}[1h])), "slo", "audit", "", "")
+        - record: pico:slo:bad:rate6h
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event="create_failed"}[6h])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event="boot_not_ready"}[6h])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"failed|timed_out|not_completed"}[6h])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event="destroy_failed"}[6h])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_failed|suspend_timed_out"}[6h])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_failed|resume_timed_out"}[6h])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event="fork_failed"}[6h])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_failed|restore_partial_cleanup"}[6h])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"dead_letter|dropped"}[6h])), "slo", "audit", "", "")
+        - record: pico:slo:valid:rate6h
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event=~"create_completed|create_failed"}[6h])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event=~"boot_ready|boot_not_ready"}[6h])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"succeeded|failed|timed_out|not_completed"}[6h])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event=~"destroy_completed|destroy_failed"}[6h])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_completed|suspend_failed|suspend_timed_out"}[6h])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_completed|resume_failed|resume_timed_out"}[6h])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event=~"fork_completed|fork_failed"}[6h])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_completed|restore_failed|restore_partial_cleanup"}[6h])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"delivered|dead_letter|dropped"}[6h])), "slo", "audit", "", "")
+        - record: pico:slo:bad:rate30d
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event="create_failed"}[30d])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event="boot_not_ready"}[30d])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"failed|timed_out|not_completed"}[30d])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event="destroy_failed"}[30d])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_failed|suspend_timed_out"}[30d])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_failed|resume_timed_out"}[30d])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event="fork_failed"}[30d])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_failed|restore_partial_cleanup"}[30d])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"dead_letter|dropped"}[30d])), "slo", "audit", "", "")
+        - record: pico:slo:valid:rate30d
+          expr: |
+            label_replace(sum(rate(pico_create_events_total{event=~"create_completed|create_failed"}[30d])), "slo", "create", "", "")
+            or label_replace(sum(rate(pico_boot_events_total{event=~"boot_ready|boot_not_ready"}[30d])), "slo", "boot", "", "")
+            or label_replace(sum(rate(pico_exec_events_total{event=~"succeeded|failed|timed_out|not_completed"}[30d])), "slo", "exec", "", "")
+            or label_replace(sum(rate(pico_destroy_events_total{event=~"destroy_completed|destroy_failed"}[30d])), "slo", "destroy", "", "")
+            or label_replace(sum(rate(pico_suspend_events_total{event=~"suspend_completed|suspend_failed|suspend_timed_out"}[30d])), "slo", "suspend", "", "")
+            or label_replace(sum(rate(pico_resume_events_total{event=~"resume_completed|resume_failed|resume_timed_out"}[30d])), "slo", "resume", "", "")
+            or label_replace(sum(rate(pico_fork_events_total{event=~"fork_completed|fork_failed"}[30d])), "slo", "fork", "", "")
+            or label_replace(sum(rate(pico_restore_events_total{event=~"restore_completed|restore_failed|restore_partial_cleanup"}[30d])), "slo", "restore", "", "")
+            or label_replace(sum(rate(pico_audit_delivery_count{outcome=~"delivered|dead_letter|dropped"}[30d])), "slo", "audit", "", "")
+        - record: pico:slo:error_ratio:5m
+          expr: pico:slo:bad:rate5m / pico:slo:valid:rate5m
+        - record: pico:slo:error_ratio:30m
+          expr: pico:slo:bad:rate30m / pico:slo:valid:rate30m
+        - record: pico:slo:error_ratio:1h
+          expr: pico:slo:bad:rate1h / pico:slo:valid:rate1h
+        - record: pico:slo:error_ratio:6h
+          expr: pico:slo:bad:rate6h / pico:slo:valid:rate6h
+        - record: pico:slo:error_ratio:30d
+          expr: pico:slo:bad:rate30d / pico:slo:valid:rate30d
+        - record: pico:slo:burn:5m
+          expr: |
+            pico:slo:error_ratio:5m
+              / on(slo) group_left
+            (1 - pico:slo:availability_target)
+        - record: pico:slo:burn:30m
+          expr: |
+            pico:slo:error_ratio:30m
+              / on(slo) group_left
+            (1 - pico:slo:availability_target)
+        - record: pico:slo:burn:1h
+          expr: |
+            pico:slo:error_ratio:1h
+              / on(slo) group_left
+            (1 - pico:slo:availability_target)
+        - record: pico:slo:burn:6h
+          expr: |
+            pico:slo:error_ratio:6h
+              / on(slo) group_left
+            (1 - pico:slo:availability_target)
+        - record: pico:slo:budget_remaining
+          expr: |
+            clamp_min(
+              1 - (
+                pico:slo:error_ratio:30d
+                  / on(slo) group_left
+                (1 - pico:slo:availability_target)
+              ),
+              0
+            )
+        - record: pico:slo:error_rate:1h
+          expr: pico:slo:error_ratio:1h
+        - record: pico:slo:error_rate:30d
+          expr: pico:slo:error_ratio:30d
+
+    - name: pico.slo.alerts
+      rules:
+        - alert: PicoComputeSloBurnFast
+          expr: |
+            pico:slo:burn:1h > 14.4
+              and pico:slo:burn:5m > 14.4
+              and pico:slo:valid:rate5m > 0.01
+          for: 2m
+          labels:
+            severity: critical
+            category: slo_burn
+            owner: sre-pico
+            runbook: docs/runbooks/slo-error-budget.md
+          annotations:
+            summary: "Fast SLO burn on {{ $labels.slo }}: {{ $value | humanize }}"
+            description: >
+              {{ $labels.slo }} is burning error budget more than 14.4x on both
+              the 1h and 5m windows. Freeze non-incident production rollouts in
+              the affected region. See docs/observability/slo-error-budget-policy.md
+              and jump to the owning lifecycle runbook.
+
+        - alert: PicoComputeSloBurnSlow
+          expr: |
+            pico:slo:burn:6h > 6
+              and pico:slo:burn:30m > 6
+              and pico:slo:valid:rate30m > 0.003
+          for: 15m
+          labels:
+            severity: warning
+            category: slo_burn
+            owner: sre-pico
+            runbook: docs/runbooks/slo-error-budget.md
+          annotations:
+            summary: "Slow SLO burn on {{ $labels.slo }}: {{ $value | humanize }}"
+            description: >
+              {{ $labels.slo }} is burning error budget more than 6x on both the
+              6h and 30m windows. Ticket the owning team. No automatic freeze.
+              Review remaining 30d budget on pico-slo-error-budget.
+
+        - alert: PicoComputeSloBudgetExhausted
+          expr: pico:slo:budget_remaining <= 0
+          for: 15m
+          labels:
+            severity: critical
+            category: slo_burn
+            owner: sre-pico
+            runbook: docs/runbooks/slo-error-budget.md
+          annotations:
+            summary: "30d error budget exhausted for {{ $labels.slo }}"
+            description: >
+              {{ $labels.slo }} has no remaining 30-day error budget. Freeze all
+              non-incident production changes in the region until remaining
+              budget is above 10% or an exception is approved.
+
+        - alert: PicoComputeSloTelemetryStale
+          expr: absent(pico:slo:valid:rate5m)
+          for: 15m
+          labels:
+            severity: warning
+            category: telemetry_delivery_failure
+            owner: sre-pico
+            runbook: docs/runbooks/audit-telemetry.md
+          annotations:
+            summary: "SLO recording series absent"
+            description: >
+              pico:slo:valid:rate5m has no samples. Treat user-facing SLO
+              status as unknown, not healthy. Investigate the metrics pipeline
+              before using budget remaining for a rollout decision.
+
+    - name: pico.quarantine
+      interval: 60s
+      rules:
+        - record: pico:quarantine:alerts:fired:rate5m
+          expr: rate(pico_quarantine_alerts_fired_total[5m])
+        - record: pico:quarantine:alerts:resolved:rate5m
+          expr: rate(pico_quarantine_alerts_resolved_total[5m])
+        - record: pico:quarantine:hosts:active
+          expr: pico_quarantine_hosts_quarantined
+        - record: pico:quarantine:alerts:active
+          expr: pico_quarantine_alerts_active
+
+    - name: pico.quarantine.alerts
+      rules:
+        - alert: PicoComputeHostQuarantined
+          expr: pico_quarantine_hosts_quarantined > 0
+          for: 1m
+          labels:
+            severity: warning
+            owner: sre-pico
+            runbook: docs/runbooks/host-quarantine.md
+          annotations:
+            summary: "Host(s) quarantined: {{ $value }}"
+            description: >
+              {{ $value }} host(s) are currently quarantined due to alert
+              conditions (repeated runtime failures, stale resources,
+              capacity reporting staleness, resource pressure, or
+              cleanup/reconciliation issues). Quarantined hosts are excluded
+              from new sandbox placement. Check the host-health dashboard
+              and quarantine alert details for root cause.
+
+        - alert: PicoComputeHostAlertFiringRateHigh
+          expr: rate(pico_quarantine_alerts_fired_total[5m]) > 1
+          for: 5m
+          labels:
+            severity: critical
+            owner: sre-pico
+            runbook: docs/runbooks/host-quarantine.md
+          annotations:
+            summary: "High rate of quarantine alerts: {{ $value }}/s"
+            description: >
+              Quarantine alerts are firing at an elevated rate of {{ $value }}
+              per second. This may indicate a systemic issue across hosts.
+              Investigate the quarantine dashboard and verify that alert
+              conditions are not caused by a telemetry pipeline or
+              reconciliation infrastructure failure.
+
+        - alert: PicoComputeHostUnresolvedAlerts
+          expr: pico_quarantine_alerts_active > 5
+          for: 30m
+          labels:
+            severity: warning
+            owner: sre-pico
+            runbook: docs/runbooks/host-quarantine.md
+          annotations:
+            summary: "{{ $value }} active unresolved quarantine alerts"
+            description: >
+              {{ $value }} quarantine alerts have been active for more than
+              30 minutes without resolution or acknowledgement. Review the
+              alert details and take action per the host quarantine runbook.
+
+    - name: pico.placement.alerts
+      rules:
+        - alert: PicoComputeCellCannotPlace
+          expr: |
+            (
+              sum by (cell, region) (rate(pico_placement_hosts_evaluated_sum[5m])) > 0
+            )
+            and
+            (
+              sum by (cell, region) (rate(pico_placement_hosts_passed_constraints_sum[5m])) == 0
+            )
+          for: 5m
+          labels:
+            severity: critical
+            category: capacity_exhaustion
+            owner: sre-pico
+            runbook: docs/runbooks/scheduling-capacity.md
+          annotations:
+            summary: "Cell cannot place sandboxes: {{ $labels.cell }}"
+            description: >
+              Cell {{ $labels.cell }} in region {{ $labels.region }} is
+              evaluating hosts but none pass hard constraints for 5m.
+              New placement is shed. Existing sandboxes are unchanged.
+              Check scheduling-capacity (quarantine, efficiency) and treat
+              scheduler errors as backpressure, not retry.
+
+    - name: pico.restore.alerts
+      rules:
+        - alert: PicoComputeRestoreSaturated
+          expr: |
+            (
+              max(pico:restore:latency:p99:rate5m) > 1
+            )
+            and
+            (
+              sum(rate(pico_restore_events_total{event="restore_completed"}[5m])) > 0
+            )
+          for: 10m
+          labels:
+            severity: warning
+            category: capacity_exhaustion
+            owner: sre-pico
+            runbook: docs/runbooks/snapshot-fork.md
+          annotations:
+            summary: "Restore p99 above SLO-RESTORE-LAT while restores complete"
+            description: >
+              Restore p99 has exceeded 1s for 10m while restore_completed
+              events are still flowing. Shed additional restore admission.
+              Check snapshot-fork (latency by snapshot_type and cache_tier)
+              and image-cache hit/miss. Do not raise max_concurrent_restores
+              without a restore-pressure report.
+        - alert: PicoComputeRestorePartialCleanup
+          expr: sum(increase(pico_restore_events_total{event="restore_partial_cleanup"}[5m])) > 0
+          labels:
+            severity: critical
+            category: regional_lifecycle_failure
+            owner: sre-pico
+            runbook: docs/runbooks/snapshot-fork.md
+          annotations:
+            summary: "Partial restore cleanup is a bad restore event"
+            description: >
+              restore_partial_cleanup is firing. Treat it as a failed
+              restore. Do not reuse the workspace. Follow snapshot-fork
+              then cleanup-reconciliation.
+
+    - name: pico.image.cache
+      interval: 60s
+      rules:
+        - record: pico:image_cache:hit_rate5m
+          expr: |
+            sum(rate(pico_image_cache_hits[5m]))
+            /
+            (sum(rate(pico_image_cache_hits[5m])) + sum(rate(pico_image_cache_misses[5m])))
+        - record: pico:image_cache:miss:rate5m
+          expr: rate(pico_image_cache_misses[5m])
+        - record: pico:image_cache:eviction:rate5m
+          expr: rate(pico_image_cache_evictions[5m])
+        - record: pico:image_prepare:latency:p50:rate5m
+          expr: histogram_quantile(0.50, rate(pico_image_prepare_latency_seconds_bucket[5m]))
+        - record: pico:image_prepare:latency:p95:rate5m
+          expr: histogram_quantile(0.95, rate(pico_image_prepare_latency_seconds_bucket[5m]))
+        - record: pico:image_prepare:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_image_prepare_latency_seconds_bucket[5m]))
+        - record: pico:image_prepare:latency:p99:hit:rate5m
+          expr: histogram_quantile(0.99, rate(pico_image_prepare_latency_seconds_bucket{cache_result="hit"}[5m]))
+        - record: pico:image_verify:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_image_verify_latency_seconds_bucket[5m]))
+        - record: pico:image_overlay:latency:p99:rate5m
+          expr: histogram_quantile(0.99, rate(pico_image_overlay_latency_seconds_bucket[5m]))
+
+    - name: pico.image.cache.alerts
+      rules:
+        - alert: PicoComputeImageCacheHitRateLow
+          expr: |
+            (
+              pico:image_cache:hit_rate5m < 0.8
+            )
+            and
+            (
+              (sum(rate(pico_image_cache_hits[5m])) + sum(rate(pico_image_cache_misses[5m]))) > 0
+            )
+          for: 15m
+          labels:
+            severity: warning
+            category: capacity_exhaustion
+            owner: sre-pico
+            runbook: docs/runbooks/image-cache.md
+          annotations:
+            summary: "Image cache hit rate below 0.80"
+            description: >
+              Warm image-cache hit rate has stayed below 0.80 for 15m.
+              Misses may slow boot; they must not skip verification.
+              Check pico-image-cache hit/miss/eviction. Do not copy
+              layers onto a host. Size from an image-cache report.
+        - alert: PicoComputeImagePrepareSaturated
+          expr: |
+            (
+              max(pico:image_prepare:latency:p99:hit:rate5m) > 1
+            )
+            and
+            (
+              sum(rate(pico_image_cache_hits[5m])) > 0
+            )
+          for: 10m
+          labels:
+            severity: warning
+            category: regional_lifecycle_failure
+            owner: sre-pico
+            runbook: docs/runbooks/image-cache.md
+          annotations:
+            summary: "Warm image prepare p99 above 1s while cache hits complete"
+            description: >
+              Image prepare p99 has exceeded 1s for 10m while cache hits
+              are still flowing. Check verify and overlay latency on
+              pico-image-cache. Do not bypass signature checks.

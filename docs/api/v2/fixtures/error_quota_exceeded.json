@@ -1,0 +1,12 @@
+{
+  "error": {
+    "code": "quota_exceeded",
+    "message": "Tenant sandbox limit (10) reached",
+    "details": {
+      "limit": 10,
+      "current": 10,
+      "resource": "sandbox_count"
+    },
+    "request_id": "req_01JXYZ123456789"
+  }
+}

@@ -1,0 +1,107 @@
+[settings]
+env_shell_expand = true
+
+[tools]
+rust = "1.98.1"
+
+[env]
+_.file = ".env"
+
+[tasks."firecracker:setup"]
+description = "Build and install pico-guest-agent on a Firecracker development VM"
+run = "scripts/run-firecracker-dev.sh"
+env = { USE_PREBUILT_ASSETS = "1", VM_KERNEL_PATH = "/opt/pico/kernel/vmlinux", VM_ROOTFS_PATH = "/opt/pico/rootfs.ext4" }
+
+[tasks."firecracker:dev"]
+description = "Run the development server for Firecracker"
+depends = "firecracker:setup"
+run = "cargo watch -x 'run --bin pico-api'"
+env = { PICO_RUNTIME = "remote-firecracker", PICO_FIRECRACKER_KERNEL_PATH = "/opt/pico/kernel/vmlinux", PICO_ROOTFS_PATH = "/opt/pico/rootfs.ext4" }
+
+[tasks."qemu:setup"]
+description = "Build and install pico-guest-agent on a QEMU development VM"
+run = "scripts/build-qemu-assets-macos.sh"
+
+[tasks."qemu:dev"]
+description = "Run the development server for QEMU"
+depends = "qemu:setup"
+run = "cargo watch -x 'run --bin pico-api'"
+env = { PICO_RUNTIME = "qemu", PICO_GUEST_AGENT_ADDR = "127.0.0.1:0", PICO_ROOTFS_PATH = "$HOME/.local/share/pico/assets/rootfs.ext4" }
+
+[tasks."dev-host"]
+description = "Run host-agent + sandboxd as two local processes"
+run = "bash scripts/dev-host.sh"
+
+[tasks.smoke_test]
+description = "Run the smoke test"
+run = "bash scripts/smoke.sh"
+
+[tasks."rust:fmt"]
+description = "Run Rust formatter"
+run = "cargo fmt --all"
+
+[tasks."rust:sort_deps"]
+description = "Run Rust sort deps"
+run = "cargo sort -w"
+
+[tasks."rust:check"]
+description = "Run check on the Rust workspace"
+run = "cargo ca"
+
+[tasks."rust:lint"]
+description = "Run linting on the Rust workspace"
+run = "cargo lint"
+
+[tasks."rust:test"]
+description = "Run tests on the Rust workspace"
+run = ["cargo ta", "docker ps -a -q --filter 'label=org.testcontainers.managed-by=testcontainers' | xargs docker rm -f"]
+
+[tasks."rust:all"]
+description = "Run all Rust tasks"
+depends = ["rust:fmt", "rust:sort_deps", "rust:check", "rust:lint"]
+run = { task = "rust:test" }
+
+# Infrastructure operations
+
+[tasks."infra:validate"]
+description = "Run Terraform validate"
+run = "terraform -chdir=infra validate"
+
+[tasks."infra:init"]
+description = "Initialize the infrastructure with Cloudflare R2 backend"
+run = "terraform -chdir=infra init -backend-config=backend.r2.hcl"
+
+[tasks."infra:plan"]
+description = "Run Terraform plan"
+run = "terraform -chdir=infra plan"
+
+[tasks."infra:apply"]
+description = "Run Terraform apply"
+run = "terraform -chdir=infra apply --auto-approve"
+
+[tasks."infra:replace_api_instance"]
+description = "Run Terraform apply to replace the API instance"
+run = "terraform -chdir=infra apply -replace=aws_instance.api --auto-approve"
+
+[tasks."infra:destroy"]
+description = "Run Terraform destroy"
+run = "terraform -chdir=infra destroy --auto-approve"
+
+[tasks."prod:livez"]
+description = "Verify the production API liveness"
+run = "curl -v $(terraform -chdir=infra output -raw api_url)/v1/livez"
+
+[tasks."prod:create_sandbox"]
+description = "Create a new production sandbox"
+run = "cargo run --bin pc create --ssh-key \"$(cat ~/.ssh/id_ed25519.pub)\" --api-url $(terraform -chdir=infra output -raw api_url)"
+
+[tasks."prod:list"]
+description = "List all production sandboxes"
+run = "cargo run --bin pc list --api-url $(terraform -chdir=infra output -raw api_url)"
+
+[tasks."prod:ssh"]
+description = "SSH into a specific production sandbox"
+usage = '''
+arg "sandbox_id" help="Target sandbox ID"
+'''
+run = "cargo run --bin pc -vv ssh {{ usage.sandbox_id }} --api-url $(terraform -chdir=infra output -raw api_url)"

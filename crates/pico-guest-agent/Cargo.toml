@@ -1,0 +1,28 @@
+[package]
+name = "pico-guest-agent"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Minimal binary running inside the guest; executes commands over vsock/TCP"
+
+[dependencies]
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+pico-core = { workspace = true }
+pico-guest-protocol = { workspace = true }
+pico-seccomp = { workspace = true }
+hashbrown = { workspace = true }
+heapless = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+rustix = { workspace = true, features = ["fs", "mount", "process", "thread"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sys-info = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

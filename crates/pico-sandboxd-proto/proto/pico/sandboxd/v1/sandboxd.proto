@@ -1,0 +1,459 @@
+syntax = "proto3";
+
+package pico.sandboxd.v1;
+
+// ------------------------------------------------------------------
+// host-agent <-> sandboxd control protocol (Interface 1)
+// ------------------------------------------------------------------
+// Transport: gRPC over Unix domain socket.
+// Auth (not in messages): SO_PEERCRED allowlist + metadata token
+//   key: x-pico-sandboxd-token
+//
+// Mutating RPCs carry CommandMeta for fencing, idempotency, and
+// absolute deadlines. Stream payloads never enter the ledger.
+// ------------------------------------------------------------------
+
+// Envelope for every state-changing command.
+message CommandMeta {
+  string sandbox_id = 1;
+  string operation_id = 2;
+  // FencingToken on the wire: "epoch.sequence" where both parts are
+  // decimal u64 (Display of pico_core::FencingToken). Example: "7.3".
+  // Reject malformed tokens as InvalidArgument.
+  string assignment_fencing_token = 3;
+  uint64 policy_epoch = 4;
+  // Absolute Unix deadline in milliseconds (not a relative timeout).
+  int64 deadline_unix_ms = 5;
+}
+
+// Operation kinds for supervised operations on the wire.
+enum OperationKind {
+  OPERATION_KIND_UNSPECIFIED = 0;
+  OPERATION_KIND_PREPARE = 1;
+  OPERATION_KIND_BOOT = 2;
+  OPERATION_KIND_EXEC = 3;
+  OPERATION_KIND_SUSPEND = 4;
+  OPERATION_KIND_RESUME = 5;
+  OPERATION_KIND_DESTROY = 6;
+  OPERATION_KIND_PROCESS = 7;
+  OPERATION_KIND_RESTORE = 8;
+  OPERATION_KIND_FORK = 9;
+  OPERATION_KIND_INJECT_SECRETS = 10;
+}
+
+enum OutcomeStatus {
+  OUTCOME_STATUS_UNSPECIFIED = 0;
+  OUTCOME_STATUS_RUNNING = 1;
+  OUTCOME_STATUS_SUCCEEDED = 2;
+  OUTCOME_STATUS_FAILED = 3;
+  OUTCOME_STATUS_CANCELED = 4;
+  OUTCOME_STATUS_TIMED_OUT = 5;
+  OUTCOME_STATUS_REQUIRES_REVIEW = 6;
+}
+
+enum OutcomeReason {
+  OUTCOME_REASON_UNSPECIFIED = 0;
+  OUTCOME_REASON_IN_PROGRESS = 1;
+  OUTCOME_REASON_COMPLETED = 2;
+  OUTCOME_REASON_BACKEND_FAILURE = 3;
+  OUTCOME_REASON_CANCELED_BY_HOST = 4;
+  OUTCOME_REASON_DEADLINE_EXCEEDED = 5;
+  OUTCOME_REASON_PARTIAL_CLEANUP = 6;
+  OUTCOME_REASON_SUPERVISOR_RESTARTED = 7;
+  OUTCOME_REASON_PROCESS_EXITED = 8;
+  OUTCOME_REASON_PROCESS_SIGNALED = 9;
+  OUTCOME_REASON_PROCESS_FAILURE = 10;
+  OUTCOME_REASON_RESTORE_REJECTED = 11;
+}
+
+enum SandboxState {
+  SANDBOX_STATE_UNSPECIFIED = 0;
+  SANDBOX_STATE_PENDING = 1;
+  SANDBOX_STATE_SCHEDULED = 2;
+  SANDBOX_STATE_PREPARING = 3;
+  SANDBOX_STATE_BOOTING = 4;
+  SANDBOX_STATE_RUNNING = 5;
+  SANDBOX_STATE_SUSPENDING = 6;
+  SANDBOX_STATE_SUSPENDED = 7;
+  SANDBOX_STATE_RESUMING = 8;
+  SANDBOX_STATE_STOPPED = 9;
+  SANDBOX_STATE_DESTROYING = 10;
+  SANDBOX_STATE_DESTROYED = 11;
+  SANDBOX_STATE_FAILED = 12;
+}
+
+enum NonReadyReason {
+  NON_READY_REASON_UNSPECIFIED = 0;
+  NON_READY_REASON_IMAGE = 1;
+  NON_READY_REASON_NETWORK = 2;
+  NON_READY_REASON_RESOURCE = 3;
+  NON_READY_REASON_BACKEND = 4;
+  NON_READY_REASON_PROTOCOL = 5;
+  NON_READY_REASON_TIMEOUT = 6;
+  NON_READY_REASON_CLEANUP = 7;
+}
+
+enum RuntimeType {
+  RUNTIME_TYPE_UNSPECIFIED = 0;
+  RUNTIME_TYPE_FIRECRACKER = 1;
+  RUNTIME_TYPE_QEMU = 2;
+  RUNTIME_TYPE_GVISOR = 3;
+  RUNTIME_TYPE_REMOTE_FIRECRACKER = 4;
+}
+
+// Terminal or active result of a supervised operation.
+message Outcome {
+  string operation_id = 1;
+  string sandbox_id = 2;
+  OperationKind kind = 3;
+  OutcomeStatus status = 4;
+  // Machine-readable reason as a proto enum.
+  OutcomeReason reason_code = 5;
+  // Optional stable boot failure class when not ready.
+  // UNSPECIFIED means no classification.
+  NonReadyReason non_ready_reason = 6;
+  // Redacted human detail for host reporting.
+  optional string message = 7;
+  repeated ResourceReceipt resources = 8;
+  // Observed SandboxState after the operation.
+  SandboxState observed_state = 9;
+  // ISO-8601 or ledger timestamp string.
+  string completed_at = 10;
+}
+
+// Durable proof a named host resource was created.
+message ResourceReceipt {
+  string class = 1;
+  string name = 2;
+  optional string external_id = 3;
+  // runtime|network|workspace|cgroup|dns|...
+  string owner = 4;
+}
+
+// Backend-neutral runtime configuration used at prepare.
+message SandboxConfig {
+  string id = 1;
+  uint64 memory_limit_bytes = 2;
+  uint32 cpu_shares = 3;
+  optional uint64 memory_soft_limit_bytes = 4;
+  optional uint32 max_pids = 5;
+  bool network_isolated = 6;
+  optional uint32 ssh_port = 7;
+  repeated uint32 cpu_set = 8;
+}
+
+// Host-side resource inputs coordinated by sandboxd at prepare.
+message HostResourceSpec {
+  uint32 vcpus = 1;
+  uint32 memory_mb = 2;
+  optional uint64 idle_timeout_secs = 3;
+  optional string image_id = 4;
+  optional string image_digest = 5;
+  optional string ssh_public_key = 6;
+  optional string ssh_key_type = 7;
+  repeated uint32 requested_ports = 8;
+  bool cross_tenant_host = 9;
+  optional string tenant_id = 10;
+}
+
+message PrepareRequest {
+  CommandMeta meta = 1;
+  SandboxConfig config = 2;
+  RuntimeType runtime_type = 3;
+  HostResourceSpec host = 4;
+}
+
+message BootRequest {
+  CommandMeta meta = 1;
+}
+
+message ExecRequest {
+  CommandMeta meta = 1;
+  string command = 2;
+  repeated string args = 3;
+  map<string, string> env = 4;
+  string working_dir = 5;
+  optional int64 timeout_ms = 6;
+  uint64 max_stdout_bytes = 7;
+  uint64 max_stderr_bytes = 8;
+}
+
+message ExecEvent {
+  oneof body {
+    ExecStarted started = 1;
+    ExecStdout stdout = 2;
+    ExecStderr stderr = 3;
+    ExecExited exited = 4;
+    ExecFailed failed = 5;
+  }
+}
+
+message ExecStarted {
+  string guest_operation_id = 1;
+}
+
+message ExecStdout {
+  bytes data = 1;
+}
+
+message ExecStderr {
+  bytes data = 1;
+}
+
+message ExecExited {
+  int32 exit_code = 1;
+  Outcome outcome = 2;
+}
+
+message ExecFailed {
+  Outcome outcome = 1;
+}
+
+message CancelRequest {
+  string operation_id = 1;
+  string sandbox_id = 2;
+}
+
+message SuspendRequest {
+  CommandMeta meta = 1;
+}
+
+message ResumeRequest {
+  CommandMeta meta = 1;
+}
+
+message DestroyRequest {
+  CommandMeta meta = 1;
+}
+
+// Shared host capability evidence for snapshot restore and fork.
+//
+// Single owner for the 7 compatibility fields plus disk_mb. Adding a new
+// host field (e.g. disk_mb) touches this message once, not every
+// Restore/Fork layer (Parts -> Request -> Params -> Command).
+message HostShape {
+  string backend_type = 1;
+  string backend_version = 2;
+  string protocol_version = 3;
+  string cpu_arch = 4;
+  uint32 memory_mb = 5;
+  uint32 vcpus = 6;
+  string machine_type = 7;
+  // Host disk in MiB. 0 means unspecified (older clients). Carried for
+  // future compatibility gating; not yet enforced by restore validation.
+  uint64 disk_mb = 8;
+}
+
+// Snapshot restore request (ADR-0007).
+//
+// sandboxd validates tenant binding, lineage, compatibility, integrity,
+// and exclusion from trusted metadata before attaching blobs, then
+// restores via the runtime adapter and issues fresh authority.
+message RestoreRequest {
+  CommandMeta meta = 1;
+  // Snapshot to restore from. Must be Ready and user-restorable.
+  string snapshot_id = 2;
+  // Tenant requesting restore. Must match snapshot tenant.
+  string request_tenant_id = 3;
+  // True when caller needs memory profile. False is filesystem restore.
+  bool requires_memory = 4;
+  // Must match snapshot family.
+  RuntimeType runtime_type = 5;
+  // Host capability evidence for metadata-only compatibility checks.
+  HostShape host = 6;
+}
+
+// Fork request: branch a child sandbox from a fork snapshot point.
+// Every child receives independent workspace, network, policy, boot,
+// protocol, quota, and audit identity with preserved lineage binding.
+//
+// `meta.sandbox_id` is the parent envelope the operation is admitted
+// against; `child_sandbox_id` is the prepared child that receives the
+// staged state. The parent keeps its ledger state on every path.
+message ForkRequest {
+  CommandMeta meta = 1;
+  string parent_snapshot_id = 2;
+  string request_tenant_id = 3;
+  string child_sandbox_id = 4;
+  bool requires_memory = 5;
+  // Must match snapshot family.
+  RuntimeType runtime_type = 6;
+  // Host capability evidence, same shape as RestoreRequest.
+  HostShape host = 7;
+}
+
+message FileReadRequest {
+  CommandMeta meta = 1;
+  string path = 2;
+  // Hard cap on bytes returned. 0 means server default (must be finite).
+  // Oversized files fail with ResourceExhausted; content is never truncated silently.
+  uint64 max_bytes = 3;
+}
+
+message FileReadResponse {
+  string path = 1;
+  bytes content = 2;
+  uint64 size_bytes = 3;
+}
+
+message FileWriteRequest {
+  CommandMeta meta = 1;
+  string path = 2;
+  bytes content = 3;
+  optional uint32 mode = 4;
+  bool create_parents = 5;
+}
+
+message FileWriteResponse {
+  string path = 1;
+  uint64 size_bytes = 2;
+}
+
+message FileListRequest {
+  CommandMeta meta = 1;
+  string dir = 2;
+  bool recursive = 3;
+}
+
+message FileEntry {
+  string path = 1;
+  bool is_dir = 2;
+  uint64 size_bytes = 3;
+}
+
+message FileListResponse {
+  repeated FileEntry entries = 1;
+}
+
+// Lease-checked credential injection request (broker fetch may happen in sandboxd).
+message CredentialInjectSpec {
+  string tenant_id = 1;
+  string lease_id = 2;
+  string policy_decision_id = 3;
+  repeated NamedCredential credentials = 4;
+}
+
+message NamedCredential {
+  string name = 1;
+  string kind = 2;
+  map<string, string> attributes = 3;
+  // Optional inline secret material when broker is not used (tests only).
+  optional bytes material = 4;
+}
+
+message InjectSecretsRequest {
+  CommandMeta meta = 1;
+  CredentialInjectSpec spec = 2;
+}
+
+message GetSandboxRequest {
+  string sandbox_id = 1;
+}
+
+message SshObservation {
+  optional uint32 host_port = 1;
+  string username = 2;
+  optional string public_key = 3;
+}
+
+// Host-local observed sandbox snapshot for observation cache.
+message SandboxObservation {
+  string sandbox_id = 1;
+  SandboxState observed_state = 2;
+  // Monotonic generation for cache and port-route invalidation.
+  uint64 generation = 3;
+  // Supervisor observation identity, including the host boot and daemon incarnation.
+  string host_boot_id = 4;
+  string guest_boot_id = 5;
+  RuntimeType backend = 6;
+  repeated PortTarget ports = 7;
+  optional SshObservation ssh = 8;
+  uint64 policy_epoch = 9;
+  string assignment_fencing_token = 10;
+  string updated_at = 11;
+}
+
+message PortTarget {
+  uint32 guest_port = 1;
+  oneof target {
+    // Host-reachable "ip:port" for TCP proxy.
+    string tcp_addr = 2;
+    bool backend_managed = 3;
+    bool unsupported = 4;
+  }
+}
+
+message GetPortTargetRequest {
+  string sandbox_id = 1;
+  uint32 guest_port = 2;
+}
+
+// Unknown sandbox or port: return gRPC NotFound (not an empty PortTarget).
+// Proxy must fail closed on NotFound or generation mismatch.
+message GetPortTargetResponse {
+  PortTarget target = 1;
+  uint64 generation = 2;
+}
+
+message WatchRequest {
+  // Empty means all sandboxes on this host.
+  repeated string sandbox_ids = 1;
+}
+
+message ReconcileStatus {
+  bool complete = 1;
+  uint64 review_findings = 2;
+  // Supervisor observation identity, including the host boot and daemon incarnation.
+  string host_boot_id = 3;
+}
+
+message WatchEvent {
+  oneof body {
+    SandboxObservation upsert = 1;
+    string removed_sandbox_id = 2;
+    ReconcileStatus reconcile = 3;
+  }
+}
+
+message ListSandboxesRequest {}
+
+message ListSandboxesResponse {
+  repeated SandboxObservation sandboxes = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ready_for_work = 1;
+  bool reconcile_complete = 2;
+  uint64 review_findings = 3;
+  string host_boot_id = 4;
+  // Runtime families this sandboxd build can actually run, so the host can
+  // advertise exactly what placement can satisfy.
+  repeated RuntimeType supported_runtimes = 5;
+}
+
+// Sole gRPC surface between host-agent and sandboxd (Interface 1).
+service Sandboxd {
+  rpc Prepare(PrepareRequest) returns (Outcome);
+  rpc Boot(BootRequest) returns (Outcome);
+  rpc Exec(ExecRequest) returns (stream ExecEvent);
+  rpc Cancel(CancelRequest) returns (Outcome);
+  rpc Suspend(SuspendRequest) returns (Outcome);
+  rpc Resume(ResumeRequest) returns (Outcome);
+  rpc Destroy(DestroyRequest) returns (Outcome);
+  rpc Restore(RestoreRequest) returns (Outcome);
+  rpc Fork(ForkRequest) returns (Outcome);
+
+  rpc FileRead(FileReadRequest) returns (FileReadResponse);
+  rpc FileWrite(FileWriteRequest) returns (FileWriteResponse);
+  rpc FileList(FileListRequest) returns (FileListResponse);
+  rpc InjectSecrets(InjectSecretsRequest) returns (Outcome);
+
+  rpc GetSandbox(GetSandboxRequest) returns (SandboxObservation);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc GetPortTarget(GetPortTargetRequest) returns (GetPortTargetResponse);
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
+
+  rpc Health(HealthRequest) returns (HealthResponse);
+}

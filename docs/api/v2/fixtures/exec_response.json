@@ -1,0 +1,7 @@
+{
+  "exit_code": 0,
+  "stdout": "hello world\n",
+  "stderr": "",
+  "duration_ms": 42,
+  "request_id": "req_01JXYZ123456789"
+}

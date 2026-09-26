@@ -1,0 +1,56 @@
+[package]
+name = "pico-sandboxd"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Durable local supervisor for PicoCompute sandbox runtimes"
+
+[[bin]]
+name = "sandboxd"
+path = "src/main.rs"
+
+[features]
+default = []
+# Test-only: lets the sandboxd binary serve MockBackend-driven sandboxes when
+# PICO_SANDBOXD_MOCK_GUEST_SOCKET and PICO_SANDBOXD_ALLOW_MOCK=1 are set.
+# Used by the binary-level restart acceptance tests on runners without
+# KVM/Firecracker assets. Production builds never enable this feature, and the
+# dual-key requirement prevents a release artifact with the feature from being
+# switched to mock mode by a single env var.
+mock-backend = []
+
+[dependencies]
+anyhow = { workspace = true }
+pico-core = { workspace = true }
+pico-guest-protocol = { workspace = true }
+pico-network-agent = { workspace = true }
+pico-runtime = { workspace = true }
+pico-sandboxd-proto = { workspace = true }
+pico-seccomp = { workspace = true }
+pico-telemetry = { workspace = true }
+hashbrown = { workspace = true }
+heapless = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tokio-vsock = { workspace = true }
+toml = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }

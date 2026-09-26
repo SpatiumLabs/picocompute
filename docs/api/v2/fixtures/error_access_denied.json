@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "access_denied",
+    "message": "Lease expired at 2026-06-09T12:05:00Z",
+    "request_id": "req_01JXYZ123456789"
+  }
+}

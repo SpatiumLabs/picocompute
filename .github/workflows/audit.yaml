@@ -1,0 +1,38 @@
+name: Security Audit
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "**/Cargo.toml"
+      - ".cargo/audit.toml"
+      - Cargo.lock
+  schedule:
+    - cron: "0 2 * * 0" # Run every sunday at 2AM UTC
+
+permissions:
+  contents: read
+
+jobs:
+  security-audit:
+    permissions:
+      checks: write # for rustsec/audit-check to create check
+      contents: read # for actions/checkout to fetch code
+      issues: write # for rustsec/audit-check to create issues
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile --ignore-rust-version
+
+      - name: Audit Check
+        uses: rustsec/audit-check@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

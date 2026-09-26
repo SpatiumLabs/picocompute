@@ -1,0 +1,641 @@
+syntax = "proto3";
+
+package pico.guest.v1;
+
+// ------------------------------------------------------------------
+// Operational services
+// ------------------------------------------------------------------
+// These services are available only after a successful bootstrap
+// handshake on the authenticated protocol session.
+//
+// Every operational request carries a RequestContext that binds
+// the call to the authenticated session.  The guest rejects a
+// request before any side effect when sandbox ID, session ID,
+// policy epoch, or protocol version does not match.
+//
+// Idempotency and retry:
+//   - Side-effecting RPCs are deduplicated by (sandbox_id,
+//     operation_id).  A duplicate returns the persisted or cached
+//     terminal outcome or continues the same in-progress operation.
+//   - request_id changes for every retry attempt.
+//   - operation_id is stable across retries and reconnects.
+//   - Read-only RPCs omit operation_id and are always safe to
+//     retry on transport unavailability while deadline budget
+//     remains.
+//   - Automatic gRPC retries are disabled for mutating RPCs.
+//     sandboxd owns retry decisions.
+//
+// Deadline semantics:
+//   - The host owns the absolute operation deadline.
+//   - The host sets the gRPC deadline to the remaining budget.
+//   - The guest converts the received budget to a local monotonic
+//     deadline.
+//   - Every child action uses the same or an earlier deadline.
+//   - A retry never resets or extends the original deadline.
+//
+// Stream semantics:
+//   - Each direction and logical stream has an independent sequence
+//     space.  Sequence IDs start at 1 and increase by one.
+//   - Acknowledgements are cumulative through the highest contiguous
+//     sequence.
+//   - Duplicate frames are ignored after validation.
+//   - A gap pauses delivery and requires replay or fails with a
+//     typed stream error.
+//   - End-of-stream and close are explicit frames.
+//   - The replay buffer keeps at most 1 MiB per output stream.
+// ------------------------------------------------------------------
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// ==================================================================
+// Common types
+// ==================================================================
+
+// Context carried by every operational request.
+message RequestContext {
+  // Unique identity for one transmission attempt.  Changes on retry.
+  string request_id = 1;
+
+  // Stable identity for one logical side-effecting operation.  Same
+  // across retries and reconnects.  Read-only requests may omit this.
+  string operation_id = 2;
+
+  // Expected sandbox identity.  Rejected if it does not match the
+  // authenticated session.
+  string sandbox_id = 3;
+
+  // Authenticated connection session ID assigned during handshake.
+  bytes session_id = 4;
+
+  // Policy version admitted by the host.
+  uint64 policy_epoch = 5;
+
+  // Negotiated protocol major and minor packed as (major << 16 |
+  // minor).
+  uint32 protocol_version = 6;
+
+  // Absolute host deadline as a Unix timestamp (seconds since
+  // epoch).  Used for audit and correlation.  If this and the gRPC
+  // deadline disagree, both peers enforce the earlier deadline.
+  google.protobuf.Timestamp deadline = 7;
+
+  // W3C distributed trace context propagated from the caller.
+  // When set, the guest starts a child span under this parent.
+  TraceContext trace_context = 8;
+}
+
+// W3C trace context for distributed tracing across service
+// boundaries.  Carries the minimum fields needed to continue a
+// trace in the guest.
+message TraceContext {
+  // Hex-encoded trace ID (32 hex chars).
+  string trace_id = 1;
+  // Hex-encoded parent span ID (16 hex chars).
+  string span_id = 2;
+  // W3C trace flags as a single byte (e.g. 0x01 = sampled).
+  uint32 trace_flags = 3;
+  // Optional W3C tracestate header value.
+  string trace_state = 4;
+}
+
+// ------------------------------------------------------------------
+// Operation identity and status
+// ------------------------------------------------------------------
+
+// The terminal outcome of an operation.  Every side-effecting RPC
+// eventually returns one of these.
+message OperationOutcome {
+  oneof status {
+    // The operation completed successfully.
+    Success success = 1;
+    // The operation failed with an application error.
+    Failure failure = 2;
+    // The operation was explicitly canceled.
+    Canceled canceled = 3;
+    // The operation exceeded its deadline.
+    TimedOut timed_out = 4;
+    // The requested capability or operation is not supported.
+    Unsupported unsupported = 5;
+    // The outcome requires human or host-level review.
+    RequiresReview requires_review = 6;
+  }
+
+  message Success {
+    bytes result_payload = 1;
+  }
+
+  message Failure {
+    string code = 1;
+    string message = 2;
+    // True when the caller may retry this specific failure.
+    bool retryable = 3;
+  }
+
+  message Canceled {
+    string reason = 1;
+  }
+
+  message TimedOut {
+    // Remaining budget at timeout (0 means the original budget was
+    // exhausted, >0 means a child action budget was exhausted).
+    google.protobuf.Duration budget_remaining = 1;
+  }
+
+  message Unsupported {
+    string detail = 1;
+  }
+
+  message RequiresReview {
+    string detail = 1;
+  }
+}
+
+// Query for the status of a previously submitted operation.
+message OperationStatusRequest {
+  RequestContext context = 1;
+  string operation_id = 2;
+}
+
+// Current status of an operation.  The operation may still be
+// running or may have reached a terminal outcome.
+message OperationStatusResponse {
+  oneof state {
+    // The operation is still in progress.
+    InProgress in_progress = 1;
+    // The operation has reached a terminal outcome.
+    OperationOutcome terminal = 2;
+  }
+
+  message InProgress {
+    string description = 1;
+  }
+}
+
+// ------------------------------------------------------------------
+// Stream frame types
+// ------------------------------------------------------------------
+
+// A single frame on a logical byte stream (stdout, stderr, file
+// content).  Each direction and logical stream has an independent
+// sequence space.
+message StreamFrame {
+  // Monotonic sequence number starting at 1.
+  uint64 sequence = 1;
+
+  // Payload bytes for this frame.  Max 64 KiB.
+  bytes payload = 2;
+
+  // True when this is the last frame of the stream.
+  bool end_of_stream = 3;
+}
+
+    // Cumulative acknowledgement of received frames.
+message StreamAck {
+  // Highest contiguous sequence number received.
+  uint64 highest_contiguous = 1;
+}
+
+// Generic acknowledgement.  Returned by operations that have no
+// payload beyond confirmation.
+message Ack {}
+
+// ==================================================================
+// Executor service
+// ==================================================================
+
+service Executor {
+  // Execute a command inside the sandbox and stream its output.
+  rpc Exec(ExecRequest) returns (stream ExecResponse);
+
+  // Send a POSIX signal to a running process identified by
+  // operation_id.
+  rpc Signal(SignalRequest) returns (SignalResponse);
+
+  // Cancel a side-effecting operation by operation_id.
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+
+  // Reattach to the output stream of a running or completed
+  // operation.  The caller supplies the last acknowledged frame
+  // sequence number; the guest replays buffered frames or returns
+  // a typed history_lost outcome.
+  rpc AttachStream(AttachStreamRequest) returns (stream AttachStreamResponse);
+}
+
+message ExecRequest {
+  RequestContext context = 1;
+
+  // Command to execute.  Must be a single binary name or absolute
+  // path.  The guest validates this before spawning.
+  string command = 2;
+
+  // Arguments passed to the command.
+  repeated string args = 3;
+
+  // Environment variables.  Merged with (and overriding) the
+  // sandbox default environment.
+  map<string, string> env = 4;
+
+  // Working directory inside the sandbox.  Defaults to the
+  // sandbox root or the image-configured home directory.
+  string working_dir = 5;
+
+  // Per-operation timeout.  If the operation exceeds this, the
+  // guest sends a TimedOut outcome.
+  google.protobuf.Duration timeout = 6;
+
+  // Maximum bytes of stdout to capture.  When exceeded the guest
+  // sends an output_limit_exceeded outcome.
+  uint64 max_stdout_bytes = 7;
+
+  // Maximum bytes of stderr to capture.
+  uint64 max_stderr_bytes = 8;
+}
+
+// Streaming response for Exec.  The server sends zero or more
+// frames followed by a single terminal outcome.
+message ExecResponse {
+  oneof frame {
+    // Stdout data frame.
+    StdoutData stdout = 1;
+    // Stderr data frame.
+    StderrData stderr = 2;
+    // Cumulative acknowledgement from the guest (for flow control).
+    StreamAck ack = 3;
+    // Terminal outcome of the exec operation.
+    OperationOutcome outcome = 4;
+  }
+
+  message StdoutData {
+    StreamFrame frame = 1;
+  }
+
+  message StderrData {
+    StreamFrame frame = 1;
+  }
+}
+
+message SignalRequest {
+  RequestContext context = 1;
+  // The operation_id of the exec operation to signal.
+  string operation_id = 2;
+  // POSIX signal number (e.g., 9 for SIGKILL, 15 for SIGTERM).
+  int32 signal = 3;
+}
+
+message SignalResponse {
+  oneof result {
+    Ack acknowledged = 1;
+    OperationOutcome error = 2;
+  }
+}
+
+message CancelRequest {
+  RequestContext context = 1;
+  // The operation_id to cancel.
+  string operation_id = 2;
+}
+
+message CancelResponse {
+  oneof result {
+    // The operation was accepted for cancellation.
+    Ack accepted = 1;
+    // The operation already reached a terminal state.
+    OperationOutcome already_terminal = 2;
+    // The operation_id is unknown to this session.
+    UnknownOp unknown = 3;
+  }
+}
+
+// The referenced operation ID is not known to this session.
+message UnknownOp {
+  string operation_id = 1;
+}
+
+message AttachStreamRequest {
+  RequestContext context = 1;
+  // The operation_id to attach to.
+  string operation_id = 2;
+  // The last frame sequence number the caller has confirmed.
+  // The guest replays frames starting from sequence + 1.
+  uint64 last_received_sequence = 3;
+}
+
+message AttachStreamResponse {
+  oneof frame {
+    // A buffered or live stdout frame.
+    ExecResponse.StdoutData stdout = 1;
+    // A buffered or live stderr frame.
+    ExecResponse.StderrData stderr = 2;
+    // The requested sequence has been evicted from the replay
+    // buffer.  earliest_available is the first frame still held.
+    HistoryLost history_lost = 3;
+    // Terminal outcome when the operation has completed.
+    OperationOutcome outcome = 4;
+  }
+
+  message HistoryLost {
+    uint64 earliest_available = 1;
+  }
+}
+
+// ==================================================================
+// FileTransfer service
+// ==================================================================
+
+service FileTransfer {
+  // Write a file to the sandbox filesystem.  The request stream
+  // contains metadata in the first message and content frames
+  // thereafter.
+  rpc PutFile(stream PutFileRequest) returns (PutFileResponse);
+
+  // Read a file from the sandbox filesystem.  Returns metadata
+  // and content frames.
+  rpc GetFile(GetFileRequest) returns (stream GetFileResponse);
+}
+
+message PutFileRequest {
+  oneof payload {
+    // First message: file metadata.
+    PutFileMetadata metadata = 1;
+    // Subsequent messages: content chunk frames.
+    StreamFrame chunk = 2;
+  }
+}
+
+message PutFileMetadata {
+  RequestContext context = 1;
+  // Absolute path inside the sandbox.
+  string path = 2;
+  // File permissions in octal (e.g., 0644).
+  uint32 mode = 3;
+  // Expected total content size in bytes.  The guest enforces
+  // this against received data.
+  uint64 expected_size = 4;
+  // Overwrite an existing file.  False causes a typed error if
+  // the path already exists.
+  bool overwrite = 5;
+}
+
+message PutFileResponse {
+  oneof result {
+    // Total bytes written.
+    uint64 bytes_written = 1;
+    OperationOutcome error = 2;
+  }
+  // Blake3 hex digest of the received content.  The host can use
+  // this to verify the guest received exactly what was sent.
+  string checksum = 4;
+}
+
+message GetFileRequest {
+  RequestContext context = 1;
+  // Absolute path inside the sandbox.
+  string path = 2;
+}
+
+message GetFileResponse {
+  oneof frame {
+    // File metadata (sent first).
+    FileMetadata metadata = 1;
+    // Content chunk frame.
+    StreamFrame chunk = 2;
+    // Terminal outcome.
+    OperationOutcome outcome = 3;
+  }
+
+  message FileMetadata {
+    // File size in bytes.
+    uint64 size = 1;
+    // File mode (e.g., 0644).
+    uint32 mode = 2;
+    // Last modification time.
+    google.protobuf.Timestamp modified_at = 3;
+  }
+}
+
+// ==================================================================
+// Mount service
+// ==================================================================
+
+service Mount {
+  // Mount a workspace (host-provided filesystem) at the specified
+  // path inside the sandbox.
+  rpc MountWorkspace(MountWorkspaceRequest) returns (MountWorkspaceResponse);
+}
+
+message MountWorkspaceRequest {
+  RequestContext context = 1;
+  // Guest-side mount point.  Must be an absolute path.
+  string mount_point = 2;
+  // Filesystem type hint (e.g., "virtiofs", "9p").
+  string fs_type = 3;
+  // Mount options (key=value pairs).
+  map<string, string> options = 4;
+}
+
+message MountWorkspaceResponse {
+  oneof result {
+    bool mounted = 1;
+    OperationOutcome error = 2;
+  }
+}
+
+// ==================================================================
+// Monitor service
+// ==================================================================
+
+service Monitor {
+  // Retrieve sandbox resource usage statistics.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+
+  // Perform a health check against the guest agent.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message StatsRequest {
+  RequestContext context = 1;
+}
+
+message StatsResponse {
+  // CPU usage since boot or last reset.
+  CpuStats cpu = 1;
+  // Memory usage.
+  MemoryStats memory = 2;
+  // Disk usage for the sandbox filesystem.
+  DiskStats disk = 3;
+
+  message CpuStats {
+    // Total user-space CPU time.
+    google.protobuf.Duration user_time = 1;
+    // Total kernel-space CPU time.
+    google.protobuf.Duration system_time = 2;
+    // Number of context switches.
+    uint64 context_switches = 3;
+  }
+
+  message MemoryStats {
+    // Resident set size in bytes.
+    uint64 rss_bytes = 1;
+    // Available memory in bytes.
+    uint64 available_bytes = 2;
+    // Total memory in bytes.
+    uint64 total_bytes = 3;
+    // Swap usage in bytes.
+    uint64 swap_bytes = 4;
+  }
+
+  message DiskStats {
+    // Total disk space in bytes.
+    uint64 total_bytes = 1;
+    // Used disk space in bytes.
+    uint64 used_bytes = 2;
+    // Available disk space in bytes.
+    uint64 available_bytes = 3;
+  }
+}
+
+message HealthRequest {
+  RequestContext context = 1;
+}
+
+message HealthResponse {
+  // Overall health status.
+  HealthStatus status = 1;
+
+  // Human-readable health details (e.g., "all subsystems ok").
+  string message = 2;
+
+  enum HealthStatus {
+    HEALTH_STATUS_UNSPECIFIED = 0;
+    HEALTH_STATUS_OK = 1;
+    HEALTH_STATUS_DEGRADED = 2;
+    HEALTH_STATUS_UNHEALTHY = 3;
+  }
+}
+
+// ==================================================================
+// Lifecycle service
+// ==================================================================
+
+service Lifecycle {
+  // Prepare the guest for a snapshot.  The guest drains or rejects
+  // active operations, invalidates the protocol session, zeroizes
+  // the boot secret, and confirms quiescence.
+  rpc Quiesce(QuiesceRequest) returns (QuiesceResponse);
+
+  // Notify the guest that it has been restored from a snapshot
+  // (or forked).  The guest receives a fresh session and refreshes
+  // non-restorable resources.
+  rpc ResumeNotify(ResumeNotifyRequest) returns (ResumeNotifyResponse);
+
+  // Orderly shutdown of the guest agent and optionally the entire
+  // sandbox.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+message QuiesceRequest {
+  RequestContext context = 1;
+
+  // How to handle active operations.
+  DrainMode drain_mode = 2;
+
+  // Deadline for quiescence.  The guest must complete draining
+  // or reject all operations before this.
+  google.protobuf.Timestamp quiesce_deadline = 3;
+
+  enum DrainMode {
+    DRAIN_MODE_UNSPECIFIED = 0;
+    // Wait for active operations to complete within the deadline.
+    DRAIN_MODE_GRACEFUL = 1;
+    // Terminate all active operations immediately.
+    DRAIN_MODE_FORCE = 2;
+  }
+}
+
+message QuiesceResponse {
+  oneof result {
+    // The guest has quiesced successfully.
+    bool quiesced = 1;
+    // The guest could not quiesce within the deadline.
+    OperationOutcome error = 2;
+  }
+}
+
+message ResumeNotifyRequest {
+  RequestContext context = 1;
+  // Fresh per-boot sandbox identity after restore.
+  string sandbox_id = 2;
+  // New policy epoch for the resumed sandbox.
+  uint64 policy_epoch = 3;
+  // Lineage identifier for snapshot ancestry tracking.
+  string lineage_id = 4;
+  // Timestamp when the snapshot was taken.
+  google.protobuf.Timestamp snapshot_taken_at = 5;
+}
+
+message ResumeNotifyResponse {
+  oneof result {
+    // The guest has accepted the resume notification and refreshed
+    // non-restorable resources.
+    bool accepted = 1;
+    // The guest rejected the resume due to a terminal condition.
+    OperationOutcome error = 2;
+  }
+}
+
+message ShutdownRequest {
+  RequestContext context = 1;
+  // Human-readable reason for the shutdown.
+  string reason = 2;
+  // If true, force-shutdown without honoring active operations.
+  bool force = 3;
+}
+
+message ShutdownResponse {
+  oneof result {
+    // Shutdown has been initiated.
+    bool shutting_down = 1;
+    // The guest could not shut down.
+    OperationOutcome error = 2;
+  }
+}
+
+// ==================================================================
+// Secrets service
+// ==================================================================
+
+service Secrets {
+  // Inject short-lived credentials into the sandbox at the canonical
+  // secrets tmpfs path. Credentials are mounted through tmpfs and
+  // excluded from snapshots.
+  rpc InjectSecrets(InjectSecretsRequest) returns (InjectSecretsResponse);
+}
+
+message InjectSecretsRequest {
+  RequestContext context = 1;
+  // Lease ID that authorized the credential request.
+  string lease_id = 2;
+  // Policy decision ID that authorized the credential request.
+  string policy_decision_id = 3;
+  // Credential files to write into the secrets tmpfs.
+  repeated SecretCredential credentials = 4;
+}
+
+message SecretCredential {
+  // File name inside the secrets directory.
+  string name = 1;
+  // Raw credential bytes.
+  bytes content = 2;
+  // File mode (e.g., 0400).
+  uint32 mode = 3;
+}
+
+message InjectSecretsResponse {
+  oneof result {
+    // Credentials were injected successfully.
+    bool injected = 1;
+    // The injection failed.
+    OperationOutcome error = 2;
+  }
+}

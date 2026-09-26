@@ -1,0 +1,1191 @@
+openapi: "3.2.0"
+info:
+  title: PicoCompute API
+  version: "2.0.0"
+  $self: https://api.picocompute.dev/v2/openapi.yaml
+  description: |
+    PicoCompute public API for sandbox lifecycle, command execution, file access,
+    workspace streaming, and port exposure.
+
+    ## Versioning
+
+    This is the v2 API. Breaking changes from v1:
+
+    - **State model**: 12 states (v1 had 15). `Executing` and `Idle` are
+      removed. `Requested` renamed to `Pending`.
+    - **Idempotency**: All lifecycle operations require an `Idempotency-Key`
+      header.
+    - **Tenant context**: All requests require a `PicoCompute-Tenant` header.
+    - **Access leases**: Exec, stream, and file operations require a signed
+      `PicoCompute-Access-Lease` header.
+    - **Long-running operations**: Create, Suspend, Resume, and Destroy return
+      an operation token for async polling.
+    - **Response envelopes**: All responses include a `request_id`.
+
+    ## Error taxonomy
+
+    | Status | Code | Meaning |
+    |--------|------|---------|
+    | 400 | `validation_error` | Request schema or constraint violation |
+    | 401 | `unauthenticated` | Missing or invalid bearer token |
+    | 403 | `access_denied` | Lease expired, revoked, or scope mismatch |
+    | 403 | `quota_exceeded` | Tenant resource quota exhausted |
+    | 403 | `policy_denied` | Policy engine rejected the request |
+    | 404 | `not_found` | Sandbox or resource does not exist |
+    | 409 | `state_conflict` | Sandbox state does not allow the requested operation |
+    | 409 | `version_conflict` | Optimistic concurrency failure; re-read and retry |
+    | 422 | `scheduling_error` | No cell has capacity for the request |
+    | 500 | `runtime_error` | Internal runtime failure |
+    | 503 | `not_ready` | Service is starting or degraded |
+    | 504 | `timeout` | Operation exceeded its deadline |
+
+    ## Idempotency
+
+    Every state-mutating operation accepts an `Idempotency-Key` header
+    (max 256 bytes, `[a-zA-Z0-9_-]`). Repeating a request with the same key
+    within the retention window returns the original response without
+    re-executing the operation. Idempotency keys are scoped to the tenant.
+
+    ## Access model
+
+    Lifecycle operations (create, destroy, suspend, resume) use standard
+    bearer authentication. Runtime access operations (exec, stream, file read,
+    file write) require a signed access lease in addition to the bearer token.
+
+tags:
+  - name: sandboxes
+    summary: Sandboxes
+    description: Sandbox lifecycle operations
+    kind: nav
+
+  - name: create
+    summary: Create
+    description: Sandbox creation and forking
+    parent: sandboxes
+    kind: nav
+
+  - name: lifecycle
+    summary: Lifecycle
+    description: Suspend, resume, and destroy operations
+    parent: sandboxes
+    kind: nav
+
+  - name: exec
+    summary: Exec
+    description: Command execution inside sandboxes
+    kind: nav
+
+  - name: streaming
+    summary: Streams
+    description: Interactive terminal, TCP, and stdio streams
+    kind: nav
+
+  - name: files
+    summary: Files
+    description: Workspace file read and write operations
+    kind: nav
+
+  - name: networking
+    summary: Networking
+    description: Port exposure and management
+    kind: nav
+
+  - name: operations
+    summary: Operations
+    description: Long-running operation status polling
+    kind: nav
+
+  - name: requires-lease
+    summary: Requires Access Lease
+    description: Operations that require a PicoCompute-Access-Lease header
+    kind: badge
+
+servers:
+  - url: https://api.picocompute.dev/v2
+    description: Production
+    name: production
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ---- Sandbox lifecycle ----
+
+  /sandboxes:
+    post:
+      tags: [create, sandboxes]
+      operationId: CreateSandbox
+      summary: Create a new sandbox or fork an existing one
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Tenant"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSandboxRequest"
+            examples:
+              create:
+                summary: Create a standard Firecracker sandbox
+                value:
+                  runtime: firecracker
+                  image: alpine-linux-6.1
+                  vcpus: 2
+                  memory_mb: 512
+                  idle_timeout_secs: 300
+                  ports: [8080]
+              fork:
+                summary: Fork from an existing sandbox
+                value:
+                  source_sandbox_id: sbx_01JXYZABCDEFGH
+                  idle_timeout_secs: 600
+      responses:
+        "202":
+          description: Sandbox creation accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+              examples:
+                accepted:
+                  value:
+                    operation_id: op_01JXYZ123456789
+                    sandbox_id: sbx_01JXYZABCDEFGH
+                    state: Pending
+                    status_url: /v2/operations/op_01JXYZ123456789
+        "201":
+          description: |
+            Sandbox created synchronously (available for stub and
+            pre-warmed runtimes). The idempotency-key replay result
+            also uses this status code.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "403":
+          $ref: "#/components/responses/QuotaExceeded"
+        "409":
+          description: Idempotency key conflict (different body with same key)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: idempotency_conflict
+                  message: A different request was already submitted with this idempotency key
+                  request_id: req_01JXYZ123456789
+
+    get:
+      tags: [sandboxes]
+      operationId: ListSandboxes
+      summary: List sandboxes for the tenant
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 250
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: state
+          description: Filter by lifecycle state
+          in: query
+          schema:
+            $ref: "#/components/schemas/SandboxState"
+        - name: runtime
+          description: Filter by runtime type
+          in: query
+          schema:
+            $ref: "#/components/schemas/RuntimeType"
+      responses:
+        "200":
+          description: Paginated list of sandboxes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxList"
+
+  /sandboxes/{sandbox_id}:
+    get:
+      tags: [sandboxes]
+      operationId: GetSandbox
+      summary: Get sandbox status and metadata
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/Tenant"
+      responses:
+        "200":
+          description: Sandbox found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      tags: [lifecycle, sandboxes]
+      operationId: DestroySandbox
+      summary: Destroy a sandbox and release its resources
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Tenant"
+      responses:
+        "202":
+          description: Destroy accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "200":
+          description: |
+            Sandbox already destroyed (idempotent replay) or destroyed
+            synchronously.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/StateConflict"
+
+  /sandboxes/{sandbox_id}/suspend:
+    post:
+      tags: [lifecycle, sandboxes]
+      operationId: SuspendSandbox
+      summary: Suspend a running sandbox
+      description: |
+        Suspends the VM, preserving memory and device state. The sandbox must
+        be in the `Running` state. If already `Suspended`, returns the current
+        state (idempotent). If `Suspending`, waits for the transition to
+        complete.
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Tenant"
+      responses:
+        "202":
+          description: Suspend accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "200":
+          description: Sandbox already suspended (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+                example:
+                  id: sbx_01JXYZABCDEFGH
+                  state: Suspended
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/StateConflict"
+
+  /sandboxes/{sandbox_id}/resume:
+    post:
+      tags: [lifecycle, sandboxes]
+      operationId: ResumeSandbox
+      summary: Resume a suspended sandbox
+      description: |
+        Resumes the VM from its suspended state. The sandbox must be in the
+        `Suspended` state. If already `Running`, returns the current state
+        (idempotent). If `Resuming`, waits for the transition to complete.
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Tenant"
+      responses:
+        "202":
+          description: Resume accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "200":
+          description: Sandbox already running (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+                example:
+                  id: sbx_01JXYZABCDEFGH
+                  state: Running
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/StateConflict"
+
+  # ---- Runtime access ----
+
+  /sandboxes/{sandbox_id}/exec:
+    post:
+      tags: [exec, requires-lease]
+      operationId: Exec
+      summary: Execute a command inside the sandbox
+      description: |
+        The sandbox must be in the `Running` state. The access lease must
+        authorize the `exec` action for this sandbox.
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/AccessLease"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecRequest"
+      responses:
+        "200":
+          description: Command executed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "403":
+          description: Access lease invalid, expired, or scope mismatch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: access_denied
+                  message: Lease expired at 2026-06-09T12:05:00Z
+                  request_id: req_01JXYZ123456789
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/StateConflict"
+        "504":
+          $ref: "#/components/responses/Timeout"
+
+  /sandboxes/{sandbox_id}/stream:
+    post:
+      tags: [streaming, requires-lease]
+      operationId: AttachStream
+      summary: Open an interactive stream to the sandbox
+      description: |
+        Supports bidirectional streaming via WebSocket upgrade (HTTP 101) or
+        server-sent events for terminal output. The sandbox must be in the
+        `Running` state. The access lease must authorize the `stream` action.
+
+        When using SSE (`text/event-stream`), each event contains one line of
+        stdout or stderr output.
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/AccessLease"
+        - name: protocol
+          in: query
+          description: Stream protocol
+          schema:
+            type: string
+            enum: [terminal, tcp, stdio]
+            default: terminal
+        - name: command
+          in: query
+          description: Command to attach to (for stdio protocol)
+          schema:
+            type: string
+      responses:
+        "101":
+          description: WebSocket upgrade
+        "200":
+          description: Server-sent events stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              itemSchema:
+                $ref: "#/components/schemas/StreamEvent"
+        "403":
+          description: Access lease invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/StateConflict"
+
+  /sandboxes/{sandbox_id}/files:
+    get:
+      tags: [files, requires-lease]
+      operationId: GetFile
+      summary: Read a file or list a directory
+      description: |
+        The access lease must authorize the `file_read` action. If `path` is
+        a directory, returns a list of entries. If a file, returns its content.
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/AccessLease"
+        - name: path
+          in: query
+          required: true
+          description: Path relative to the sandbox workspace root
+          schema:
+            type: string
+            example: /home/user/main.py
+        - name: recursive
+          in: query
+          description: List directories recursively
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: File contents or directory listing
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/FileReadResponse"
+                  - type: array
+                    items:
+                      $ref: "#/components/schemas/FileInfo"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "403":
+          $ref: "#/components/responses/AccessDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    put:
+      tags: [files, requires-lease]
+      operationId: PutFile
+      summary: Write a file into the sandbox workspace
+      description: |
+        The access lease must authorize the `file_write` action. Creates parent
+        directories if they do not exist.
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Tenant"
+        - $ref: "#/components/parameters/AccessLease"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FileWriteRequest"
+      responses:
+        "200":
+          description: File written
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileInfo"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "403":
+          $ref: "#/components/responses/AccessDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /sandboxes/{sandbox_id}/ports:
+    post:
+      tags: [networking]
+      operationId: ExposePort
+      summary: Expose a sandbox network port on the host
+      description: |
+        Binds a host port and proxies traffic to the sandbox guest port.
+        The sandbox must be in the `Running` state.
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Tenant"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExposePortRequest"
+      responses:
+        "200":
+          description: Port exposed (or already exposed, idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExposePortResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/StateConflict"
+
+  /sandboxes/{sandbox_id}/ports/{port}:
+    delete:
+      tags: [networking]
+      operationId: UnexposePort
+      summary: Remove a port exposure
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - name: port
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 65535
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/Tenant"
+      responses:
+        "200":
+          description: Port exposure removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExposePortResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---- Operations ----
+
+  /operations/{operation_id}:
+    get:
+      tags: [operations]
+      operationId: GetOperation
+      summary: Poll a long-running operation for completion
+      parameters:
+        - name: operation_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^op_[a-zA-Z0-9]+$"
+        - $ref: "#/components/parameters/Tenant"
+      responses:
+        "200":
+          description: Operation status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Bearer token for API authentication. Scoped to a tenant. Obtain from
+        the PicoCompute control plane.
+
+  parameters:
+    SandboxId:
+      name: sandbox_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^sbx_[a-zA-Z0-9]+$"
+      example: sbx_01JXYZABCDEFGH
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+        pattern: "^[a-zA-Z0-9_-]+$"
+      description: |
+        Client-generated key for idempotent request replay. Scoped to the
+        tenant. Results are retained for 24 hours.
+
+    Tenant:
+      name: PicoCompute-Tenant
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[a-z][a-z0-9_-]*$"
+      description: Tenant identifier for multi-tenancy.
+
+    AccessLease:
+      name: PicoCompute-Access-Lease
+      in: header
+      schema:
+        type: string
+      description: |
+        Signed Ed25519 access lease authorizing a specific action on a
+        specific sandbox. Obtained from the control-plane lease endpoint.
+
+  responses:
+    ValidationError:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: validation_error
+              message: "sandbox_id must match pattern ^sbx_[a-zA-Z0-9]+$"
+              details:
+                - field: sandbox_id
+                  issue: pattern_mismatch
+                  expected: "^sbx_[a-zA-Z0-9]+$"
+                  received: "my-sandbox"
+              request_id: req_01JXYZ123456789
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: not_found
+              message: "sandbox sbx_01JXYZABCDEFGH not found"
+              request_id: req_01JXYZ123456789
+
+    QuotaExceeded:
+      description: Tenant resource quota exceeded
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: quota_exceeded
+              message: "Tenant sandbox limit (10) reached"
+              details:
+                limit: 10
+                current: 10
+                resource: sandbox_count
+              request_id: req_01JXYZ123456789
+
+    AccessDenied:
+      description: Access denied
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: access_denied
+              message: "Lease expired at 2026-06-09T12:05:00Z"
+              request_id: req_01JXYZ123456789
+
+    StateConflict:
+      description: Sandbox state does not allow this operation
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: state_conflict
+              message: "Sandbox must be Running to exec (current state: Suspended)"
+              details:
+                current_state: Suspended
+                required_states:
+                  - Running
+              request_id: req_01JXYZ123456789
+
+    Timeout:
+      description: Operation timed out
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: timeout
+              message: "Exec did not complete within 30s deadline"
+              request_id: req_01JXYZ123456789
+
+  schemas:
+    # ---- Enums ----
+
+    SandboxState:
+      type: string
+      enum:
+        - Pending
+        - Scheduled
+        - Preparing
+        - Booting
+        - Running
+        - Suspending
+        - Suspended
+        - Resuming
+        - Stopped
+        - Destroying
+        - Destroyed
+        - Failed
+
+    RuntimeType:
+      type: string
+      enum:
+        - firecracker
+        - qemu
+
+    FailureCode:
+      type: string
+      enum:
+        - boot_timeout
+        - resource_exhausted
+        - network_unreachable
+        - suspend_failed
+        - resume_failed
+        - workspace_corrupted
+        - image_pull_failed
+        - quota_exceeded
+        - policy_denied
+        - internal_error
+
+    OperationStatus:
+      type: string
+      enum:
+        - pending
+        - in_progress
+        - completed
+        - failed
+
+    StreamProtocol:
+      type: string
+      enum:
+        - terminal
+        - tcp
+        - stdio
+
+    # ---- Request types ----
+
+    CreateSandboxRequest:
+      type: object
+      required:
+        - image
+      properties:
+        runtime:
+          allOf:
+            - $ref: "#/components/schemas/RuntimeType"
+          default: firecracker
+        image:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Root filesystem image identifier
+          example: alpine-linux-6.1
+        source_sandbox_id:
+          type: string
+          pattern: "^sbx_[a-zA-Z0-9]+$"
+          description: |
+            When set, forks the workspace and configuration from this sandbox.
+            The source sandbox state is unchanged by the fork.
+          example: sbx_01JXYZABCDEFGH
+        vcpus:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 2
+        memory_mb:
+          type: integer
+          minimum: 64
+          maximum: 65536
+          default: 512
+        idle_timeout_secs:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 300
+          description: Seconds of inactivity before automatic stop. 0 disables.
+        ports:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          uniqueItems: true
+          description: Guest ports to expose on the host
+          example: [8080, 3000]
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: Environment variables to inject into the sandbox
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: Arbitrary key-value metadata for the sandbox
+
+    ExecRequest:
+      type: object
+      required:
+        - command
+      properties:
+        command:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          example: python
+        args:
+          type: array
+          items:
+            type: string
+          example: ["-c", "print('hello')"]
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: Environment overrides for this execution
+        working_dir:
+          type: string
+          example: /home/user
+        timeout_secs:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 30
+          description: Execution deadline in seconds
+
+    FileWriteRequest:
+      type: object
+      required:
+        - path
+        - content
+      properties:
+        path:
+          type: string
+          minLength: 1
+          description: Path relative to workspace root
+          example: /home/user/main.py
+        content:
+          type: string
+          description: File content
+        append:
+          type: boolean
+          default: false
+          description: Append to existing file instead of overwriting
+
+    ExposePortRequest:
+      type: object
+      required:
+        - guest_port
+      properties:
+        guest_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Guest-side port to expose
+          example: 8080
+        host_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Host-side port (auto-assigned if omitted)
+
+    # ---- Response types ----
+
+    Sandbox:
+      type: object
+      properties:
+        id:
+          type: string
+          example: sbx_01JXYZABCDEFGH
+        state:
+          $ref: "#/components/schemas/SandboxState"
+        runtime:
+          $ref: "#/components/schemas/RuntimeType"
+        image:
+          type: string
+          example: alpine-linux-6.1
+        vcpus:
+          type: integer
+          example: 2
+        memory_mb:
+          type: integer
+          example: 512
+        idle_timeout_secs:
+          type: integer
+          example: 300
+        ports:
+          type: array
+          items:
+            $ref: "#/components/schemas/PortBinding"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-06-09T12:00:00Z"
+        last_activity_at:
+          type: string
+          format: date-time
+          example: "2026-06-09T12:05:00Z"
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        failure:
+          $ref: "#/components/schemas/FailureInfo"
+        request_id:
+          type: string
+          example: req_01JXYZ123456789
+
+    PortBinding:
+      type: object
+      properties:
+        guest_port:
+          type: integer
+          example: 8080
+        host_port:
+          type: integer
+          example: 32001
+        host_address:
+          type: string
+          example: 127.0.0.1
+
+    FailureInfo:
+      type: object
+      properties:
+        code:
+          $ref: "#/components/schemas/FailureCode"
+        message:
+          type: string
+          example: "Guest agent did not respond within 300s boot timeout"
+        retryable:
+          type: boolean
+          example: true
+        occurred_at:
+          type: string
+          format: date-time
+          example: "2026-06-09T12:10:15Z"
+
+    Operation:
+      type: object
+      properties:
+        operation_id:
+          type: string
+          pattern: "^op_[a-zA-Z0-9]+$"
+          example: op_01JXYZ123456789
+        sandbox_id:
+          type: string
+          pattern: "^sbx_[a-zA-Z0-9]+$"
+          description: Present when the operation created a sandbox
+          example: sbx_01JXYZABCDEFGH
+        action:
+          type: string
+          enum:
+            - create
+            - destroy
+            - suspend
+            - resume
+            - fork
+          example: create
+        status:
+          $ref: "#/components/schemas/OperationStatus"
+        state:
+          $ref: "#/components/schemas/SandboxState"
+          description: Current lifecycle state of the sandbox
+        result:
+          description: |
+            The final sandbox resource when the operation is `completed`.
+            Absent while `pending` or `in_progress`.
+          allOf:
+            - $ref: "#/components/schemas/Sandbox"
+        error:
+          description: Error information when the operation is `failed`
+          allOf:
+            - $ref: "#/components/schemas/Error"
+        status_url:
+          type: string
+          format: uri-reference
+          example: /v2/operations/op_01JXYZ123456789
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-06-09T12:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-06-09T12:00:05Z"
+        request_id:
+          type: string
+          example: req_01JXYZ123456789
+
+    SandboxList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Sandbox"
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page; null on the last page
+          example: cur_01JXYZ123456789
+        request_id:
+          type: string
+          example: req_01JXYZ123456789
+
+    ExecResponse:
+      type: object
+      properties:
+        exit_code:
+          type: integer
+          example: 0
+        stdout:
+          type: string
+          example: "hello\n"
+        stderr:
+          type: string
+          example: ""
+        duration_ms:
+          type: integer
+          example: 42
+        request_id:
+          type: string
+          example: req_01JXYZ123456789
+
+    FileReadResponse:
+      type: object
+      properties:
+        path:
+          type: string
+          example: /home/user/main.py
+        content:
+          type: string
+          example: "print('hello')\n"
+        size:
+          type: integer
+          example: 17
+        modified_at:
+          type: string
+          format: date-time
+          example: "2026-06-09T12:00:00Z"
+        request_id:
+          type: string
+          example: req_01JXYZ123456789
+
+    FileInfo:
+      type: object
+      properties:
+        path:
+          type: string
+          example: /home/user/main.py
+        size:
+          type: integer
+          example: 17
+        is_dir:
+          type: boolean
+          example: false
+        modified_at:
+          type: string
+          format: date-time
+          example: "2026-06-09T12:00:00Z"
+
+    ExposePortResponse:
+      type: object
+      properties:
+        sandbox_id:
+          type: string
+          example: sbx_01JXYZABCDEFGH
+        guest_port:
+          type: integer
+          example: 8080
+        host_port:
+          type: integer
+          example: 32001
+        host_address:
+          type: string
+          example: 127.0.0.1
+        request_id:
+          type: string
+          example: req_01JXYZ123456789
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+            - request_id
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: state_conflict
+            message:
+              type: string
+              description: Human-readable error description
+              example: "Sandbox must be Running to exec (current state: Suspended)"
+            details:
+              description: Optional structured details about the error
+            request_id:
+              type: string
+              description: Unique identifier for this request
+              example: req_01JXYZ123456789
+
+    # ---- Streaming ----
+
+    StreamEvent:
+      type: object
+      description: A single event in a server-sent event stream.
+      properties:
+        stream:
+          type: string
+          enum: [stdout, stderr, status, error]
+          description: Output stream identifier
+          example: stdout
+        data:
+          type: string
+          description: Event payload
+          example: "hello world\n"
+        timestamp:
+          type: string
+          format: date-time
+          description: When the event was produced
+          example: "2026-06-09T12:00:00.123Z"
+
+    # ---- State preconditions ----
+
+    StatePreconditions:
+      description: |
+        Required sandbox state for each operation.
+
+        | Operation | Required state |
+        |-----------|---------------|
+        | Exec | `Running` |
+        | Suspend | `Running` (idempotent if already `Suspended`) |
+        | Resume | `Suspended` (idempotent if already `Running`) |
+        | Fork | Source sandbox in `Running` or `Suspended` |
+        | Destroy | Any except `Destroying`, `Destroyed` |
+        | GetFile | `Running` or `Stopped` (workspace must exist) |
+        | PutFile | `Running` or `Stopped` (workspace must exist) |
+        | AttachStream | `Running` |
+        | ExposePort | `Running` |
+
+        Operations on sandboxes in transitory states (`Preparing`, `Booting`,
+        `Suspending`, `Resuming`, `Destroying`) return `409 state_conflict`
+        with a `retry_after` hint in seconds.
+      type: object

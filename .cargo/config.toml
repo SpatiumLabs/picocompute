@@ -1,0 +1,60 @@
+[build]
+target-dir = "target"
+jobs = 3
+
+[profile.dev]
+# Faster incremental builds in dev
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin" # "thin" is a good balance; use "fat" for max perf
+codegen-units = 1 # Better optimization, slower compile
+strip = "symbols" # Smaller binary in CI/prod
+
+# Custom profile for CI - fast compile, some optimization
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+incremental = false  # CI caches the whole target dir anyway
+
+# Linker (fast on Linux when mold is available)
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "gcc" # Workaround for EC2
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[alias]
+# Setup all local development dependencies
+setup = "install --locked cargo-nextest cargo-hack cargo-sort cargo-udeps prek"
+# Test all workspace crates
+ta = "nextest run --workspace --all-features"
+# Check all without building
+ca = "check --workspace --all-targets"
+# Clippy across everything
+lint = "clippy --workspace --all-targets -- -D warnings"
+# Build release
+ship = "build --workspace --release"
+
+# Registry/source
+[net]
+retry = 3 # Retry failed network requests (useful in CI)
+git-fetch-with-cli = true  # Use system git (helps with SSH keys/auth)
+
+# Sccache (shared compilation cache, great for CI)
+# Uncomment if sccache is installed
+# [build]
+# rustc-wrapper = "sccache"

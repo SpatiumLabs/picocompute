@@ -1,0 +1,53 @@
+[image]
+id = "pico-guest-standard"
+version = "2026.06.0"
+source_date_epoch = 1781170000
+
+[base.source]
+url = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.0-aarch64.tar.gz"
+digest = "sha256:unresolved"
+
+[packages]
+openssh-server = "9.9_p2-r0"
+
+[guest_agent]
+source = "workspace"
+version = "0.3.0"
+protocol_version = "1.0"
+capabilities = ["exec", "file_transfer", "health", "stats"]
+
+[filesystem]
+size = "512M"
+label = "pico-root"
+uuid = "00000000-0000-4000-a000-000000000001"
+
+[[mounts]]
+path = "/workspace"
+class = "workspace"
+writable = true
+lifecycle = "persistent"
+
+[[mounts]]
+path = "/run/pico/tmp"
+class = "runtime_tmp"
+writable = true
+lifecycle = "ephemeral"
+
+[[mounts]]
+path = "/run/pico/secrets"
+class = "secret"
+writable = false
+lifecycle = "ephemeral"
+
+[[mounts]]
+path = "/var/log/pico"
+class = "guest_logs"
+writable = true
+lifecycle = "persistent"
+
+[kernel]
+backend = "firecracker"
+variant = "production"
+version = "pico-linux-6.18"
+cmdline = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init nomodules"
+config_profile = "firecracker-aarch64-v1"

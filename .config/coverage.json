@@ -1,0 +1,25 @@
+{
+  "description": "Coverage gate thresholds for PicoCompute launch reviews. Line coverage gates; region coverage is warn-only. See docs/security/coverage-threshold.md.",
+  "version": 1,
+  "tool": "cargo-llvm-cov",
+  "metric": "line",
+  "scope": "crates/*/src/** filtered from llvm-cov JSON (workspace default members, eBPF crates excluded via workspace exclude). Workspace and per-crate floors all use this filtered scope; unfiltered llvm-cov totals are recorded informationally in gate.json.",
+  "runner": "ubuntu-latest x86_64 only. Arch-gated or OS-gated code covered on another arch reads as uncovered here; see coverage threshold doc limitations.",
+  "thresholds": {
+    "workspace_line": 70.0,
+    "per_crate_line": {
+      "pico-core": 75.0,
+      "pico-runtime": 65.0,
+      "pico-guest-protocol": 80.0,
+      "pico-network-agent": 0.0
+    }
+  },
+  "warn_only": {
+    "workspace_region": 60.0,
+    "note": "Region coverage approximates branch coverage and is reported but never blocks. Tighten to a blocking gate only after three consecutive green CI runs with variance under 2 points."
+  },
+  "gate_behavior": "block",
+  "calibration": "Starter floors are unmeasured. If the first main runs fail, run once with COVERAGE_WARN_ONLY=1 to observe real values, then adjust floors to observed values with a dated entry plus Security owner approval. Never silently keep a red gate red.",
+  "affected_gates": ["G-16", "G-17"],
+  "ratchet": "Thresholds are floors, not targets. Raise a floor only after the new floor holds for three consecutive main runs. Never lower a floor without Security owner approval and a dated entry in docs/security/coverage-threshold.md."
+}

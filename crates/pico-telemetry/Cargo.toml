@@ -1,0 +1,23 @@
+[package]
+name = "pico-telemetry"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Standardized logs, metrics, and traces with OTLP gRPC export"
+
+[dependencies]
+chrono = { workspace = true }
+hashbrown = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,72 @@
+name: Coverage Gate
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - crates/**/*.rs
+      - crates/**/Cargo.toml
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - ".cargo/config.toml"
+      - ".config/coverage.json"
+      - ".config/nextest.toml"
+      - scripts/coverage.sh
+      - ".github/workflows/coverage.yaml"
+  pull_request:
+    branches: [main]
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.event_name }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  coverage:
+    name: Coverage bundle and gate
+    runs-on: ubuntu-latest
+    # x86_64 only; arch-gated code covered elsewhere reads as uncovered
+    # here. See coverage threshold doc limitations.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # HEAD SHA pins the revision; full history is not needed.
+          fetch-depth: 1
+      - name: Install Linux system dependencies
+        uses: ./.github/actions/install-linux-deps
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h
+      - name: Collect coverage and enforce gate
+        # Block on below-threshold: script exits 1, job fails, bundle still uploads.
+        run: ./scripts/coverage.sh
+      - name: Upload revision-pinned bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-bundle-${{ github.sha }}
+          path: target/coverage/bundle-*/
+          if-no-files-found: error
+          retention-days: 90

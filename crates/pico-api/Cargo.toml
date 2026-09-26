@@ -1,0 +1,34 @@
+[package]
+name = "pico-api"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Public REST API for the PicoCompute hypervisor"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+pico-core = { workspace = true }
+pico-host-agent = { workspace = true }
+pico-telemetry = { workspace = true }
+hashbrown = { workspace = true }
+opentelemetry = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+rand = { workspace = true }

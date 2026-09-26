@@ -1,0 +1,42 @@
+name: Semgrep OSS scan
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - crates/**/*.rs
+      - crates/**/Cargo.toml
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - ".github/workflows/semgrep.yaml"
+  pull_request:
+    branches: [main]
+    paths: *paths
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * 0" # Run every sunday at midnight UTC
+
+concurrency:
+  group: semgrep-${{ github.event_name }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: semgrep-oss
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - id: cache-semgrep
+        uses: actions/cache@v6
+        with:
+          path: ~/.local
+          key: semgrep-1.164.0-${{ runner.os }}
+      - if: steps.cache-semgrep.outputs.cache-hit != 'true'
+        run: pip install --user semgrep==1.164.0
+      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: semgrep scan --config=auto

@@ -1,0 +1,10 @@
+{
+  "operation_id": "op_01JXYZ123456789",
+  "action": "create",
+  "status": "pending",
+  "state": "Pending",
+  "status_url": "/v2/operations/op_01JXYZ123456789",
+  "created_at": "2026-06-09T12:00:00Z",
+  "updated_at": "2026-06-09T12:00:00Z",
+  "request_id": "req_01JXYZ123456789"
+}

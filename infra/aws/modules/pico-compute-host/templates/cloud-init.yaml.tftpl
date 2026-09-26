@@ -1,0 +1,101 @@
+#cloud-config
+
+write_files:
+  - path: /usr/local/bin/pico-bootstrap.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      exec > >(tee /var/log/pico-bootstrap.log) 2>&1
+
+      log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+      retry() {
+        local max="$${1:-3}"; local delay="$${2:-5}"; shift 2; local i=1
+        while true; do
+          if "$@"; then return 0; fi
+          if (( i >= max )); then return 1; fi
+          sleep "$delay"; (( i++ )); (( delay *= 2 ))
+        done
+      }
+
+      AWS_REGION="${aws_region}"
+      DOMAIN_NAME="${domain_name}"
+      RUNTIME="${runtime}"
+      ARCH="${arch}"
+      IDLE_TIMEOUT_SECS="${idle_timeout_secs}"
+      PICO_ROOT="/opt/pico"
+      PICO_BIN="$PICO_ROOT/bin"
+      PICO_IMAGE_DIR="$PICO_ROOT/image/$ARCH"
+      ASSET_CACHE_BUCKET="${asset_cache_bucket}"
+      ASSET_CACHE_PREFIX="${asset_cache_prefix}"
+      COMMIT="${commit}"
+
+      mkdir -p "$PICO_BIN" "$PICO_IMAGE_DIR" /var/lib/pico/workspaces /etc/pico
+
+      # --- Download binaries from S3 ---
+
+      if [[ -z "$ASSET_CACHE_BUCKET" ]]; then
+        log "asset cache disabled, expecting binaries at $PICO_BIN and image at $PICO_IMAGE_DIR"
+      else
+        log "downloading host-agent from s3://$ASSET_CACHE_BUCKET/$ASSET_CACHE_PREFIX/$COMMIT/$ARCH/pico-host-agent"
+        retry 3 5 aws s3 cp "s3://$ASSET_CACHE_BUCKET/$ASSET_CACHE_PREFIX/$COMMIT/$ARCH/pico-host-agent" "$PICO_BIN/pico-host-agent" --region "$AWS_REGION"
+        chmod 0755 "$PICO_BIN/pico-host-agent"
+
+        log "downloading sandboxd from s3://$ASSET_CACHE_BUCKET/$ASSET_CACHE_PREFIX/$COMMIT/$ARCH/pico-sandboxd"
+        retry 3 5 aws s3 cp "s3://$ASSET_CACHE_BUCKET/$ASSET_CACHE_PREFIX/$COMMIT/$ARCH/pico-sandboxd" "$PICO_BIN/pico-sandboxd" --region "$AWS_REGION"
+        chmod 0755 "$PICO_BIN/pico-sandboxd"
+
+        log "downloading kernel from s3://$ASSET_CACHE_BUCKET/$ASSET_CACHE_PREFIX/$COMMIT/$ARCH/kernel/vmlinux"
+        retry 3 5 aws s3 cp "s3://$ASSET_CACHE_BUCKET/$ASSET_CACHE_PREFIX/$COMMIT/$ARCH/kernel/vmlinux" "$PICO_IMAGE_DIR/vmlinux" --region "$AWS_REGION"
+
+        log "downloading rootfs from s3://$ASSET_CACHE_BUCKET/$ASSET_CACHE_PREFIX/$COMMIT/$ARCH/rootfs.ext4"
+        retry 3 5 aws s3 cp "s3://$ASSET_CACHE_BUCKET/$ASSET_CACHE_PREFIX/$COMMIT/$ARCH/rootfs.ext4" "$PICO_IMAGE_DIR/rootfs.ext4" --region "$AWS_REGION"
+      fi
+
+      # --- Host Agent Service ---
+
+      cat >"/etc/pico/host-agent.env" <<EOF_ENV
+      PICO_RUNTIME=$RUNTIME
+      PICO_PUBLIC_HOST=$DOMAIN_NAME
+      PICO_IDLE_TIMEOUT_SECS=$IDLE_TIMEOUT_SECS
+      PICO_WORKSPACE_ROOT=/var/lib/pico/workspaces
+      PICO_IMAGE_DIR=$PICO_IMAGE_DIR
+      PICO_FIRECRACKER_BIN=/usr/local/bin/firecracker
+      PICO_SANDBOXD_BIN=$PICO_BIN/pico-sandboxd
+      RUN_ENV=${environment}
+      EOF_ENV
+      chmod 0600 "/etc/pico/host-agent.env"
+
+      cat >/etc/systemd/system/pico-host-agent.service <<'EOF_SERVICE'
+      [Unit]
+      Description=PicoCompute Host Agent
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      EnvironmentFile=/etc/pico/host-agent.env
+      ExecStartPre=/usr/bin/test -e /dev/kvm
+      ExecStartPre=/usr/bin/test -x /usr/local/bin/firecracker
+      ExecStartPre=/usr/bin/test -f /opt/pico/image/${arch}/vmlinux
+      ExecStartPre=/usr/bin/test -f /opt/pico/image/${arch}/rootfs.ext4
+      ExecStart=/opt/pico/bin/pico-host-agent
+      Restart=on-failure
+      RestartSec=5
+      WorkingDirectory=/opt/pico
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF_SERVICE
+
+      systemctl daemon-reload
+      systemctl enable pico-host-agent.service
+      retry 3 5 systemctl restart pico-host-agent.service
+      systemctl --no-pager --full status pico-host-agent.service
+
+      log "==> bootstrap completed successfully"
+
+runcmd:
+  - [bash, /usr/local/bin/pico-bootstrap.sh]

@@ -1,0 +1,12 @@
+{
+  "error": {
+    "code": "version_conflict",
+    "message": "Sandbox sbx_01JXYZABCDEFGH was modified since last read. Expected version 5, current version 7. Re-read and retry.",
+    "details": {
+      "expected_version": 5,
+      "current_version": 7,
+      "sandbox_id": "sbx_01JXYZABCDEFGH"
+    },
+    "request_id": "req_01JXYZ123456789"
+  }
+}

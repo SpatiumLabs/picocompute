@@ -1,0 +1,342 @@
+[main_thread]
+match_action = "Allow"
+mismatch_action = { errno = 1 }
+
+[[main_thread.filter]]
+syscall = "accept4"
+
+[[main_thread.filter]]
+syscall = "arch_prctl"
+
+[[main_thread.filter]]
+syscall = "bind"
+
+[[main_thread.filter]]
+syscall = "brk"
+
+[[main_thread.filter]]
+syscall = "clock_gettime"
+
+[[main_thread.filter]]
+syscall = "clock_nanosleep"
+
+[[main_thread.filter]]
+syscall = "clone"
+
+[[main_thread.filter]]
+syscall = "clone3"
+
+[[main_thread.filter]]
+syscall = "close"
+
+[[main_thread.filter]]
+syscall = "connect"
+
+[[main_thread.filter]]
+syscall = "dup"
+
+[[main_thread.filter]]
+syscall = "dup3"
+
+[[main_thread.filter]]
+syscall = "epoll_create1"
+
+[[main_thread.filter]]
+syscall = "epoll_ctl"
+
+[[main_thread.filter]]
+syscall = "epoll_pwait"
+
+[[main_thread.filter]]
+syscall = "epoll_wait"
+
+[[main_thread.filter]]
+syscall = "eventfd2"
+
+[[main_thread.filter]]
+syscall = "execve"
+
+[[main_thread.filter]]
+syscall = "exit"
+
+[[main_thread.filter]]
+syscall = "exit_group"
+
+[[main_thread.filter]]
+syscall = "fchmod"
+
+[[main_thread.filter]]
+syscall = "fchown"
+
+[[main_thread.filter]]
+syscall = "fcntl"
+
+[[main_thread.filter]]
+syscall = "fstat"
+
+[[main_thread.filter]]
+syscall = "ftruncate"
+
+[[main_thread.filter]]
+syscall = "futex"
+
+[[main_thread.filter]]
+syscall = "getcpu"
+
+[[main_thread.filter]]
+syscall = "getcwd"
+
+[[main_thread.filter]]
+syscall = "getdents64"
+
+[[main_thread.filter]]
+syscall = "getegid"
+
+[[main_thread.filter]]
+syscall = "geteuid"
+
+[[main_thread.filter]]
+syscall = "getgid"
+
+[[main_thread.filter]]
+syscall = "getpeername"
+
+[[main_thread.filter]]
+syscall = "getpid"
+
+[[main_thread.filter]]
+syscall = "getppid"
+
+[[main_thread.filter]]
+syscall = "getrandom"
+
+[[main_thread.filter]]
+syscall = "getrlimit"
+
+[[main_thread.filter]]
+syscall = "get_robust_list"
+
+[[main_thread.filter]]
+syscall = "getrusage"
+
+[[main_thread.filter]]
+syscall = "getsockname"
+
+[[main_thread.filter]]
+syscall = "getsockopt"
+
+[[main_thread.filter]]
+syscall = "gettid"
+
+[[main_thread.filter]]
+syscall = "gettimeofday"
+
+[[main_thread.filter]]
+syscall = "getuid"
+
+[[main_thread.filter]]
+syscall = "ioctl"
+
+[[main_thread.filter]]
+syscall = "io_uring_enter"
+
+[[main_thread.filter]]
+syscall = "io_uring_register"
+
+[[main_thread.filter]]
+syscall = "io_uring_setup"
+
+[[main_thread.filter]]
+syscall = "kill"
+
+[[main_thread.filter]]
+syscall = "listen"
+
+[[main_thread.filter]]
+syscall = "lseek"
+
+[[main_thread.filter]]
+syscall = "madvise"
+
+[[main_thread.filter]]
+syscall = "memfd_create"
+
+[[main_thread.filter]]
+syscall = "mkdirat"
+
+[[main_thread.filter]]
+syscall = "mknod"
+
+[[main_thread.filter]]
+syscall = "mknodat"
+
+[[main_thread.filter]]
+syscall = "mlock"
+
+[[main_thread.filter]]
+syscall = "mmap"
+
+[[main_thread.filter]]
+syscall = "mount"
+
+[[main_thread.filter]]
+syscall = "mprotect"
+
+[[main_thread.filter]]
+syscall = "mremap"
+
+[[main_thread.filter]]
+syscall = "munlock"
+
+[[main_thread.filter]]
+syscall = "munmap"
+
+[[main_thread.filter]]
+syscall = "name_to_handle_at"
+
+[[main_thread.filter]]
+syscall = "nanosleep"
+
+[[main_thread.filter]]
+syscall = "newfstatat"
+
+[[main_thread.filter]]
+syscall = "openat"
+
+[[main_thread.filter]]
+syscall = "pipe2"
+
+[[main_thread.filter]]
+syscall = "pkey_mprotect"
+
+[[main_thread.filter]]
+syscall = "prctl"
+
+[[main_thread.filter]]
+syscall = "pread64"
+
+[[main_thread.filter]]
+syscall = "prlimit64"
+
+[[main_thread.filter]]
+syscall = "pwrite64"
+
+[[main_thread.filter]]
+syscall = "read"
+
+[[main_thread.filter]]
+syscall = "readlinkat"
+
+[[main_thread.filter]]
+syscall = "readv"
+
+[[main_thread.filter]]
+syscall = "recvfrom"
+
+[[main_thread.filter]]
+syscall = "recvmsg"
+
+[[main_thread.filter]]
+syscall = "renameat"
+
+[[main_thread.filter]]
+syscall = "renameat2"
+
+[[main_thread.filter]]
+syscall = "restart_syscall"
+
+[[main_thread.filter]]
+syscall = "rseq"
+
+[[main_thread.filter]]
+syscall = "rt_sigaction"
+
+[[main_thread.filter]]
+syscall = "rt_sigprocmask"
+
+[[main_thread.filter]]
+syscall = "rt_sigreturn"
+
+[[main_thread.filter]]
+syscall = "sched_getaffinity"
+
+[[main_thread.filter]]
+syscall = "sched_setaffinity"
+
+[[main_thread.filter]]
+syscall = "sched_yield"
+
+[[main_thread.filter]]
+syscall = "sendfile"
+
+[[main_thread.filter]]
+syscall = "sendmsg"
+
+[[main_thread.filter]]
+syscall = "sendto"
+
+[[main_thread.filter]]
+syscall = "set_robust_list"
+
+[[main_thread.filter]]
+syscall = "set_tid_address"
+
+[[main_thread.filter]]
+syscall = "setns"
+
+[[main_thread.filter]]
+syscall = "setrlimit"
+
+[[main_thread.filter]]
+syscall = "setsockopt"
+
+[[main_thread.filter]]
+syscall = "shutdown"
+
+[[main_thread.filter]]
+syscall = "sigaltstack"
+
+[[main_thread.filter]]
+syscall = "socket"
+
+[[main_thread.filter]]
+syscall = "socketpair"
+
+[[main_thread.filter]]
+syscall = "statx"
+
+[[main_thread.filter]]
+syscall = "symlinkat"
+
+[[main_thread.filter]]
+syscall = "sysinfo"
+
+[[main_thread.filter]]
+syscall = "tgkill"
+
+[[main_thread.filter]]
+syscall = "time"
+
+[[main_thread.filter]]
+syscall = "tkill"
+
+[[main_thread.filter]]
+syscall = "umount2"
+
+[[main_thread.filter]]
+syscall = "uname"
+
+[[main_thread.filter]]
+syscall = "unlinkat"
+
+[[main_thread.filter]]
+syscall = "unshare"
+
+[[main_thread.filter]]
+syscall = "wait4"
+
+[[main_thread.filter]]
+syscall = "write"
+
+[[main_thread.filter]]
+syscall = "writev"

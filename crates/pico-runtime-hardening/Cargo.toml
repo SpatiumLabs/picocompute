@@ -1,0 +1,31 @@
+[package]
+name = "pico-runtime-hardening"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Runtime process hardening: namespaces, eBPF syscall audit, anomaly detection, and file integrity monitoring"
+build = "build.rs"
+
+[features]
+default = []
+# Selects the Linux eBPF loader (`ebpf/linux.rs`) instead of the stub.
+# `aya` is always available on Linux target deps so enabling this feature
+# does not leave the loader without its crate (see CI fix).
+ebpf-syscall-audit = []
+# Selects the Linux BPF LSM file integrity loader (`ebpf/fim_linux.rs`).
+# Requires kernel CONFIG_BPF_LSM=y and `bpf` in /sys/kernel/security/lsm.
+ebpf-file-integrity = []
+
+[dependencies]
+pico-telemetry = { workspace = true }
+hashbrown = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.14.0" }
+rustix = { workspace = true, features = ["thread"] }

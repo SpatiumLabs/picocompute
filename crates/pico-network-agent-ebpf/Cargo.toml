@@ -1,0 +1,30 @@
+[package]
+name = "pico-network-agent-ebpf"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "eBPF XDP classifier for per-sandbox L3 network isolation"
+
+[[bin]]
+name = "pico-network-agent-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+
+[package.metadata.cargo-udeps.ignore]
+development = ["pico-network-agent-ebpf"]
+
+[profile.dev]
+opt-level = 1
+debug = true
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+panic = "abort"
+strip = "symbols"
+codegen-units = 1

@@ -1,0 +1,36 @@
+[package]
+name = "pico-runtime"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Runtime for the PicoCompute hypervisor"
+
+[dependencies]
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+pico-core = { workspace = true, features = ["mock-backend"] }
+pico-guest-protocol = { workspace = true }
+pico-network-agent = { workspace = true }
+pico-runtime-hardening = { workspace = true }
+pico-seccomp = { workspace = true }
+hashbrown = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.14.0"
+
+[build-dependencies]
+pico-core = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+tempfile = { workspace = true }
