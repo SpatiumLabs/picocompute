@@ -474,7 +474,7 @@ pub fn aggregate_rejections(rejections: &[(&impl fmt::Debug, String)]) -> Vec<(S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
+    use rand::{SeedableRng, TryRng};
 
     #[derive(Debug, Clone)]
     struct TestCandidate {
@@ -746,24 +746,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sampled_power_of_k_spreads_beyond_global_best() {
-        let candidates = make_candidates();
-        let mut seen_best = false;
-        let mut seen_other = false;
-        for seed in 0..64 {
-            let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-            let outcome = sampled_outcome(&candidates, SelectionMode::PowerOfK { k: 1 }, &mut rng);
-            match outcome.selected.unwrap().id.as_str() {
-                "c1" => seen_best = true,
-                "c2" => seen_other = true,
-                other => panic!("unexpected sampled winner {other}"),
-            }
+    /// Fixed-output RNG that pins which sample index wins without depending
+    /// on any real RNG stream. Constant zero always draws the lowest index
+    /// (the global best of the sorted survivors); constant max always draws
+    /// the highest index.
+    struct FixedRng(u64);
+
+    impl TryRng for FixedRng {
+        type Error = core::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.0 as u32)
         }
-        assert!(
-            seen_best && seen_other,
-            "k=1 over two eligible must elect both across seeds"
-        );
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(self.0)
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            for chunk in dst.chunks_mut(8) {
+                let bytes = self.0.to_le_bytes();
+                let len = chunk.len().min(bytes.len());
+                chunk.copy_from_slice(&bytes[..len]);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sampled_power_of_k_elects_best_of_sample() {
+        let candidates = make_candidates();
+        // k=1 over two eligible survivors: the stub draws one fixed index,
+        // and the winner is that entry, proving selection follows the
+        // sample rather than always taking the global best.
+        let mut low = FixedRng(0);
+        let first = sampled_outcome(&candidates, SelectionMode::PowerOfK { k: 1 }, &mut low);
+        assert_eq!(first.selected.unwrap().id, "c1");
+        assert!(first.selection.sampled);
+
+        let mut high = FixedRng(u64::MAX);
+        let second = sampled_outcome(&candidates, SelectionMode::PowerOfK { k: 1 }, &mut high);
+        assert_eq!(second.selected.unwrap().id, "c2");
+        assert!(second.selection.sampled);
+        assert_eq!(second.selection.sample_size, 1);
+        assert_eq!(second.selection.eligible, 2);
     }
 
     #[test]

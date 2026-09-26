@@ -350,8 +350,11 @@ candidates and picks the best of the sample so concurrent bursts diverge
 instead of herding onto one stale-snapshot winner, and an in-flight
 overlay folds that instance's recent placements back into the snapshot
 before filtering and scoring. Overlay entries expire on a TTL matched to
-inventory staleness and release early when an assignment settles, and the
-winner policy plus overlay state ride the placement spans and responses.
+inventory staleness and release early when an assignment settles: every
+host capacity report funnels through the placement gate, which drops the
+overlay entries the fresh snapshot supersedes so production never
+double-counts placements against refreshed snapshots. The winner policy
+plus overlay state ride the placement spans, responses, and audit events.
 The host keeps final admission authority: boot revalidates assignment,
 fencing, policy epoch, and live capacity, and rejects stale estimates
 with typed errors.

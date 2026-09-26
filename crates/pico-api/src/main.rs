@@ -103,10 +103,14 @@ async fn build_state(config: &AppConfig) -> Result<Arc<dyn SandboxService>> {
         RuntimeBackend::Host(runtime) => runtime,
         RuntimeBackend::Stub => RuntimeType::Firecracker,
     };
+    // The gate owns both schedulers; every capacity report funnels through
+    // it so fresh snapshots release the overlay entries they supersede.
+    let gate =
+        Arc::new(PlacementGate::new(Arc::clone(&registry)).with_default_runtime(default_runtime));
 
     let inner: Arc<dyn SandboxService> = match config.runtime {
         RuntimeBackend::Stub => {
-            seed_stub_registry(&registry);
+            seed_stub_registry(&gate);
             Arc::new(
                 StubAgent::new(config.workspace_root.clone())
                     .context("failed to initialize stub agent")?,
@@ -124,13 +128,11 @@ async fn build_state(config: &AppConfig) -> Result<Arc<dyn SandboxService>> {
                 .context("failed to initialize host agent")?
                 .with_lease_authority(authority),
             );
-            seed_registry_from_host(&registry, &host).await;
-            spawn_host_refresh(Arc::clone(&registry), Arc::clone(&host));
+            seed_registry_from_host(&gate, &host).await;
+            spawn_host_refresh(Arc::clone(&gate), Arc::clone(&host));
             host as Arc<dyn SandboxService>
         }
     };
-    let gate =
-        Arc::new(PlacementGate::new(Arc::clone(&registry)).with_default_runtime(default_runtime));
 
     Ok(Arc::new(
         PolicyEnforcingAgent::with_admission(
@@ -147,7 +149,8 @@ async fn build_state(config: &AppConfig) -> Result<Arc<dyn SandboxService>> {
 ///
 /// Generous static capacity so local development keeps admitting without
 /// host reports.
-fn seed_stub_registry(registry: &Arc<PlacementRegistry>) {
+fn seed_stub_registry(gate: &Arc<PlacementGate>) {
+    let registry = gate.registry();
     registry.upsert_cell(CellInfo {
         cell_id: CellId::from_string("cel_default"),
         region_id: RegionId::from_string("default-region"),
@@ -169,7 +172,7 @@ fn seed_stub_registry(registry: &Arc<PlacementRegistry>) {
         admission_pressure: 0.0,
         snapshot_timing_hint: SnapshotTimingHint::InsufficientData,
     });
-    registry.report_host(
+    gate.report_host(
         &HostCapacityReport {
             host_id: "hst_stub".into(),
             cell_id: "cel_default".into(),
@@ -213,12 +216,12 @@ fn seed_stub_registry(registry: &Arc<PlacementRegistry>) {
 ///
 /// Inventory, health, and stats are observed sequentially, not atomically;
 /// see [`host_report_from_observations`] for the skew bound.
-async fn seed_registry_from_host(registry: &Arc<PlacementRegistry>, host: &Arc<HostAgent>) {
+async fn seed_registry_from_host(gate: &Arc<PlacementGate>, host: &Arc<HostAgent>) {
     let inventory = host.inventory().await;
     let health = host.health_with_gc().await;
     let stats = host.stats().await;
     let report = host_report_from_observations(&inventory, &health, &stats);
-    registry.report_host(&report, time::OffsetDateTime::now_utc());
+    gate.report_host(&report, time::OffsetDateTime::now_utc());
     info!(
         host_id = %report.host_id,
         cell_id = %report.cell_id,
@@ -237,7 +240,7 @@ async fn seed_registry_from_host(registry: &Arc<PlacementRegistry>, host: &Arc<H
 /// Each loop observes inventory, health, and stats sequentially; the
 /// resulting report can mix timestamps under churn (see
 /// [`host_report_from_observations`]).
-fn spawn_host_refresh(registry: Arc<PlacementRegistry>, host: Arc<HostAgent>) {
+fn spawn_host_refresh(gate: Arc<PlacementGate>, host: Arc<HostAgent>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
@@ -246,7 +249,7 @@ fn spawn_host_refresh(registry: Arc<PlacementRegistry>, host: Arc<HostAgent>) {
             let health = host.health_with_gc().await;
             let stats = host.stats().await;
             let report = host_report_from_observations(&inventory, &health, &stats);
-            registry.report_host(&report, time::OffsetDateTime::now_utc());
+            gate.report_host(&report, time::OffsetDateTime::now_utc());
         }
     });
     info!("placement registry ready with 60s host TTL");

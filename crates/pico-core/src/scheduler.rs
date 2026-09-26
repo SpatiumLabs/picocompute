@@ -959,7 +959,20 @@ impl RegionalScheduler {
         if cells.is_empty() {
             tracing::Span::current().record("sampled_k", sampled_k);
             tracing::Span::current().record("overlay_adjusted", false);
-            self.emit_outcome_with_context(request, None, "no_cell_available", None, 0, context);
+            self.emit_outcome_with_context(
+                request,
+                None,
+                "no_cell_available",
+                None,
+                0,
+                SelectionDetail {
+                    sampled: false,
+                    sample_size: 0,
+                    eligible: 0,
+                },
+                false,
+                context,
+            );
             return Err(SchedulerError::NoCellsAvailable);
         }
 
@@ -1004,6 +1017,8 @@ impl RegionalScheduler {
                 format!("{err:?}"),
                 None,
                 outcome.backpressure.total_candidates,
+                outcome.selection,
+                overlay_adjusted,
                 context,
             );
             return Err(err);
@@ -1022,6 +1037,8 @@ impl RegionalScheduler {
                 format!("{err:?}"),
                 None,
                 outcome.backpressure.total_candidates,
+                outcome.selection,
+                overlay_adjusted,
                 context,
             );
             return Err(err);
@@ -1041,6 +1058,8 @@ impl RegionalScheduler {
                 format!("{err:?}"),
                 None,
                 outcome.backpressure.total_candidates,
+                outcome.selection,
+                overlay_adjusted,
                 context,
             );
             return Err(err);
@@ -1079,6 +1098,8 @@ impl RegionalScheduler {
         // instance sees the load even when the snapshot has not refreshed.
         // The host keeps final admission authority; a stale estimate that
         // slips through fails closed at boot with a typed reason.
+        // Cell snapshots carry no disk request, so only vCPU, memory, and
+        // the sandbox slot are reserved here.
         self.overlay.lock().record(
             selected_cell.cell_id.as_str(),
             u64::from(request.vcpus),
@@ -1114,12 +1135,22 @@ impl RegionalScheduler {
             format!("{reason:?}"),
             Some(best_score),
             backpressure_cached.eligible_candidates,
+            selection,
+            overlay_adjusted,
             context,
         );
 
         Ok(response)
     }
 
+    /// Emits the placement outcome audit event when a sink is attached.
+    ///
+    /// Carries the winner policy and overlay state so sampled placements
+    /// stay reconstructible from audit alone.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private audit-emission sink; every argument maps to one audit field and bundling would hide the event contract"
+    )]
     fn emit_outcome_with_context(
         &self,
         request: &SchedulerRequest,
@@ -1127,6 +1158,8 @@ impl RegionalScheduler {
         reason: impl Into<String>,
         score: Option<f64>,
         candidates_evaluated: usize,
+        selection: SelectionDetail,
+        overlay_adjusted: bool,
         context: Option<&ScheduleTraceContext>,
     ) {
         if let Some(ref sink) = self.audit_sink {
@@ -1141,6 +1174,10 @@ impl RegionalScheduler {
                     reason: reason.into(),
                     score,
                     candidates_evaluated,
+                    sampled: selection.sampled,
+                    sample_size: selection.sample_size,
+                    eligible: selection.eligible,
+                    overlay_adjusted,
                     trace_id: context.and_then(|c| c.trace_id.clone()),
                     operation_id: context.and_then(|c| c.operation_id.clone()),
                     idempotency_key: context.and_then(|c| c.idempotency_key.clone()),

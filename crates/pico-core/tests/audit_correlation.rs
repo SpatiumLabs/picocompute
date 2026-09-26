@@ -76,6 +76,10 @@ fn events_share_correlation_identifiers() {
                 reason: "BestScore".into(),
                 score: Some(0.95),
                 candidates_evaluated: 3,
+                sampled: false,
+                sample_size: 3,
+                eligible: 3,
+                overlay_adjusted: false,
             })
             .build(),
     );
@@ -251,6 +255,10 @@ fn policy_decision_precedes_placement() {
                 reason: "BestScore".into(),
                 score: Some(0.85),
                 candidates_evaluated: 4,
+                sampled: false,
+                sample_size: 4,
+                eligible: 4,
+                overlay_adjusted: false,
             })
             .build(),
     );
@@ -337,6 +345,10 @@ fn placement_outcome_precedes_lifecycle_scheduled() {
                 reason: "BestScore".into(),
                 score: Some(0.88),
                 candidates_evaluated: 3,
+                sampled: false,
+                sample_size: 3,
+                eligible: 3,
+                overlay_adjusted: false,
             })
             .build(),
     );

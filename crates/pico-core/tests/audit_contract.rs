@@ -144,12 +144,57 @@ fn placement_outcome_roundtrips() {
             reason: "BestScore".into(),
             score: Some(0.92),
             candidates_evaluated: 5,
+            sampled: false,
+            sample_size: 5,
+            eligible: 5,
+            overlay_adjusted: false,
         })
         .build();
 
     let json = serde_json::to_string(&event).unwrap();
     let back: AuditEvent = serde_json::from_str(&json).unwrap();
     assert_eq!(back.kind, AuditEventKind::PlacementOutcome);
+}
+
+#[test]
+fn placement_outcome_reads_events_without_selection_fields() {
+    // Events recorded before selection detail existed must still decode,
+    // with the new fields defaulting to the un-sampled, un-adjusted state.
+    let hlc = Arc::new(Hlc::new());
+    let event = AuditEventBuilder::new(hlc, AuditEventKind::PlacementOutcome)
+        .sandbox_id(SandboxId::from_string("sbx_test"))
+        .details(AuditEventDetails::PlacementOutcome {
+            cell_id: Some("cel_001".into()),
+            host_id: Some("hst_001".into()),
+            reason: "BestScore".into(),
+            score: Some(0.92),
+            candidates_evaluated: 5,
+            sampled: false,
+            sample_size: 5,
+            eligible: 5,
+            overlay_adjusted: false,
+        })
+        .build();
+
+    let mut json = serde_json::to_value(&event).unwrap();
+    let details = json
+        .get_mut("details")
+        .expect("placement event carries details");
+    for field in ["sampled", "sample_size", "eligible", "overlay_adjusted"] {
+        details
+            .as_object_mut()
+            .expect("details decode as object")
+            .remove(field);
+    }
+    let back: AuditEvent = serde_json::from_value(json).unwrap();
+    assert!(matches!(
+        back.details,
+        Some(AuditEventDetails::PlacementOutcome {
+            sampled: false,
+            overlay_adjusted: false,
+            ..
+        })
+    ));
 }
 
 #[test]
