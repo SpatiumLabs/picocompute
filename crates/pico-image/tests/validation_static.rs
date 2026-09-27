@@ -15,6 +15,11 @@ mod validation_static {
     // ---- happy-path ----
 
     #[test]
+    fn shipped_definition_stays_loadable_and_monolithic() {
+        crate::common::assert_shipped_definition_loads();
+    }
+
+    #[test]
     fn valid_manifest_passes_all_static_checks() {
         let manifest = valid_manifest();
         let def = valid_definition();

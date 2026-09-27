@@ -576,7 +576,15 @@ fn is_valid_uuid(uuid: &str) -> bool {
 pub(super) fn check_no_secrets_in_manifest(
     manifest: &PicoComputeGuestManifest,
 ) -> Result<(), String> {
-    let json = serde_json::to_string(manifest)
+    // The pattern list below is deliberately broad, so it is matched against
+    // the manifest without the environment block: layer names are free text
+    // and a legitimate name such as `toolkit-tokenizer` would otherwise fail
+    // with a misleading "may contain a secret" error. Environment fields get
+    // the narrower assignment-shaped scan in
+    // `check_environment_no_secrets`.
+    let mut without_environment = manifest.clone();
+    without_environment.environment = None;
+    let json = serde_json::to_string(&without_environment)
         .map_err(|e| format!("failed to serialize manifest for secret scan: {}", e))?;
 
     let secret_patterns = [
@@ -661,6 +669,185 @@ pub(super) fn check_platform_info(manifest: &PicoComputeGuestManifest) -> Result
     }
 
     Ok(())
+}
+
+/// Validate the optional environment layer composition.
+///
+/// Monolithic manifests without an environment pass. Layered manifests must
+/// bind the same image family, compatibility profile, architecture, and
+/// snapshot exclusions as the manifest so scheduler placement and host boot
+/// cannot diverge by layer, and must declare the required feature marker so a
+/// reader that predates `environment` refuses the manifest instead of
+/// silently booting the monolithic rootfs.
+pub(super) fn check_environment_composition(
+    manifest: &PicoComputeGuestManifest,
+) -> Result<(), String> {
+    let Some(ref env) = manifest.environment else {
+        if manifest
+            .required_features
+            .iter()
+            .any(|f| f == crate::layers::ENVIRONMENT_LAYER_FEATURE)
+        {
+            return Err(format!(
+                "required feature '{}' declared but no environment composition present",
+                crate::layers::ENVIRONMENT_LAYER_FEATURE
+            ));
+        }
+        return Ok(());
+    };
+    crate::layers::validate_environment_composition(env)?;
+    if env.image_id != manifest.image_id {
+        return Err(format!(
+            "environment image_id '{}' does not match manifest image_id '{}'",
+            env.image_id, manifest.image_id
+        ));
+    }
+    if env.compatibility.profile_id != manifest.compatibility.profile_id {
+        return Err(format!(
+            "environment profile '{}' does not match manifest profile '{}'",
+            env.compatibility.profile_id, manifest.compatibility.profile_id
+        ));
+    }
+    if env.compatibility.architecture != manifest.platform.architecture {
+        return Err(format!(
+            "environment architecture '{}' does not match manifest platform '{}'",
+            env.compatibility.architecture, manifest.platform.architecture
+        ));
+    }
+    let mut env_excl = env.compatibility.snapshot_excluded_classes.clone();
+    env_excl.sort();
+    let mut manifest_excl = manifest.snapshot.excluded_mount_classes.clone();
+    manifest_excl.sort();
+    if env_excl != manifest_excl {
+        return Err(format!(
+            "environment snapshot exclusions {env_excl:?} do not match manifest {manifest_excl:?}"
+        ));
+    }
+    if !manifest
+        .required_features
+        .iter()
+        .any(|f| f == crate::layers::ENVIRONMENT_LAYER_FEATURE)
+    {
+        return Err(format!(
+            "layered manifest must declare required feature '{}'",
+            crate::layers::ENVIRONMENT_LAYER_FEATURE
+        ));
+    }
+    crate::layers::unknown_required_features(manifest).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Enforce the per-layer supply-chain gate: every layer must carry SBOM,
+/// provenance, and signature evidence digests.
+///
+/// Without this the evidence fields are decorative, because a composition with
+/// no evidence at all still builds and promotes. A failed check blocks
+/// promotion at `RootfsBuilder::build`, which runs
+/// `validate_supply_chain` and refuses to sign when the report does not pass.
+pub(super) fn check_environment_supply_chain(
+    manifest: &PicoComputeGuestManifest,
+) -> Result<(), String> {
+    let Some(ref env) = manifest.environment else {
+        return Ok(());
+    };
+    let missing = crate::layers::layers_missing_supply_chain_evidence(env);
+    if !missing.is_empty() {
+        return Err(format!(
+            "environment layers missing sbom/provenance/signature evidence: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Credential keywords checked against environment layer free-text fields.
+///
+/// Lowercase by construction: the scanned value is lowercased once per field,
+/// so patterns are stored lowercase and compared directly. What keeps a
+/// legitimate name such as `toolkit-tokenizer` from matching `token` is
+/// [`is_assignment_shaped`], not the pattern list.
+const LAYER_SECRET_PATTERNS: &[&str] = &[
+    "private_key",
+    "private-key",
+    "private key",
+    "bearer ",
+    "access_key",
+    "secret_key",
+    "api_key",
+    "password",
+    "token",
+];
+
+/// Scan only the environment layer free-text fields for credential patterns.
+///
+/// The whole-manifest scan uses a deliberately broad word list to catch
+/// credentials anywhere in the manifest, which produces false positives on
+/// legitimate layer names (for example a toolkit named `*tokenizer*`). Layer
+/// names and media types are therefore scanned here with assignment-shaped
+/// patterns instead.
+pub(super) fn check_environment_no_secrets(
+    manifest: &PicoComputeGuestManifest,
+) -> Result<(), String> {
+    let Some(ref env) = manifest.environment else {
+        return Ok(());
+    };
+    for layer in env.ordered_layers() {
+        for (field, value) in [
+            ("name", layer.name.as_str()),
+            ("media_type", layer.media_type.as_str()),
+        ] {
+            let lower = value.to_ascii_lowercase();
+            for &pattern in LAYER_SECRET_PATTERNS {
+                if let Some(pos) = lower.find(pattern)
+                    && is_assignment_shaped(&lower, pos, pattern)
+                {
+                    return Err(format!(
+                        "environment layer '{}' {field} may contain a secret near '{pattern}'",
+                        layer.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True when a match of `pattern` at `pos` reads as a credential keyword
+/// rather than part of a longer identifier.
+///
+/// Two shapes are accepted:
+///
+/// - an explicit assignment after the keyword (`token=`, `token:`, `api_key:`),
+///   or
+/// - the keyword standing alone at a field boundary.
+///
+/// A keyword embedded in an identifier must not match, so `toolkit-tokenizer`
+/// is accepted against the `token` pattern.
+fn is_assignment_shaped(haystack: &str, pos: usize, pattern: &str) -> bool {
+    let after = haystack[pos + pattern.len()..].chars().next();
+    let before = haystack[..pos].chars().next_back();
+    let starts_word = before.is_none_or(|c| !is_word_char(c));
+
+    // A pattern that itself ends in a separator (for example `"bearer "`) is
+    // already unambiguous, so the trailing-character check does not apply: the
+    // character after it begins the value, not a longer identifier.
+    let pattern_ends_word = pattern.chars().next_back().is_some_and(is_word_char);
+    if pattern_ends_word {
+        let ends_word = after.is_none_or(|c| !is_word_char(c));
+        if !ends_word {
+            // Embedded in a longer identifier, for example `tokenizer`.
+            return false;
+        }
+        if after.is_some_and(|c| c == '=' || c == ':') {
+            return true;
+        }
+    }
+
+    starts_word
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
 /// Validate that the SBOM covers all components declared in the manifest and

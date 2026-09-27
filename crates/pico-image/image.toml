@@ -51,3 +51,35 @@ variant = "production"
 version = "pico-linux-6.18"
 cmdline = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init nomodules"
 config_profile = "firecracker-aarch64-v1"
+
+# Optional composable environment: base/workspace/toolkit layers stacked at
+# prepare/boot. Omit this section to build the monolithic single-rootfs image.
+# Layers are declared in overlay precedence order; the first `toolkit` entry is
+# the topmost layer. Exactly one `base` and one `workspace` are required.
+# Layer names must match [A-Za-z0-9._-] because hosts derive mount paths from
+# them. Per-layer sbom/provenance/signature digests are required for promotion.
+#
+# [[environment.layers]]
+# role = "base"
+# name = "debian-base"
+# path = "/srv/pico/layers/debian-base.erofs"
+# version = "2026.09.1"
+# sbom_digest = "sha256:<per-layer-sbom>"
+# provenance_digest = "sha256:<per-layer-provenance>"
+# signature_digest = "sha256:<per-layer-signature>"
+#
+# [[environment.layers]]
+# role = "workspace"
+# name = "workspace-seed"
+# path = "/srv/pico/layers/workspace-seed.erofs"
+# sbom_digest = "sha256:<per-layer-sbom>"
+# provenance_digest = "sha256:<per-layer-provenance>"
+# signature_digest = "sha256:<per-layer-signature>"
+#
+# [[environment.layers]]
+# role = "toolkit"
+# name = "toolkit-python"
+# path = "/srv/pico/layers/toolkit-python.erofs"
+# sbom_digest = "sha256:<per-layer-sbom>"
+# provenance_digest = "sha256:<per-layer-provenance>"
+# signature_digest = "sha256:<per-layer-signature>"

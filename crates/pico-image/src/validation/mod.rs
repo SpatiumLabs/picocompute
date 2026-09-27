@@ -100,6 +100,14 @@ pub fn validate_static(
             "platform and architecture",
             Box::new(|| checks::check_platform_info(manifest)),
         ),
+        (
+            "environment layer composition",
+            Box::new(|| checks::check_environment_composition(manifest)),
+        ),
+        (
+            "security posture: no secrets in environment layers",
+            Box::new(|| checks::check_environment_no_secrets(manifest)),
+        ),
     ];
 
     for (name, check_fn) in checks {
@@ -142,6 +150,10 @@ pub fn validate_supply_chain(
         (
             "provenance consistency",
             Box::new(|| checks::check_provenance_consistency(provenance, definition)),
+        ),
+        (
+            "per-layer supply-chain evidence",
+            Box::new(|| checks::check_environment_supply_chain(manifest)),
         ),
     ];
 

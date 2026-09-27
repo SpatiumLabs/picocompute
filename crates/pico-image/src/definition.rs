@@ -13,6 +13,10 @@ pub struct ImageDefinition {
     pub mounts: Vec<MountDef>,
     #[serde(default)]
     pub kernel: Option<KernelSource>,
+    /// Optional composable environment declaration (base/workspace/toolkit
+    /// layers). Absent means the monolithic single-rootfs build.
+    #[serde(default)]
+    pub environment: Option<EnvironmentDef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +75,111 @@ pub struct MountDef {
     pub class: String,
     pub writable: bool,
     pub lifecycle: PathLifecycle,
+}
+
+/// Composable environment declaration: the layers to stack, in order.
+///
+/// Layers are declared in overlay precedence order. Exactly one `base` and one
+/// `workspace` entry are required; `toolkit` entries are optional and the
+/// first toolkit is the topmost layer, so shadowing order is explicit rather
+/// than inferred from names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentDef {
+    /// Declared layers in overlay precedence order.
+    pub layers: Vec<EnvironmentLayerDef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentLayerRole {
+    /// Immutable OS root, bottom of the stack. Exactly one required.
+    Base,
+    /// Immutable workspace seed. Exactly one required.
+    Workspace,
+    /// Immutable toolkit extension, topmost first. Zero or more.
+    Toolkit,
+}
+
+impl EnvironmentLayerRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Workspace => "workspace",
+            Self::Toolkit => "toolkit",
+        }
+    }
+
+    /// Map a declared role onto the composition layer kind.
+    pub fn layer_kind(self) -> crate::layers::EnvironmentLayerKind {
+        match self {
+            Self::Base => crate::layers::EnvironmentLayerKind::Base,
+            Self::Workspace => crate::layers::EnvironmentLayerKind::Workspace,
+            Self::Toolkit => crate::layers::EnvironmentLayerKind::Toolkit,
+        }
+    }
+}
+
+/// One declared environment layer, resolved from a local materialized file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentLayerDef {
+    /// Position class in the overlay stack.
+    pub role: EnvironmentLayerRole,
+    /// Stable layer name; single safe path component on the host.
+    pub name: String,
+    /// Path to the already-materialized layer image (EROFS/ext4/squashfs).
+    pub path: String,
+    /// Media type recorded in the composition.
+    #[serde(default = "default_layer_media_type")]
+    pub media_type: String,
+    /// Human release version label.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Per-layer SBOM digest. Required for promotion.
+    #[serde(default)]
+    pub sbom_digest: Option<String>,
+    /// Per-layer provenance digest. Required for promotion.
+    #[serde(default)]
+    pub provenance_digest: Option<String>,
+    /// Per-layer detached signature digest. Required for promotion.
+    #[serde(default)]
+    pub signature_digest: Option<String>,
+}
+
+fn default_layer_media_type() -> String {
+    "application/vnd.pico.layer.erofs".into()
+}
+
+impl EnvironmentLayerDef {
+    /// Resolve the declared layer against its materialized file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ImageError`] when the path is not valid UTF-8,
+    /// the file cannot be read, or the resolved descriptor fails
+    /// [`crate::layers::validate_environment_layer`].
+    pub fn resolve(&self) -> Result<crate::layers::EnvironmentLayer, crate::error::ImageError> {
+        use crate::error::ImageError;
+
+        let path = camino::Utf8Path::new(&self.path);
+        let digest = crate::render::compute_file_digest(path)?;
+        let size = std::fs::metadata(path)
+            .map_err(|e| {
+                ImageError::ParseError(format!("failed to stat layer {}: {e}", self.path))
+            })?
+            .len();
+        let mut layer = crate::layers::EnvironmentLayer::new(
+            self.name.clone(),
+            self.role.layer_kind(),
+            digest,
+            size,
+            self.media_type.clone(),
+        )?;
+        layer.version = self.version.clone();
+        layer.sbom_digest = self.sbom_digest.clone();
+        layer.provenance_digest = self.provenance_digest.clone();
+        layer.signature_digest = self.signature_digest.clone();
+        Ok(layer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

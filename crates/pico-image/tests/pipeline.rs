@@ -58,6 +58,34 @@ mod tests {
                 },
             ],
             kernel: None,
+            environment: None,
+        }
+    }
+
+    /// Scratch directory for a generated manifest. Panics on I/O failure,
+    /// which is acceptable in a test body.
+    fn output_dir() -> camino::Utf8PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pico-pipeline-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = camino::Utf8PathBuf::from_path_buf(dir).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// A `render::OutputInfo` for a throwaway file with the given contents.
+    fn stub_output(name: &str, bytes: &[u8]) -> render::OutputInfo {
+        let dir = output_dir();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        render::OutputInfo {
+            path: path.clone(),
+            digest: pico_image::render::compute_file_digest(&path).unwrap(),
+            size: bytes.len() as u64,
         }
     }
 
@@ -157,6 +185,8 @@ mod tests {
                 memory: false,
                 excluded_mount_classes: vec!["secret".into(), "runtime_tmp".into()],
             },
+            required_features: vec![],
+            environment: None,
         };
 
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -373,6 +403,8 @@ uuid = "00000000-0000-4000-a000-000000000001"
                 memory: false,
                 excluded_mount_classes: vec!["secret".into(), "runtime_tmp".into()],
             },
+            required_features: vec![],
+            environment: None,
         };
 
         let def = simple_definition();
@@ -441,6 +473,7 @@ uuid = "00000000-0000-4000-a000-000000000001"
                 },
             ],
             kernel: None,
+            environment: None,
         }
     }
 
@@ -523,6 +556,8 @@ uuid = "00000000-0000-4000-a000-000000000001"
                 memory: false,
                 excluded_mount_classes: vec!["runtime_tmp".into(), "secret".into()],
             },
+            required_features: vec![],
+            environment: None,
         }
     }
 
@@ -1423,6 +1458,157 @@ uuid = "00000000-0000-4000-a000-000000000001"
             ga.get("size").unwrap().as_u64().unwrap(),
             agent_content.len() as u64
         );
+    }
+
+    #[test]
+    fn definition_declares_optional_environment_section() {
+        let toml = r#"
+[image]
+id = "layered-image"
+version = "0.1.0"
+source_date_epoch = 1781170000
+
+[base.source]
+url = "https://example.com/rootfs.tar.gz"
+digest = "sha256:abc"
+
+[packages]
+
+[guest_agent]
+source = "workspace"
+
+[filesystem]
+size = "64M"
+label = "test"
+uuid = "00000000-0000-4000-a000-000000000001"
+
+[[environment.layers]]
+role = "base"
+name = "debian-base"
+path = "/srv/layers/debian-base.erofs"
+version = "2026.09.1"
+sbom_digest = "sha256:sbom1"
+provenance_digest = "sha256:prov1"
+signature_digest = "sha256:sig1"
+
+[[environment.layers]]
+role = "workspace"
+name = "workspace-seed"
+path = "/srv/layers/workspace.erofs"
+sbom_digest = "sha256:sbom2"
+provenance_digest = "sha256:prov2"
+signature_digest = "sha256:sig2"
+
+[[environment.layers]]
+role = "toolkit"
+name = "toolkit-python"
+path = "/srv/layers/python.erofs"
+sbom_digest = "sha256:sbom3"
+provenance_digest = "sha256:prov3"
+signature_digest = "sha256:sig3"
+"#;
+        let def: ImageDefinition = toml::from_str(toml).unwrap();
+        let env = def.environment.as_ref().expect("environment must parse");
+        assert_eq!(env.layers.len(), 3);
+        assert_eq!(env.layers[0].role.as_str(), "base");
+        assert_eq!(env.layers[1].role.as_str(), "workspace");
+        assert_eq!(env.layers[2].role.as_str(), "toolkit");
+        // Declaration order is precedence order, so the first toolkit is topmost.
+        assert_eq!(env.layers[2].name, "toolkit-python");
+        // Custom media type may be supplied; the default is EROFS.
+        assert_eq!(env.layers[0].media_type, "application/vnd.pico.layer.erofs");
+    }
+
+    #[test]
+    fn definition_without_environment_section_is_none() {
+        let def: ImageDefinition = toml::from_str(
+            r#"
+[image]
+id = "mono"
+version = "0.1.0"
+source_date_epoch = 1781170000
+
+[base.source]
+url = "https://example.com/rootfs.tar.gz"
+digest = "sha256:abc"
+
+[packages]
+
+[guest_agent]
+source = "workspace"
+
+[filesystem]
+size = "64M"
+label = "test"
+uuid = "00000000-0000-4000-a000-000000000001"
+"#,
+        )
+        .unwrap();
+        assert!(def.environment.is_none());
+    }
+
+    #[test]
+    fn attach_environment_requires_exactly_one_base_and_workspace() {
+        let def = sample_definition();
+        let base = manifest::generate_manifest(
+            &def,
+            &sample_lock(),
+            &stub_output("rootfs.ext4", b"rootfs"),
+            &stub_output("pico-agent", b"agent"),
+            &output_dir(),
+            &pico_image::build_mount_contract_from_def(&def).unwrap(),
+            None,
+        )
+        .unwrap()
+        .1;
+
+        // Only a base layer declared: no workspace.
+        let mut missing_workspace = def.clone();
+        missing_workspace.environment = Some(EnvironmentDef {
+            layers: vec![EnvironmentLayerDef {
+                role: EnvironmentLayerRole::Base,
+                name: "only-base".into(),
+                path: "/nonexistent/base.erofs".into(),
+                media_type: "application/vnd.pico.layer.erofs".into(),
+                version: None,
+                sbom_digest: None,
+                provenance_digest: None,
+                signature_digest: None,
+            }],
+        });
+        let err = manifest::attach_environment_from_definition(base.clone(), &missing_workspace)
+            .expect_err("missing workspace must fail closed");
+        assert!(err.to_string().contains("workspace"), "unexpected: {err}");
+
+        // Two base layers declared.
+        let mut two_bases = def.clone();
+        two_bases.environment = Some(EnvironmentDef {
+            layers: vec![
+                EnvironmentLayerDef {
+                    role: EnvironmentLayerRole::Base,
+                    name: "base-a".into(),
+                    path: "/nonexistent/a.erofs".into(),
+                    media_type: "application/vnd.pico.layer.erofs".into(),
+                    version: None,
+                    sbom_digest: None,
+                    provenance_digest: None,
+                    signature_digest: None,
+                },
+                EnvironmentLayerDef {
+                    role: EnvironmentLayerRole::Base,
+                    name: "base-b".into(),
+                    path: "/nonexistent/b.erofs".into(),
+                    media_type: "application/vnd.pico.layer.erofs".into(),
+                    version: None,
+                    sbom_digest: None,
+                    provenance_digest: None,
+                    signature_digest: None,
+                },
+            ],
+        });
+        let err = manifest::attach_environment_from_definition(base, &two_bases)
+            .expect_err("duplicate base must fail closed");
+        assert!(err.to_string().contains("base layers"), "unexpected: {err}");
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod definition;
 pub mod error;
 pub mod host_verify;
 pub mod kernel;
+pub mod layers;
 pub mod lock;
 pub mod manifest;
 pub mod normalize;
@@ -15,7 +16,21 @@ pub(crate) mod util;
 pub mod validation;
 pub mod warm_snapshot;
 
-pub use host_verify::{HostImageLayout, HostVerificationPolicy, VerifiedImage, verify_for_host};
+pub use host_verify::{
+    HostImageLayout, HostVerificationPolicy, VerifiedImage, verify_environment_compatibility,
+    verify_environment_layers, verify_environment_supply_chain, verify_for_host,
+};
+pub use layers::{
+    COLLAPSE_THRESHOLD_LAYERS, CompositionCompatibility, CompositionPromotion,
+    CompositionPromotionStage, ENVIRONMENT_LAYER_FEATURE, ENVIRONMENT_SCHEMA_VERSION,
+    EnvironmentComposition, EnvironmentLayer, EnvironmentLayerKind, HostCompatibilityExpectation,
+    HostLayerFile, LayerRebuildPlan, MAX_ENVIRONMENT_LAYERS, OVERLAYFS_OPAQUE_VALUE,
+    OVERLAYFS_OPAQUE_XATTR, collapse_advice, compute_composition_digest,
+    format_composition_audit_record, known_required_features, layers_missing_supply_chain_evidence,
+    plan_overlay_stack, plan_rebuild, unknown_required_features, validate_environment_composition,
+    validate_environment_layer, validate_layer_name, validate_layer_store_dir,
+    verify_composition_compatibility, verify_layers_for_host,
+};
 
 // TODO: Wire warm snapshot generation into the image pipeline.
 // The warm_snapshot module is implemented but not yet called from
@@ -98,7 +113,7 @@ impl RootfsBuilder {
             size: guest_agent_size,
         };
 
-        let (manifest_path, manifest) = manifest::generate_manifest(
+        let (manifest_path, mut manifest) = manifest::generate_manifest(
             &definition,
             &lock,
             &rootfs_output,
@@ -107,6 +122,16 @@ impl RootfsBuilder {
             &mount_contract,
             definition.kernel.as_ref(),
         )?;
+
+        // Optional composable environment: when the definition declares
+        // `[[environment.layers]]`, resolve and attach the signed composition
+        // before generating evidence so SBOM, provenance, and the signature
+        // all cover the layer set.
+        if definition.environment.is_some() {
+            manifest = manifest::attach_environment_from_definition(manifest, &definition)?;
+            manifest::validate_manifest(&manifest, &definition)?;
+            manifest::write_manifest(&manifest, &self.output_dir)?;
+        }
 
         let manifest_json = serde_json::to_string(&manifest).map_err(|e| {
             error::ImageError::ParseError(format!("failed to serialize manifest: {}", e))
@@ -119,6 +144,7 @@ impl RootfsBuilder {
             &definition,
             &lock,
             &manifest_digest,
+            manifest.environment.as_ref(),
             &self.output_dir,
         )?;
 
