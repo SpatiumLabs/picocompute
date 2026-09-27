@@ -19,6 +19,10 @@ pub struct LogSettings {
 #[derive(Clone, Debug, Default)]
 pub struct MetricsSettings {
     /// OTLP gRPC collector endpoint (empty = no export).
+    ///
+    /// Include an explicit scheme (`http://` or `https://`). A bare
+    /// `host:port` is resolved to `https://` by the OTLP exporter, so an
+    /// operator expecting plaintext must spell out `http://`.
     pub otlp_endpoint: String,
     /// Export interval in seconds.
     pub export_interval_secs: u64,
@@ -31,6 +35,9 @@ pub struct MetricsSettings {
 #[derive(Clone, Debug, Default)]
 pub struct TracingSettings {
     /// OTLP gRPC endpoint for spans (empty = no export).
+    ///
+    /// Include an explicit scheme (`http://` or `https://`); see
+    /// [`MetricsSettings::otlp_endpoint`].
     pub otlp_endpoint: String,
     /// Sample rate 0.0-1.0.
     pub sample_rate: f64,

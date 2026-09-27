@@ -103,12 +103,12 @@ nix = { version = "0.31.3", features = [
     "sched",
     "user",
 ] }
-opentelemetry = "0.32.0"
-opentelemetry-otlp = { version = "0.32.0", features = [
+opentelemetry = "0.33.0"
+opentelemetry-otlp = { version = "0.33.0", features = [
     "grpc-tonic",
     "metrics",
 ] }
-opentelemetry_sdk = { version = "0.32.0", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.33.0", features = ["rt-tokio"] }
 parking_lot = "0.12.5"
 process_control = "5.2.0"
 proptest = "1.7"
@@ -168,7 +168,7 @@ tonic-prost-build = "0.14.6"
 tower = "0.5.3"
 tower-http = { version = "0.7.1", features = ["request-id", "trace", "util"] }
 tracing = "0.1.44"
-tracing-opentelemetry = "0.33.0"
+tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 ulid = { version = "3.0.0", features = ["serde"] }
 ureq = "3.4.2"
