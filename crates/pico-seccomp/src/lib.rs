@@ -188,6 +188,48 @@ mod tests {
     }
 
     #[test]
+    fn guest_agent_profile_does_not_permit_mount() {
+        // The guest agent's secrets path is mounted by `/init`, not by the
+        // agent, precisely because this filter cannot permit `mount(2)`. If a
+        // future change widens the profile to allow it, the agent's Exec path
+        // would also inherit the widened filter for every tenant command, so
+        // this invariant should fail loudly rather than silently.
+        let toml_str = crate::profile::get_embedded_profile(ComponentProfile::GuestAgent);
+        let parsed: serde_json::Value = toml::from_str(toml_str)
+            .unwrap_or_else(|e| panic!("guest-agent profile should parse: {e}"));
+        let filter = parsed["main_thread"]["filter"]
+            .as_array()
+            .expect("guest-agent profile must have a filter array");
+        assert!(!filter.is_empty(), "guest-agent filter should not be empty");
+
+        let permitted = |name: &str| {
+            filter
+                .iter()
+                .any(|e| e.get("syscall").and_then(|s| s.as_str()) == Some(name))
+        };
+        for syscall in ["mount", "umount", "umount2"] {
+            assert!(
+                !permitted(syscall),
+                "guest-agent profile must not permit {syscall}: the secrets tmpfs is mounted by \
+                 /init, and widening this filter would widen it for Exec'd tenant commands"
+            );
+        }
+        // Sanity: the filter really is the syscall allowlist we think it is,
+        // and the agent can still spawn Exec'd commands.
+        assert!(
+            permitted("execve") || permitted("execveat"),
+            "guest-agent must still be able to spawn Exec'd commands"
+        );
+        // The file primitives the secrets path depends on must remain allowed.
+        for syscall in ["openat", "unlinkat", "mkdirat", "write"] {
+            assert!(
+                permitted(syscall),
+                "guest-agent needs {syscall} to manage credential files"
+            );
+        }
+    }
+
+    #[test]
     fn init_profile_for_component_with_strictness_logs_on_failure() {
         let result = init_profile_for_component_with_strictness(
             ComponentProfile::HostAgent,

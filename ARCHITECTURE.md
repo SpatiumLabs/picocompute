@@ -485,8 +485,21 @@ Control Plane Host Agent Guest Agent
 |---|---|---|---|
 | `/run/pico/secrets` | tmpfs | excluded | mode=500 (read-only to root) |
 
-The tmpfs is recreated on each inject and torn down on quiesce/destroy.
-Credential files are written with mode 0400 (owner read-only).
+The tmpfs is mounted once by the guest's `/init`, before the guest agent
+starts, and credential files are written with mode 0400 (owner read-only).
+Init owns it because the guest agent runs under a seccomp profile that cannot
+permit `mount(2)`, and widening that profile would also widen it for every
+process the agent spawns on the Exec path. Init is unfiltered and already owns
+the other filesystem mounts (`/proc`, `/dev`, `/sys`).
+
+Boot fails if the secrets tmpfs cannot be mounted, so credentials can never
+land on the root filesystem where a snapshot could capture them. On quiesce
+the guest agent unlinks the credential files; the tmpfs itself stays mounted
+because init created it and the agent cannot detach it, and its contents are
+already gone once the files are removed.
+
+The guest agent verifies the mount before every injection and fails closed if
+the path is missing or is not a tmpfs.
 
 #### Credential name validation
 

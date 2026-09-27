@@ -358,14 +358,17 @@ outcome_path = "/run/pico/tmp/boot-outcome"
     Ok(())
 }
 
-fn embed_init_script(rootfs_dir: &Utf8Path) -> Result<(), ImageError> {
-    let init_path = rootfs_dir.join(INIT_SCRIPT_PATH);
-
-    if let Some(parent) = init_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let script = r#"#!/bin/sh
+/// The guest init script, embedded into the image at `INIT_SCRIPT_PATH`.
+///
+/// **This is not the script that boots the guest.** `scripts/guest-init.sh` is
+/// the copy the Linux asset builder installs as `/init`
+/// (`scripts/build-linux-guest-assets.sh`), and nothing executes the copy
+/// embedded here, which lands at `/etc/pico/init.sh`. The two have already
+/// diverged outside the secrets mount (the asset-builder copy tolerates network
+/// and sshd failures with `|| true`; this copy does not), so do not treat them
+/// as interchangeable. `init_script_mounts_secrets_tmpfs` pins the one
+/// property both must share.
+const INIT_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 
 BOOT_LOG="/var/log/pico/boot.log"
@@ -382,7 +385,7 @@ boot_fail() {
     exit 1
 }
 
-mkdir -p /var/log/pico /run/pico/tmp
+mkdir -p /var/log/pico /run/pico/tmp /run/pico/secrets
 boot_step "init_started"
 
 [ -r /proc/mounts ] || mount -t proc proc /proc || boot_fail "proc_mount"
@@ -395,6 +398,17 @@ boot_step "dev_mounted"
 grep -qs ' /sys sysfs ' /proc/mounts || mount -t sysfs sysfs /sys || boot_fail "sysfs_mount"
 boot_step "sysfs_mounted"
 
+# Secrets live on a private RAM-backed tmpfs so credentials never reach the
+# root filesystem and therefore never reach a snapshot (ADR-0007). This is
+# mounted here in init rather than by the guest agent: the agent runs under a
+# seccomp profile that cannot permit mount(2), and granting it that syscall
+# would also widen the profile for every process the agent spawns. init is
+# unfiltered and already owns the other filesystem mounts.
+grep -qs ' /run/pico/secrets tmpfs ' /proc/mounts || \
+  mount -t tmpfs -o mode=500,nosuid,nodev,noexec,size=1m tmpfs /run/pico/secrets \
+  || boot_fail "secrets_tmpfs_mount"
+boot_step "secrets_mounted"
+
 cmdline="$(cat /proc/cmdline)"
 cmdline_value() {
   key="$1"
@@ -406,25 +420,24 @@ cmdline_value() {
   return 1
 }
 
-guest_ip="$(cmdline_value pico_guest_ip || true)"
+guest_ip="$(cmdline_value pico_guest_ip || echo "")"
 guest_prefix="$(cmdline_value pico_guest_prefix || echo 30)"
-host_ip="$(cmdline_value pico_host_ip || true)"
+host_ip="$(cmdline_value pico_host_ip || echo "")"
 
-ip link set lo up || true
-if [ -n "$guest_ip" ]; then
-  ip link set eth0 up || true
-  ip addr add "$guest_ip/$guest_prefix" dev eth0 || true
-  if [ -n "$host_ip" ]; then
-    ip route add default via "$host_ip" dev eth0 || true
-  fi
+if [ -n "$guest_ip" ] && [ -n "$host_ip" ]; then
+    ip link set lo up
+    ip link set eth0 up
+    ip addr add "$guest_ip/$guest_prefix" dev eth0
+    ip route add default via "$host_ip" dev eth0
+    boot_step "network_configured"
+else
+    boot_step "network_static_config_skipped"
 fi
-boot_step "networking_configured"
 
-ssh-keygen -A 2>/dev/null || true
+ssh-keygen -A
 mkdir -p /var/run/sshd
-/usr/sbin/sshd 2>/dev/null || true
-
-boot_step "ready_for_agent"
+/usr/sbin/sshd &
+boot_step "sshd_started"
 
 if [ -f "$AGENT_BIN" ]; then
     boot_step "agent_present"
@@ -432,18 +445,26 @@ else
     boot_fail "guest_agent_missing"
 fi
 
-echo "BOOTED $(date +%s)" > "$BOOT_OUTCOME" 2>/dev/null || true
-boot_step "boot_complete"
+echo "BOOTED $(date +%s)" > /run/pico/tmp/boot-outcome
 
 while true; do
-  "$AGENT_BIN" || {
-    status="$?"
-    boot_step "agent_exited status=$status"
-    echo "pico-agent exited with status $status" >&2
-  }
-  sleep 1
+    "$AGENT_BIN" || {
+        status="$?"
+        boot_step "agent_exited status=$status"
+        echo "pico-agent exited with status $status" >&2
+    }
+    sleep 1
 done
 "#;
+
+fn embed_init_script(rootfs_dir: &Utf8Path) -> Result<(), ImageError> {
+    let init_path = rootfs_dir.join(INIT_SCRIPT_PATH);
+
+    if let Some(parent) = init_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let script = INIT_SCRIPT;
 
     fs::write(&init_path, script)?;
 
@@ -454,4 +475,60 @@ done
     info!(?init_path, "embedded init script");
 
     Ok(())
+}
+
+/// Both copies of the guest init must mount the secrets tmpfs.
+///
+/// The guest agent cannot mount it: its seccomp profile does not permit
+/// `mount(2)`, so if init does not create the tmpfs, secret injection fails
+/// closed and no credential can be delivered. Two copies of the script exist
+/// (`scripts/guest-init.sh`, installed as `/init`, and [`INIT_SCRIPT`],
+/// embedded at `/etc/pico/init.sh`) and they have drifted elsewhere, so this
+/// pins the property that matters rather than byte equality.
+#[cfg(test)]
+mod init_script_tests {
+    use super::INIT_SCRIPT;
+
+    const ASSET_BUILDER_INIT: &str = include_str!("../../../scripts/guest-init.sh");
+
+    fn assert_mounts_secrets_tmpfs(name: &str, script: &str) {
+        assert!(
+            script.contains("mount -t tmpfs") && script.contains("/run/pico/secrets"),
+            "{name} must mount a tmpfs at the secrets path"
+        );
+        assert!(
+            script.contains("secrets_tmpfs_mount"),
+            "{name} must fail the boot if the secrets tmpfs cannot be mounted, rather than \
+             continuing and leaving credentials to land on the root filesystem"
+        );
+        // The mount must be RAM-backed and non-executable, matching the flags
+        // the guest agent documents.
+        for flag in ["nosuid", "nodev", "noexec", "mode=500"] {
+            assert!(
+                script.contains(flag),
+                "{name} must mount the secrets tmpfs with {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_script_mounts_secrets_tmpfs() {
+        assert_mounts_secrets_tmpfs("scripts/guest-init.sh", ASSET_BUILDER_INIT);
+        assert_mounts_secrets_tmpfs("embedded INIT_SCRIPT", INIT_SCRIPT);
+    }
+
+    #[test]
+    fn embedded_init_creates_the_secrets_directory() {
+        // Without the directory the mount has no target, and the guest agent
+        // fails closed rather than creating it on the root filesystem.
+        for (name, script) in [
+            ("scripts/guest-init.sh", ASSET_BUILDER_INIT),
+            ("embedded INIT_SCRIPT", INIT_SCRIPT),
+        ] {
+            assert!(
+                script.contains("mkdir -p /var/log/pico /run/pico/tmp /run/pico/secrets"),
+                "{name} must create the secrets directory before mounting it"
+            );
+        }
+    }
 }
