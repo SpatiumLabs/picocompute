@@ -97,6 +97,12 @@ ADR-0008 assigns one owner to each image-pipeline decision:
 | Final artifact and compatibility verification | Host before cache use and boot (`verify_for_host`) |
 | Warm snapshot capture and restore | Snapshot pipeline under ADR-0007 |
 
+The counts above are the 2026-09-23 evidence run and are not updated by later
+changes. Additions since then: `pico-host-agent` now runs `verify_for_host` on
+the prepare path (see `tests/image_verify.rs`), and `pico-image` covers
+composable environment layers (see `tests/composable_layers.rs`). Run the two
+suites for current host-admission and layer evidence.
+
 Runtime adapters receive an already selected variant. They materialize and
 attach declared artifacts. They do not choose components, broaden
 compatibility, waive verification, or promote images.
@@ -280,11 +286,15 @@ and size for every materialized artifact the host presents.
 A valid cryptographic signature from an unapproved identity is not
 sufficient. That matches the ADR production verification policy.
 
-`pico-host-agent` and `pico-runtime` still consume configured
-kernel and rootfs paths and check that those files exist. They do not yet
-call `verify_for_host` on the prepare path. The library hook is the
-contract those callers must use before production cache or boot. Wiring is
-a section 11 limitation.
+`pico-host-agent` now calls `verify_for_host` on the prepare path through
+`crates/pico-host-agent/src/image_verify.rs`, before any host resource is
+created, using host-agent configuration rather than the `sandboxd`
+environment the adapters read. It enforces the production policy
+(a pinned key is required to start in `production` mode), verifies every
+declared artifact digest and size, and records a `VerifiedImageRecord` on the
+sandbox entry that is emitted on the READY transition. The runtime adapters
+still attach the artifacts they were configured with and do not parse the
+manifest themselves, which matches ADR-0008.
 
 ## 9. Warm Snapshot Generation and Lineage
 
@@ -339,7 +349,8 @@ not rerun them.
 | No vulnerability or secret-scan referrer | Manifest JSON is scanned for credential patterns. A scanner identity, database revision, and policy result are not produced. |
 | No signed promotion attestation | Stages `built`/`validated`/`candidate`/`production` are not issued as referrers. |
 | Signing is optional at build time | Host verification enforces signatures in production mode. CI must supply `PICO_SIGNING_KEY` or a key file for production artifacts. |
-| `verify_for_host` is not yet called from host-agent or runtime prepare | The hook and tests exist. Prepare still checks path existence. |
+| Image verification is opt-in per host | `pico-host-agent` calls `verify_for_host` on prepare when `PICO_IMAGE_DIR` is set. A host with no image directory configured performs no verification. Production hosts must set it. |
+| No backend can present a composable layer stack | No adapter declares `EnvironmentLayers`, and the host gate refuses a layered manifest on such a backend, so a layered image cannot boot. Presenting layers in-guest needs kernel drivers, guest mount support, and a backend device surface that do not exist yet. See `docs/image/composable-environment-layers.md`. |
 | Handshake compares `image_id`, not bundle/manifest/guest-agent digests | Protocol readiness covers identity mismatch. Digest exchange remains follow-up. |
 | Live `mkfs.ext4` / `apk` / `tar` render is not in the default suite | Rendering requires those tools on Linux. This run does not claim a live rootfs was built. |
 | Alpine base digest in `image.toml` is `sha256:unresolved` | Locked-mode production builds must pin a real base digest. |

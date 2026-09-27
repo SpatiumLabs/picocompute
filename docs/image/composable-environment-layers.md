@@ -178,16 +178,77 @@ before evidence generation, so:
 persist this record on READY so audits prove which exact layer set booted
 without re-reading the manifest.
 
-## Open limitation
+## Host prepare/boot admission
 
-Host-agent and runtime prepare paths still consume configured kernel and
-rootfs paths and do not yet call `verify_for_host` or the `verify_environment_*`
-hooks.
-That is pre-existing (see `docs/robustness/image-prod-readiness-report.md`
-section 11) and remains open; this module provides the hook and its gates but
-does not itself wire the adapters. Overlaying layers inside a guest also
-depends on backend support for a merged rootfs view, which the current
-Firecracker/QEMU adapters do not yet provide.
+`pico-host-agent` verifies images before it admits a sandbox. The gate lives in
+`crates/pico-host-agent/src/image_verify.rs` and runs inside `prepare_sandbox`
+before any host resource exists, so a rejected image leaves nothing to roll
+back.
+
+Image admission is host policy, so it lives in the host agent's own
+configuration rather than the `sandboxd` environment the runtime adapters read
+(`host-agent` and `sandboxd` are separate processes per ADR-0011):
+
+| Setting | Env | Meaning |
+|---|---|---|
+| `image_verification.image_dir` | `PICO_IMAGE_DIR` | Bundle directory: `manifest.json`, optional `manifest.sig.json`, artifact files, `<layer>.erofs` per layer |
+| `image_verification.trusted_signing_key` | `PICO_IMAGE_TRUSTED_SIGNING_KEY` | Base64 Ed25519 public key pinning the approved signer |
+| `image_verification.mode` | `PICO_IMAGE_VERIFICATION_MODE` | `production` or `development`; unknown values fail closed toward `production` |
+
+`production` mode without a pinned key refuses to start. A host with no
+`image_dir` configured performs no verification at all, which keeps existing
+deployments working but means such a host boots whatever its adapter was
+pointed at; operators must set `image_dir` for admission to mean anything.
+
+On success the host records a `VerifiedImageRecord` (manifest digest, signer
+identity, composition digest, layer count, composition audit record) on the
+sandbox entry and emits it on the READY transition, so a placement or host
+audit can answer "which layer set booted" without re-reading the manifest. A
+rehydrated entry after a host restart carries no verification record, because
+this process did not run the check.
+
+### Backend layer support gate
+
+A manifest may carry an environment composition, but booting it requires the
+backend to actually present a merged layer stack. The host therefore requires
+`BackendCapability::EnvironmentLayers` and refuses a layered manifest on a
+backend that does not declare it, rather than silently booting the monolithic
+`artifacts.rootfs`.
+
+**No adapter declares this capability today**, and the host gate is what makes
+that safe. See the open limitation below.
+
+## Open limitation: no merged rootfs view yet
+
+Overlaying layers inside a guest needs backend support that does not exist
+today. Concretely, from a survey of the current code:
+
+- **No guest-side mounting exists at all.** The `MountWorkspace` RPC handler in
+  `crates/pico-guest-agent/src/mount.rs` validates its arguments and returns
+  `Mounted(true)` without a single syscall. `/etc/pico/mount-contract.json` is
+  written at build time and read by nothing. The only real `mount(2)` in the
+  workspace is the secrets tmpfs.
+- **`/init` mounts only proc, devtmpfs, and sysfs.** The four canonical mount
+  directories are plain directories on the writable root ext4 image.
+- **Neither backend exposes a shared-filesystem device.** Firecracker is
+  virtio-blk only, with a single drive hardcoded as `is_root_device: true`; it
+  has no virtio-fs endpoint in its API at all. QEMU emits one raw `-drive`,
+  with no `-fsdev`, 9p, or virtiofs.
+- **The guest kernel profiles compile none of the required drivers.** No
+  `CONFIG_OVERLAY_FS`, `CONFIG_EROFS_FS`, or `CONFIG_SQUASHFS` appears in any
+  of the four profiles in `crates/pico-image/src/kernel.rs`.
+- **The guest seccomp profile does not allow `mount` or `umount2`.** The four
+  host-side runtime profiles do.
+- **The rootfs is mounted `rw`**, so ADR-0008's "the VM rootfs is immutable at
+  runtime" invariant is not enforced by anything today.
+
+Closing this needs a separate change touching kernel profiles, the seccomp
+profile, per-sandbox kernel parameters, and at least one backend device
+surface, plus a live-boot test to prove the guest actually sees the stack.
+None of that is reachable from the image manifest, and none of it is covered
+here. What this module does provide is the capability gate that makes the gap
+safe: until a backend declares `EnvironmentLayers`, a layered manifest cannot
+boot at all.
 
 ## Tests
 

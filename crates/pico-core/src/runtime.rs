@@ -153,6 +153,16 @@ pub enum BackendCapability {
     SnapshotRestore,
     /// The backend supports eBPF-based network policy (XDP/TC) on TAP/veth interfaces.
     EbpFNetworking,
+    /// The backend can present a guest root filesystem composed of an ordered
+    /// set of independently versioned, read-only environment layers (base,
+    /// workspace, toolkits) plus a writable per-sandbox upper.
+    ///
+    /// A backend must declare this only when it can actually assemble that
+    /// merged view for the guest. Declaring it is what allows a manifest
+    /// carrying an `EnvironmentComposition` to boot; without it the host
+    /// refuses the composition rather than silently booting the monolithic
+    /// `artifacts.rootfs`.
+    EnvironmentLayers,
 }
 
 /// A deterministic set of backend capabilities.

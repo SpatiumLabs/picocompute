@@ -9,6 +9,7 @@ use pico_core::cpu_isolation::CpuIsolationPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::HostIdentity;
+use crate::image_verify::{ImageVerificationConfig, ImageVerificationMode};
 
 use zeroize::Zeroizing;
 
@@ -53,6 +54,16 @@ pub struct HostAgentConfig {
     #[serde(default)]
     pub shared_host_metric_redaction: bool,
 
+    /// Where the host resolves guest images and how strictly it verifies them
+    /// before prepare and boot.
+    ///
+    /// Image admission is host policy, so it lives in the host agent rather
+    /// than in the `sandboxd` environment the runtime adapters read. Leaving
+    /// `image_dir` unset disables image verification entirely, which is only
+    /// appropriate for development hosts.
+    #[serde(default)]
+    pub image_verification: ImageVerificationConfig,
+
     #[serde(skip)]
     pub draining: bool,
 }
@@ -79,6 +90,7 @@ impl std::fmt::Debug for HostAgentConfig {
                 "shared_host_metric_redaction",
                 &self.shared_host_metric_redaction,
             )
+            .field("image_verification", &self.image_verification)
             .field("draining", &self.draining)
             .finish()
     }
@@ -117,6 +129,7 @@ impl Default for HostAgentConfig {
             cpu_isolation_policy: CpuIsolationPolicy::None,
             cross_tenant_host: false,
             shared_host_metric_redaction: false,
+            image_verification: ImageVerificationConfig::default(),
         }
     }
 }
@@ -203,6 +216,20 @@ fn apply_env_overrides(config: &mut HostAgentConfig) {
     if let Ok(val) = std::env::var("PICO_SHARED_HOST_METRIC_REDACTION") {
         config.shared_host_metric_redaction = val.eq_ignore_ascii_case("true") || val == "1";
     }
+    if let Ok(val) = std::env::var("PICO_IMAGE_DIR") {
+        config.image_verification.image_dir = Some(val);
+    }
+    if let Ok(val) = std::env::var("PICO_IMAGE_TRUSTED_SIGNING_KEY") {
+        config.image_verification.trusted_signing_key = Some(val);
+    }
+    if let Ok(val) = std::env::var("PICO_IMAGE_VERIFICATION_MODE") {
+        // Unknown values fail closed toward production rather than silently
+        // downgrading a host that meant to be strict.
+        config.image_verification.mode = match val.as_str() {
+            "development" => ImageVerificationMode::Development,
+            _ => ImageVerificationMode::Production,
+        };
+    }
 }
 
 fn apply_identity_env_overrides(identity: &mut HostIdentity) {
@@ -237,6 +264,15 @@ fn ensure_valid(config: &HostAgentConfig) -> anyhow::Result<()> {
     }
     if config.sandboxd_token.is_empty() {
         anyhow::bail!("PICO_SANDBOXD_TOKEN must be set")
+    }
+    // Production image verification without a pinned signing key would admit
+    // any image, so refuse to start rather than degrade silently.
+    if config.image_verification.mode == ImageVerificationMode::Production
+        && config.image_verification.trusted_signing_key.is_none()
+    {
+        anyhow::bail!(
+            "image verification mode 'production' requires PICO_IMAGE_TRUSTED_SIGNING_KEY"
+        )
     }
     Ok(())
 }
@@ -326,6 +362,106 @@ mod tests {
         unsafe {
             std::env::remove_var("PICO_LOG_FORMAT");
         }
+    }
+
+    #[test]
+    fn env_override_image_dir_and_signing_key() {
+        unsafe {
+            std::env::set_var("PICO_IMAGE_DIR", "/var/lib/pico/images/standard");
+            std::env::set_var("PICO_IMAGE_TRUSTED_SIGNING_KEY", "base64key");
+            std::env::set_var("PICO_IMAGE_VERIFICATION_MODE", "production");
+        }
+        let mut config = HostAgentConfig::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(
+            config.image_verification.image_dir.as_deref(),
+            Some("/var/lib/pico/images/standard")
+        );
+        assert_eq!(
+            config.image_verification.trusted_signing_key.as_deref(),
+            Some("base64key")
+        );
+        assert_eq!(
+            config.image_verification.mode,
+            ImageVerificationMode::Production
+        );
+        unsafe {
+            std::env::remove_var("PICO_IMAGE_DIR");
+            std::env::remove_var("PICO_IMAGE_TRUSTED_SIGNING_KEY");
+            std::env::remove_var("PICO_IMAGE_VERIFICATION_MODE");
+        }
+    }
+
+    #[test]
+    fn unknown_verification_mode_fails_closed_to_production() {
+        // A typo in the mode must not silently downgrade a strict host.
+        unsafe {
+            std::env::set_var("PICO_IMAGE_VERIFICATION_MODE", "prod");
+        }
+        let mut config = HostAgentConfig::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(
+            config.image_verification.mode,
+            ImageVerificationMode::Production
+        );
+        unsafe {
+            std::env::remove_var("PICO_IMAGE_VERIFICATION_MODE");
+        }
+    }
+
+    #[test]
+    fn development_verification_mode_is_explicit() {
+        unsafe {
+            std::env::set_var("PICO_IMAGE_VERIFICATION_MODE", "development");
+        }
+        let mut config = HostAgentConfig::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(
+            config.image_verification.mode,
+            ImageVerificationMode::Development
+        );
+        unsafe {
+            std::env::remove_var("PICO_IMAGE_VERIFICATION_MODE");
+        }
+    }
+
+    #[test]
+    fn ensure_valid_rejects_production_mode_without_a_key() {
+        let mut config = HostAgentConfig {
+            auth_token: Zeroizing::new("token".into()),
+            sandboxd_token: Zeroizing::new("sandboxd".into()),
+            ..Default::default()
+        };
+        config.image_verification.mode = ImageVerificationMode::Production;
+        let err = ensure_valid(&config).expect_err("production without a key must not start");
+        assert!(
+            err.to_string().contains("PICO_IMAGE_TRUSTED_SIGNING_KEY"),
+            "unexpected: {err}"
+        );
+
+        config.image_verification.trusted_signing_key = Some("key".into());
+        assert!(ensure_valid(&config).is_ok());
+    }
+
+    #[test]
+    fn image_verification_is_unconfigured_by_default() {
+        let config = HostAgentConfig::default();
+        assert!(!config.image_verification.is_configured());
+    }
+
+    #[test]
+    fn debug_output_does_not_leak_the_signing_key() {
+        let mut config = HostAgentConfig::default();
+        config.image_verification.trusted_signing_key = Some("super-secret-signing-key".into());
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("super-secret-signing-key"),
+            "signing key must not appear in debug output: {debug}"
+        );
+        // The image directory is not a secret and should stay visible for
+        // operator diagnosis.
+        config.image_verification.image_dir = Some("/var/lib/pico/images/standard".into());
+        assert!(format!("{config:?}").contains("/var/lib/pico/images/standard"));
     }
 
     #[test]

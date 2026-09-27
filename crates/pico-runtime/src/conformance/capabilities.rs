@@ -49,7 +49,12 @@ pub(super) async fn test_capability_declarations(
             | BackendCapability::GuestTransport
             | BackendCapability::GuestReadiness
             | BackendCapability::Exec
-            | BackendCapability::EbpFNetworking => {}
+            | BackendCapability::EbpFNetworking
+            // A boolean declaration with no "unsupported" hook to exercise:
+            // either the backend can present a merged layer stack or it
+            // cannot, and the host image gate refuses a layered manifest
+            // when it cannot.
+            | BackendCapability::EnvironmentLayers => {}
             BackendCapability::Suspend => {
                 let t0 = Instant::now();
                 match backend.suspend().await {
