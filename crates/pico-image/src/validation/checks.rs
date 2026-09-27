@@ -760,6 +760,24 @@ pub(super) fn check_environment_supply_chain(
     Ok(())
 }
 
+/// Credential keywords checked against environment layer free-text fields.
+///
+/// Lowercase by construction: the scanned value is lowercased once per field,
+/// so patterns are stored lowercase and compared directly. What keeps a
+/// legitimate name such as `toolkit-tokenizer` from matching `token` is
+/// [`is_assignment_shaped`], not the pattern list.
+const LAYER_SECRET_PATTERNS: &[&str] = &[
+    "private_key",
+    "private-key",
+    "private key",
+    "bearer ",
+    "access_key",
+    "secret_key",
+    "api_key",
+    "password",
+    "token",
+];
+
 /// Scan only the environment layer free-text fields for credential patterns.
 ///
 /// The whole-manifest scan uses a deliberately broad word list to catch
@@ -773,30 +791,19 @@ pub(super) fn check_environment_no_secrets(
     let Some(ref env) = manifest.environment else {
         return Ok(());
     };
-    let assignment_patterns = [
-        "private_key",
-        "private-key",
-        "PRIVATE KEY",
-        "Bearer ",
-        "access_key",
-        "secret_key",
-        "api_key",
-        "password",
-        "token",
-    ];
     for layer in env.ordered_layers() {
         for (field, value) in [
             ("name", layer.name.as_str()),
             ("media_type", layer.media_type.as_str()),
         ] {
             let lower = value.to_ascii_lowercase();
-            for pattern in assignment_patterns {
-                if let Some(pos) = lower.find(&pattern.to_ascii_lowercase())
-                    && is_assignment_shaped(&lower, pos, pattern.len())
+            for &pattern in LAYER_SECRET_PATTERNS {
+                if let Some(pos) = lower.find(pattern)
+                    && is_assignment_shaped(&lower, pos, pattern)
                 {
                     return Err(format!(
-                        "environment layer '{}' {} may contain a secret near '{pattern}'",
-                        layer.name, field
+                        "environment layer '{}' {field} may contain a secret near '{pattern}'",
+                        layer.name
                     ));
                 }
             }
@@ -805,16 +812,42 @@ pub(super) fn check_environment_no_secrets(
     Ok(())
 }
 
-/// True when `needle` at `pos` reads as an assignment rather than part of a
-/// longer identifier (`tokenizer` must not match `token`).
-fn is_assignment_shaped(haystack: &str, pos: usize, len: usize) -> bool {
-    let after = haystack[pos + len..].chars().next();
+/// True when a match of `pattern` at `pos` reads as a credential keyword
+/// rather than part of a longer identifier.
+///
+/// Two shapes are accepted:
+///
+/// - an explicit assignment after the keyword (`token=`, `token:`, `api_key:`),
+///   or
+/// - the keyword standing alone at a field boundary.
+///
+/// A keyword embedded in an identifier must not match, so `toolkit-tokenizer`
+/// is accepted against the `token` pattern.
+fn is_assignment_shaped(haystack: &str, pos: usize, pattern: &str) -> bool {
+    let after = haystack[pos + pattern.len()..].chars().next();
     let before = haystack[..pos].chars().next_back();
-    let ends_word = after.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
-    let starts_word = before.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
-    // Require a separator after the keyword (`token=`, `token:`), or a
-    // separator/quote before it, so embedded identifiers do not match.
-    ends_word && (starts_word || after.is_some_and(|c| c == '=' || c == ':'))
+    let starts_word = before.is_none_or(|c| !is_word_char(c));
+
+    // A pattern that itself ends in a separator (for example `"bearer "`) is
+    // already unambiguous, so the trailing-character check does not apply: the
+    // character after it begins the value, not a longer identifier.
+    let pattern_ends_word = pattern.chars().next_back().is_some_and(is_word_char);
+    if pattern_ends_word {
+        let ends_word = after.is_none_or(|c| !is_word_char(c));
+        if !ends_word {
+            // Embedded in a longer identifier, for example `tokenizer`.
+            return false;
+        }
+        if after.is_some_and(|c| c == '=' || c == ':') {
+            return true;
+        }
+    }
+
+    starts_word
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
 /// Validate that the SBOM covers all components declared in the manifest and

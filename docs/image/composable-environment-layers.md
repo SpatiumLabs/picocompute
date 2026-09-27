@@ -211,4 +211,18 @@ The whole-manifest secret scan excludes the `environment` block, because its
 pattern list is deliberately broad and a legitimate layer name such as
 `toolkit-tokenizer` would otherwise fail with a misleading error. Layer
 `name` and `media_type` get a narrower assignment-shaped scan in
-`check_environment_no_secrets` (`token=` matches, `tokenizer` does not).
+`check_environment_no_secrets` against the module-level
+`LAYER_SECRET_PATTERNS` table (lowercase, compared without allocating).
+
+`is_assignment_shaped` accepts a match when an explicit assignment follows the
+keyword (`token=`, `api_key:`) or when the keyword stands alone at a field
+boundary, and rejects a keyword embedded in a longer identifier. A pattern
+that already ends in a separator, such as `bearer `, skips the
+trailing-character check because the character after it begins the value
+rather than a longer identifier.
+
+Note that `name` is charset-restricted to `[A-Za-z0-9._-]`, so the
+assignment branch is unreachable for `name` and only the bare-keyword branch
+applies there; `media_type` is the free-text field where assignment-shaped
+matches are actually reachable. The `name` scan is defense in depth against a
+future relaxation of the charset rule.

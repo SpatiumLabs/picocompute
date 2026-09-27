@@ -802,7 +802,68 @@ mod composable_layers {
         assert!(!report.all_passed());
     }
 
-    /// Composition with `count` toolkits, built through the validating
+    /// A `name` carrying a credential must fail, keeping the composition
+    /// digest binding honest after the edit.
+    fn manifest_with_edited_layer(
+        fx: &LayerFixture,
+        edit: impl FnOnce(&mut EnvironmentComposition),
+    ) -> pico_image::types::PicoComputeGuestManifest {
+        let mut comp = fx.composition.clone();
+        edit(&mut comp);
+        comp.composition_digest = pico_image::compute_composition_digest(
+            &comp.image_id,
+            &comp.base,
+            &comp.workspace,
+            &comp.toolkits,
+            &comp.compatibility,
+        );
+        let mut manifest = valid_manifest();
+        attach_environment(&mut manifest, comp);
+        manifest
+    }
+
+    #[test]
+    fn credential_bearing_media_types_are_rejected() {
+        // `media_type` is free text, so the assignment-shape scan is fully
+        // reachable there. This includes a pattern that already ends in a
+        // separator (`bearer `), which must not be suppressed by the
+        // trailing-character check.
+        let fx = layered_fixture();
+        for media_type in [
+            "application/vnd.api_key=x",
+            "application/vnd; token=abc",
+            "Bearer abcdef",
+            "private_key: x",
+            "private key x",
+            "password: hunter2",
+            "access_key: x",
+            "secret_key: x",
+        ] {
+            let manifest = manifest_with_edited_layer(&fx, |comp| {
+                comp.toolkits[0].media_type = media_type.into();
+            });
+            let report = validation::validate_static(&manifest, &valid_definition());
+            assert!(
+                !report.all_passed(),
+                "media_type {media_type:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_keyword_as_whole_layer_name_is_rejected() {
+        // Reachable because `name` is charset-restricted: a bare keyword has no
+        // separator, so the start-of-word branch fires.
+        let fx = layered_fixture();
+        for name in ["token", "password", "api_key"] {
+            let manifest = manifest_with_edited_layer(&fx, |comp| {
+                comp.toolkits[0].name = name.into();
+            });
+            let report = validation::validate_static(&manifest, &valid_definition());
+            assert!(!report.all_passed(), "layer name {name:?} must be rejected");
+        }
+    }
+
     /// Composition with `count` toolkits, built through the validating
     /// constructor so overlay order and the composition digest are correct.
     fn composition_with_toolkits(
