@@ -101,6 +101,7 @@ pub fn generate_manifest(
         },
         mount_contract: mount_contract.clone(),
         snapshot: snapshot_info,
+        required_features: vec![],
         environment: None,
     };
 
@@ -163,11 +164,137 @@ pub fn generate_manifest_with_environment(
         )));
     }
     manifest.environment = Some(environment);
+    manifest.required_features = vec![crate::layers::ENVIRONMENT_LAYER_FEATURE.into()];
     let json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| ImageError::ParseError(format!("failed to serialize manifest: {}", e)))?;
     std::fs::write(&manifest_path, json)?;
     validate_manifest(&manifest, definition)?;
     Ok((manifest_path, manifest))
+}
+
+/// Attach a composable environment to a generated manifest from the image
+/// definition's `[[environment.layers]]` declarations.
+///
+/// This is the build-path entry point: it resolves every declared layer file
+/// to its real digest and size, binds the manifest's own compatibility fields
+/// into the composition (so placement and boot cannot disagree), and marks the
+/// manifest as requiring the environment-layer feature. Returns the manifest
+/// unchanged when the definition declares no environment.
+///
+/// # Errors
+///
+/// Returns [`ImageError`] when a declared layer cannot be resolved, the
+/// declaration is not exactly one base plus one workspace, or the resulting
+/// composition fails validation.
+pub fn attach_environment_from_definition(
+    mut manifest: PicoComputeGuestManifest,
+    definition: &ImageDefinition,
+) -> Result<PicoComputeGuestManifest, ImageError> {
+    use crate::definition::EnvironmentLayerRole;
+    use crate::layers::{
+        CompositionCompatibility, ENVIRONMENT_LAYER_FEATURE, EnvironmentComposition,
+    };
+
+    let Some(ref env_def) = definition.environment else {
+        return Ok(manifest);
+    };
+
+    let bases: Vec<_> = env_def
+        .layers
+        .iter()
+        .filter(|l| l.role == EnvironmentLayerRole::Base)
+        .collect();
+    let workspaces: Vec<_> = env_def
+        .layers
+        .iter()
+        .filter(|l| l.role == EnvironmentLayerRole::Workspace)
+        .collect();
+    if bases.len() != 1 {
+        return Err(ImageError::CompositionValidationFailed(format!(
+            "environment declares {} base layers, expected exactly 1",
+            bases.len()
+        )));
+    }
+    if workspaces.len() != 1 {
+        return Err(ImageError::CompositionValidationFailed(format!(
+            "environment declares {} workspace layers, expected exactly 1",
+            workspaces.len()
+        )));
+    }
+
+    let mut resolved = Vec::with_capacity(env_def.layers.len());
+    for layer_def in &env_def.layers {
+        let layer = layer_def.resolve()?;
+        info!(name = %layer.name, kind = layer.kind.as_str(), digest = %layer.digest, "environment layer resolved");
+        resolved.push((layer_def.role, layer));
+    }
+
+    let base = resolved
+        .iter()
+        .find(|(role, _)| *role == EnvironmentLayerRole::Base)
+        .map(|(_, l)| l.clone())
+        .expect("base presence checked above");
+    let workspace = resolved
+        .iter()
+        .find(|(role, _)| *role == EnvironmentLayerRole::Workspace)
+        .map(|(_, l)| l.clone())
+        .expect("workspace presence checked above");
+    // Preserve declared precedence: toolkits keep the order they were declared
+    // in, topmost first.
+    let toolkits: Vec<_> = resolved
+        .iter()
+        .filter(|(role, _)| *role == EnvironmentLayerRole::Toolkit)
+        .map(|(_, l)| l.clone())
+        .collect();
+
+    let compatibility = CompositionCompatibility {
+        profile_id: manifest.compatibility.profile_id.clone(),
+        backends: manifest.compatibility.backends.clone(),
+        architecture: manifest.platform.architecture.clone(),
+        protocol_supported: manifest.protocol.supported.clone(),
+        snapshot_excluded_classes: manifest.snapshot.excluded_mount_classes.clone(),
+    };
+    let composition = EnvironmentComposition::new(
+        manifest.image_id.clone(),
+        base,
+        workspace,
+        toolkits,
+        compatibility,
+        manifest.release.build_epoch,
+    )?;
+
+    manifest.environment = Some(composition);
+    if !manifest
+        .required_features
+        .iter()
+        .any(|f| f == ENVIRONMENT_LAYER_FEATURE)
+    {
+        manifest
+            .required_features
+            .push(ENVIRONMENT_LAYER_FEATURE.into());
+    }
+    Ok(manifest)
+}
+
+/// Serialize a manifest to `manifest.json` in `output_dir`.
+///
+/// Callers that mutate a manifest after [`generate_manifest`] (for example by
+/// attaching a composition) must re-write it through this helper so the file
+/// the signature covers is the file on disk.
+///
+/// # Errors
+///
+/// Returns [`ImageError::ParseError`] on serialization failure and
+/// [`ImageError::IoError`] on write failure.
+pub fn write_manifest(
+    manifest: &PicoComputeGuestManifest,
+    output_dir: &Utf8Path,
+) -> Result<camino::Utf8PathBuf, ImageError> {
+    let manifest_path = output_dir.join("manifest.json");
+    let json = serde_json::to_string_pretty(manifest)
+        .map_err(|e| ImageError::ParseError(format!("failed to serialize manifest: {}", e)))?;
+    std::fs::write(&manifest_path, json)?;
+    Ok(manifest_path)
 }
 
 pub fn validate_manifest(
@@ -273,7 +400,32 @@ pub fn validate_manifest(
                 "environment snapshot exclusions {env_excl:?} do not match manifest {manifest_excl:?}"
             )));
         }
+        // A layered manifest must name the feature so a reader that predates
+        // `environment` refuses it instead of booting `artifacts.rootfs`.
+        if !manifest
+            .required_features
+            .iter()
+            .any(|f| f == crate::layers::ENVIRONMENT_LAYER_FEATURE)
+        {
+            return Err(ImageError::ManifestValidationFailed(format!(
+                "layered manifest must declare required feature '{}'",
+                crate::layers::ENVIRONMENT_LAYER_FEATURE
+            )));
+        }
+    } else if manifest
+        .required_features
+        .iter()
+        .any(|f| f == crate::layers::ENVIRONMENT_LAYER_FEATURE)
+    {
+        return Err(ImageError::ManifestValidationFailed(format!(
+            "required feature '{}' declared but no environment composition present",
+            crate::layers::ENVIRONMENT_LAYER_FEATURE
+        )));
     }
+
+    // A reader must refuse features it does not understand in either shape.
+    crate::layers::unknown_required_features(manifest)
+        .map_err(|e| ImageError::ManifestValidationFailed(e.to_string()))?;
 
     Ok(())
 }

@@ -113,6 +113,7 @@ pub(crate) fn valid_manifest() -> PicoComputeGuestManifest {
             memory: false,
             excluded_mount_classes: vec!["runtime_tmp".into(), "secret".into()],
         },
+        required_features: vec![],
         environment: None,
     }
 }
@@ -181,7 +182,23 @@ pub(crate) fn valid_definition() -> ImageDefinition {
             firmware_path: None,
             config_profile: Some("firecracker-aarch64-v1".into()),
         }),
+        environment: None,
     }
+}
+
+/// The image definition shipped with the crate must stay loadable, and its
+/// `[[environment.layers]]` section must remain commented out so the default
+/// build stays monolithic.
+#[allow(dead_code)]
+pub(crate) fn assert_shipped_definition_loads() {
+    let path = camino::Utf8Path::new(env!("CARGO_MANIFEST_DIR")).join("image.toml");
+    let content = std::fs::read_to_string(&path).expect("shipped image.toml must be readable");
+    let def: ImageDefinition = toml::from_str(&content).expect("shipped image.toml must parse");
+    assert_eq!(def.image.id, "pico-guest-standard");
+    assert!(
+        def.environment.is_none(),
+        "the shipped definition documents [[environment.layers]] as commented out"
+    );
 }
 
 /// Helper: run validation and assert it fails with the expected check name.

@@ -19,7 +19,9 @@ pub const PROVENANCE_SCHEMA_VERSION: &str = "1.0";
 /// Generate provenance metadata for an image build.
 ///
 /// Captures builder identity, source revision, build input digests,
-/// timestamp, platform, and policy profile.
+/// timestamp, platform, and policy profile. When `environment` is present,
+/// every layer material and the composition digest are recorded as build
+/// inputs so the attestation describes the exact layer set.
 ///
 /// # Errors
 ///
@@ -30,6 +32,7 @@ pub fn generate_provenance(
     definition: &ImageDefinition,
     lock: &PackageLock,
     manifest_digest: &str,
+    environment: Option<&crate::layers::EnvironmentComposition>,
     output_dir: &Utf8Path,
 ) -> Result<camino::Utf8PathBuf, ImageError> {
     info!("generating build provenance");
@@ -75,6 +78,23 @@ pub fn generate_provenance(
         digest: manifest_digest.to_string(),
         uri: None,
     });
+
+    // Layer materials and the composition binding are build inputs too, so a
+    // reviewer can tell which layer set the attested manifest describes.
+    if let Some(env) = environment {
+        for layer in env.ordered_layers() {
+            build_inputs.push(ProvenanceInput {
+                name: format!("layer-{}-{}", layer.kind.as_str(), layer.name),
+                digest: layer.digest.clone(),
+                uri: None,
+            });
+        }
+        build_inputs.push(ProvenanceInput {
+            name: "environment-composition".into(),
+            digest: env.composition_digest.clone(),
+            uri: None,
+        });
+    }
 
     let policy_profile = definition
         .kernel
@@ -272,6 +292,7 @@ mod tests {
             },
             mounts: vec![],
             kernel: None,
+            environment: None,
         }
     }
 
@@ -305,7 +326,7 @@ mod tests {
         let output_dir = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
 
         let prov_path =
-            generate_provenance(&def, &lock, "sha256:manifest123", &output_dir).unwrap();
+            generate_provenance(&def, &lock, "sha256:manifest123", None, &output_dir).unwrap();
         assert!(prov_path.exists());
 
         let content = std::fs::read_to_string(&prov_path).unwrap();
@@ -330,7 +351,7 @@ mod tests {
         let output_dir = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
 
         let prov_path =
-            generate_provenance(&def, &lock, "sha256:manifest123", &output_dir).unwrap();
+            generate_provenance(&def, &lock, "sha256:manifest123", None, &output_dir).unwrap();
         let content = std::fs::read_to_string(&prov_path).unwrap();
         let prov: ProvenanceMetadata = serde_json::from_str(&content).unwrap();
 
@@ -351,7 +372,7 @@ mod tests {
         let output_dir = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
 
         let prov_path =
-            generate_provenance(&def, &lock, "sha256:manifest123", &output_dir).unwrap();
+            generate_provenance(&def, &lock, "sha256:manifest123", None, &output_dir).unwrap();
         let content = std::fs::read_to_string(&prov_path).unwrap();
         let prov: ProvenanceMetadata = serde_json::from_str(&content).unwrap();
 
@@ -366,7 +387,7 @@ mod tests {
         let output_dir = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
 
         let prov_path =
-            generate_provenance(&def, &lock, "sha256:manifest123", &output_dir).unwrap();
+            generate_provenance(&def, &lock, "sha256:manifest123", None, &output_dir).unwrap();
         let content = std::fs::read_to_string(&prov_path).unwrap();
         let mut prov: ProvenanceMetadata = serde_json::from_str(&content).unwrap();
 
@@ -383,7 +404,7 @@ mod tests {
         let output_dir = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
 
         let prov_path =
-            generate_provenance(&def, &lock, "sha256:manifest123", &output_dir).unwrap();
+            generate_provenance(&def, &lock, "sha256:manifest123", None, &output_dir).unwrap();
         let content = std::fs::read_to_string(&prov_path).unwrap();
         let mut prov: ProvenanceMetadata = serde_json::from_str(&content).unwrap();
 
@@ -413,7 +434,7 @@ mod tests {
         let output_dir = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
 
         let prov_path =
-            generate_provenance(&def, &lock, "sha256:manifest123", &output_dir).unwrap();
+            generate_provenance(&def, &lock, "sha256:manifest123", None, &output_dir).unwrap();
         let content = std::fs::read_to_string(&prov_path).unwrap();
         let prov: ProvenanceMetadata = serde_json::from_str(&content).unwrap();
 
@@ -428,7 +449,7 @@ mod tests {
         let output_dir = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
 
         let prov_path =
-            generate_provenance(&def, &lock, "sha256:manifest123", &output_dir).unwrap();
+            generate_provenance(&def, &lock, "sha256:manifest123", None, &output_dir).unwrap();
         let content = std::fs::read_to_string(&prov_path).unwrap();
         let prov: ProvenanceMetadata = serde_json::from_str(&content).unwrap();
 

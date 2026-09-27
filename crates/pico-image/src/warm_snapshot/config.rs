@@ -285,6 +285,7 @@ mod tests {
                 memory: false,
                 excluded_mount_classes: vec!["secret".into()],
             },
+            required_features: vec![],
             environment: None,
         }
     }

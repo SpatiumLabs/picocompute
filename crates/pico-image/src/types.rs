@@ -14,6 +14,15 @@ pub struct PicoComputeGuestManifest {
     pub compatibility: CompatibilityInfo,
     pub mount_contract: MountContract,
     pub snapshot: SnapshotInfo,
+    /// Features a reader must understand before it may boot this manifest.
+    ///
+    /// ADR-0008 requires a reader to reject a field or value the manifest
+    /// marks as required. Older readers ignore unknown JSON keys, so a layered
+    /// manifest must name the feature explicitly: without the marker an
+    /// unaware reader would ignore `environment` and silently boot the
+    /// monolithic `artifacts.rootfs` instead of the layer stack.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_features: Vec<String>,
     /// Independently versioned base/workspace/toolkit composition.
     ///
     /// `None` preserves backward compatibility with monolithic manifests.

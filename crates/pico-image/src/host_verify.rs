@@ -87,6 +87,11 @@ pub fn verify_for_host(
     let signer_identity = verify_signature(layout, policy, &manifest_bytes, &manifest)?;
     verify_artifacts(layout, &manifest)?;
 
+    // Fail closed on features this reader cannot provide: a manifest requiring
+    // the environment-layer feature must not boot as a monolithic image just
+    // because the reader ignored the unknown `environment` key.
+    crate::layers::unknown_required_features(&manifest)?;
+
     let manifest_digest = compute_sha256_digest(&manifest_bytes);
     let (composition_digest, composition_audit_record) = match &manifest.environment {
         Some(env) => {
@@ -138,8 +143,8 @@ pub fn verify_environment_layers(
     }
 }
 
-/// Verify composition compatibility (backend, arch, protocol, snapshot)
-/// against host capabilities after [`verify_for_host`].
+/// Verify composition compatibility (backend, arch, protocol, profile,
+/// snapshot) against host capabilities after [`verify_for_host`].
 ///
 /// Monolithic manifests skip the check and return `Ok(())`.
 ///
@@ -156,6 +161,33 @@ pub fn verify_environment_compatibility(
         }
         None => Ok(()),
     }
+}
+
+/// Enforce the per-layer supply-chain gate on the host boot path.
+///
+/// Monolithic manifests skip the gate. A layered manifest must present SBOM,
+/// provenance, and signature evidence for every layer, so a revoked or
+/// unsigned layer cannot reach `Running` even when the composition signature
+/// itself verifies.
+///
+/// # Errors
+///
+/// Returns [`ImageError::IncompatibleComposition`] listing layers that are
+/// missing any evidence class.
+pub fn verify_environment_supply_chain(verified: &VerifiedImage) -> Result<(), ImageError> {
+    let Some(env) = &verified.manifest.environment else {
+        return Ok(());
+    };
+    let missing = crate::layers::layers_missing_supply_chain_evidence(env);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(ImageError::IncompatibleComposition {
+        reason: format!(
+            "layers missing sbom/provenance/signature evidence: {}",
+            missing.join(", ")
+        ),
+    })
 }
 
 fn verify_signature(
@@ -403,6 +435,7 @@ mod tests {
                 memory: false,
                 excluded_mount_classes: vec!["secret".into(), "runtime_tmp".into()],
             },
+            required_features: vec![],
             environment: None,
         }
     }

@@ -96,4 +96,10 @@ pub enum ImageError {
 
     #[error("incompatible environment composition: {reason}")]
     IncompatibleComposition { reason: String },
+
+    #[error("layer store path invalid for layer '{layer}' under '{mount_dir}'")]
+    LayerStorePathInvalid { layer: String, mount_dir: String },
+
+    #[error("manifest {image_id} requires unsupported feature '{feature}'")]
+    UnknownRequiredFeature { image_id: String, feature: String },
 }

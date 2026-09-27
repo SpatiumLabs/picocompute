@@ -50,6 +50,14 @@ pub fn generate_sbom(
         components.push(build_firmware_component(fw));
     }
 
+    // Layer components make per-layer supply-chain coverage checkable: a
+    // composition whose SBOM is missing a layer fails `validate_sbom`.
+    if let Some(ref env) = manifest.environment {
+        for layer in env.ordered_layers() {
+            components.push(build_layer_component(layer.kind.as_str(), layer));
+        }
+    }
+
     for pkg in &lock.packages {
         components.push(build_package_component(pkg));
     }
@@ -260,6 +268,77 @@ fn build_firmware_component(fw: &ArtifactDescriptor) -> SbomComponent {
     }
 }
 
+/// Build the SBOM component for one environment layer.
+///
+/// The component carries the layer content digest plus its declared SBOM,
+/// provenance, and signature evidence digests, so the SBOM documents the
+/// evidence chain for that layer rather than only the layer bytes.
+fn build_layer_component(role: &str, layer: &crate::layers::EnvironmentLayer) -> SbomComponent {
+    let digest_hex = strip_sha256_prefix(&layer.digest).unwrap_or_else(|| layer.digest.clone());
+    // `digest_hex` is the payload after the `sha256:` prefix; fall back to the
+    // raw digest rather than slicing so a malformed digest cannot panic here.
+    let ref_suffix = digest_hex.clone();
+    let mut props = vec![
+        SbomProperty {
+            name: "pico:layer_role".into(),
+            value: role.to_string(),
+        },
+        SbomProperty {
+            name: "pico:layer_order".into(),
+            value: layer.order.to_string(),
+        },
+        SbomProperty {
+            name: "pico:media_type".into(),
+            value: layer.media_type.clone(),
+        },
+        SbomProperty {
+            name: "pico:size".into(),
+            value: layer.size.to_string(),
+        },
+    ];
+    if let Some(ref version) = layer.version {
+        props.push(SbomProperty {
+            name: "pico:version".into(),
+            value: version.clone(),
+        });
+    }
+    for (name, value) in [
+        ("pico:layer_sbom_digest", layer.sbom_digest.as_ref()),
+        (
+            "pico:layer_provenance_digest",
+            layer.provenance_digest.as_ref(),
+        ),
+        (
+            "pico:layer_signature_digest",
+            layer.signature_digest.as_ref(),
+        ),
+    ] {
+        if let Some(v) = value {
+            props.push(SbomProperty {
+                name: name.to_string(),
+                value: v.clone(),
+            });
+        }
+    }
+
+    SbomComponent {
+        component_type: "file".into(),
+        bom_ref: format!("layer-{role}-{}@{}", layer.name, ref_suffix),
+        name: format!("pico-layer-{role}:{}", layer.name),
+        version: layer.version.clone(),
+        description: Some(format!(
+            "PicoCompute {role} layer '{}' at overlay order {}",
+            layer.name, layer.order
+        )),
+        purl: Some(format!("pkg:pico/layer/{}@{}", layer.name, ref_suffix)),
+        hashes: Some(vec![SbomHash {
+            alg: "SHA-256".into(),
+            content: digest_hex,
+        }]),
+        properties: Some(props),
+    }
+}
+
 fn build_package_component(pkg: &crate::lock::LockedPackage) -> SbomComponent {
     let digest_hex = strip_sha256_prefix(&pkg.digest).unwrap_or_else(|| pkg.digest.clone());
 
@@ -362,6 +441,22 @@ pub fn validate_sbom(
             return Err(ImageError::SbomValidationFailed(
                 "SBOM missing firmware component".into(),
             ));
+        }
+    }
+
+    if let Some(ref env) = manifest.environment {
+        for layer in env.ordered_layers() {
+            let role = layer.kind.as_str();
+            let found = sbom.components.iter().any(|c| {
+                c.bom_ref
+                    .starts_with(&format!("layer-{role}-{}@", layer.name))
+            });
+            if !found {
+                return Err(ImageError::SbomValidationFailed(format!(
+                    "SBOM missing {role} layer component: {}",
+                    layer.name
+                )));
+            }
         }
     }
 
@@ -474,7 +569,8 @@ mod tests {
                 memory: false,
                 excluded_mount_classes: vec!["runtime_tmp".into(), "secret".into()],
             },
-            environment: None,
+            required_features: vec![],
+        environment: None,
         }
     }
 

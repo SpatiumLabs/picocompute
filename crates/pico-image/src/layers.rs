@@ -16,20 +16,25 @@
 //!
 //! Rules enforced here:
 //!
-//! - Every layer carries its own content digest plus optional per-layer
-//!   supply-chain evidence digests (SBOM, provenance, signature). The
-//!   composition record binds them with one [`EnvironmentComposition::composition_digest`].
+//! - Every layer carries its own content digest plus per-layer supply-chain
+//!   evidence digests (SBOM, provenance, signature). All of them are bound by
+//!   one [`EnvironmentComposition::composition_digest`], so a promotion or
+//!   revocation decision keyed on that digest also pins the evidence it
+//!   reviewed. Only [`EnvironmentLayer::version`], a human label, is
+//!   deliberately excluded so relabelling cannot change layer identity.
 //! - The manifest signature covers the manifest bytes including the
 //!   composition, so host verification of the manifest plus
 //!   [`verify_layers_for_host`] is a signed composition check before boot.
 //! - Released layers are never mutated: overlay plans mark every lower as
-//!   read-only and the upper as the only writable layer. Whiteouts
-//!   (`.wh.*` files and opaque directory markers) are preserved by never
-//!   merging the upper down into a released lower.
-//! - Compatibility (backend, arch, protocol, snapshot exclusions) is checked
-//!   against the same allowlist gates as ADR-0008 and ADR-0004. A composition
-//!   that broadens compatibility requires recomposition plus revalidation,
-//!   never a host-time substitution.
+//!   read-only and the upper as the only writable layer. Whiteout semantics
+//!   are preserved structurally by never merging the upper down into a
+//!   released lower; see [`OVERLAYFS_OPAQUE_XATTR`] for the marker overlayfs
+//!   itself uses and why no code needs to interpret it.
+//! - Compatibility (backend, arch, protocol, profile, snapshot exclusions) is
+//!   checked against the same allowlist gates as ADR-0008 and ADR-0004, and
+//!   cross-checked between the composition and the manifest so placement and
+//!   boot cannot disagree. A composition that broadens compatibility requires
+//!   recomposition plus revalidation, never a host-time substitution.
 //! - Mount-count pressure is bounded by [`MAX_ENVIRONMENT_LAYERS`] with a
 //!   collapse recommendation at [`COLLAPSE_THRESHOLD_LAYERS`]. Collapse
 //!   squashes the oldest toolkits into one new toolkit layer with fresh
@@ -56,13 +61,32 @@ pub const MAX_ENVIRONMENT_LAYERS: usize = 16;
 /// mandatory at it.
 pub const COLLAPSE_THRESHOLD_LAYERS: usize = 8;
 
-/// Whiteout file prefix preserved across the overlay stack (AUFS/overlayfs
-/// convention for deletions in a lower layer).
-pub const WHITEOUT_PREFIX: &str = ".wh.";
+/// `trusted.overlay.opaque` xattr overlayfs sets on a directory in the upper
+/// to hide every lower directory of the same name.
+///
+/// This is the only deletion marker PicoCompute itself never has to interpret:
+/// overlayfs creates and consumes whiteouts (`0/0` character devices in the
+/// upper) and opaque directories as part of mount semantics. Pico preserves
+/// them by never merging the upper down into a released lower, so it needs no
+/// whiteout parser and cannot accidentally drop a deletion during collapse
+/// preparation. Referenced only in operator-facing advice text.
+pub const OVERLAYFS_OPAQUE_XATTR: &str = "trusted.overlay.opaque";
 
-/// Marker that makes a merged directory opaque, hiding all lower content
-/// beneath it. Plans must never drop or flatten this marker when composing.
-pub const OPAQUE_MARKER: &str = "trusted.overlay.opaque";
+/// Value overlayfs writes to [`OVERLAYFS_OPAQUE_XATTR`].
+pub const OVERLAYFS_OPAQUE_VALUE: &str = "y";
+
+/// Required-manifest-feature marker a reader must understand before it may
+/// boot a manifest that declares an [`EnvironmentComposition`].
+///
+/// ADR-0008 requires a reader to reject a field or value the manifest marks as
+/// required. Readers that predate this field ignore unknown JSON keys and
+/// would otherwise silently boot `artifacts.rootfs` and ignore the layer
+/// stack, so a layered manifest must carry this marker. See
+/// [`unknown_required_features`] for the reader-side check.
+pub const ENVIRONMENT_LAYER_FEATURE: &str = "environment-layers-v1";
+
+/// Maximum length of a layer name in bytes.
+const MAX_LAYER_NAME_LEN: usize = 128;
 
 /// Kind of one environment layer in the overlay stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -91,9 +115,15 @@ impl EnvironmentLayerKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentLayer {
     /// Stable layer name (for example `debian-base`, `workspace-seed`,
-    /// `toolkit-python`). Unique within a composition.
+    /// `toolkit-python`). Unique within a composition and restricted to a
+    /// single safe path component because hosts derive mount paths from it.
     pub name: String,
-    /// Position of this layer in the overlay order.
+    /// Position of this layer in the overlay order. Assigned by
+    /// [`EnvironmentComposition::new`] from the declared precedence and
+    /// validated against the stored array position, so shadowing order is
+    /// explicit signed data rather than a side effect of naming.
+    pub order: u32,
+    /// Position class of this layer in the overlay stack.
     pub kind: EnvironmentLayerKind,
     /// Content digest of the layer bytes (`sha256:<hex>`).
     pub digest: String,
@@ -102,21 +132,26 @@ pub struct EnvironmentLayer {
     /// OCI-style media type of the layer bytes.
     pub media_type: String,
     /// Human release version of this layer (for example `2026.09.1`).
+    ///
+    /// Deliberately excluded from [`EnvironmentComposition::composition_digest`]:
+    /// it is an operator label, not layer identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Digest of the per-layer CycloneDX/SPDX SBOM, when present.
+    /// Digest of the per-layer CycloneDX/SPDX SBOM. Required in production.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sbom_digest: Option<String>,
-    /// Digest of the per-layer SLSA/in-toto provenance, when present.
+    /// Digest of the per-layer SLSA/in-toto provenance. Required in production.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance_digest: Option<String>,
-    /// Digest of the per-layer detached signature bundle, when present.
+    /// Digest of the per-layer detached signature bundle. Required in production.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature_digest: Option<String>,
 }
 
 impl EnvironmentLayer {
     /// Build a layer and validate its fields.
+    ///
+    /// `order` is assigned by [`EnvironmentComposition::new`]; pass `0` here.
     ///
     /// # Errors
     ///
@@ -131,6 +166,7 @@ impl EnvironmentLayer {
     ) -> Result<Self, ImageError> {
         let layer = Self {
             name: name.into(),
+            order: 0,
             kind,
             digest: digest.into(),
             size,
@@ -144,7 +180,15 @@ impl EnvironmentLayer {
         Ok(layer)
     }
 
+    /// Set the human release version label.
+    #[must_use]
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
     /// Attach per-layer supply-chain evidence digests.
+    #[must_use]
     pub fn with_evidence(
         mut self,
         sbom_digest: Option<String>,
@@ -204,8 +248,13 @@ pub struct EnvironmentComposition {
 }
 
 impl EnvironmentComposition {
-    /// Build a composition, sorting toolkits by name and computing the
-    /// composition digest.
+    /// Build a composition, assigning overlay order from the declared
+    /// precedence and computing the composition digest.
+    ///
+    /// `base` and `workspace` occupy orders `0` and `1`. `toolkits` are
+    /// consumed in the order given, receiving orders `2..`: the first entry is
+    /// the topmost toolkit, so callers state shadowing order explicitly rather
+    /// than relying on name sorting. Name is retained as a human label only.
     ///
     /// # Errors
     ///
@@ -215,12 +264,23 @@ impl EnvironmentComposition {
         image_id: impl Into<String>,
         base: EnvironmentLayer,
         workspace: EnvironmentLayer,
-        mut toolkits: Vec<EnvironmentLayer>,
+        toolkits: Vec<EnvironmentLayer>,
         compatibility: CompositionCompatibility,
         build_epoch: i64,
     ) -> Result<Self, ImageError> {
-        toolkits.sort_by(|a, b| a.name.cmp(&b.name));
         let image_id = image_id.into();
+        let mut base = base;
+        base.order = 0;
+        let mut workspace = workspace;
+        workspace.order = 1;
+        let toolkits = toolkits
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut t)| {
+                t.order = (i + 2) as u32;
+                t
+            })
+            .collect::<Vec<_>>();
         let composition_digest =
             compute_composition_digest(&image_id, &base, &workspace, &toolkits, &compatibility);
         let composition = Self {
@@ -311,15 +371,7 @@ impl EnvironmentComposition {
 /// Returns `Err` with a reason when the name, digest, size, or media type is
 /// malformed.
 pub fn validate_environment_layer(layer: &EnvironmentLayer) -> Result<(), String> {
-    if layer.name.is_empty() {
-        return Err("environment layer name is empty".into());
-    }
-    if layer.name.len() > 128 {
-        return Err(format!(
-            "environment layer name '{}' exceeds 128 bytes",
-            layer.name
-        ));
-    }
+    validate_layer_name(&layer.name)?;
     if !layer.digest.starts_with("sha256:") || layer.digest.len() <= "sha256:".len() {
         return Err(format!(
             "layer '{}' digest '{}' does not use sha256: prefix",
@@ -345,6 +397,44 @@ pub fn validate_environment_layer(layer: &EnvironmentLayer) -> Result<(), String
                 layer.name
             ));
         }
+    }
+    Ok(())
+}
+
+/// Validate a layer name as a single safe path component.
+///
+/// Hosts derive overlay mount paths from the name and join those paths with
+/// `:` into the overlayfs `lowerdir=` mount option, so a name containing a path
+/// separator or the option separator would either escape the layer store or
+/// silently inject an extra lower layer. Restricting the charset here means
+/// the sink can trust its input; `plan_overlay_stack` still keeps an inline
+/// containment guard so the check dominates the sink.
+///
+/// # Errors
+///
+/// Returns `Err` with a reason when the name is empty, too long, a relative
+/// path element, or contains a character outside `[A-Za-z0-9._-]`.
+pub fn validate_layer_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("environment layer name is empty".into());
+    }
+    if name.len() > MAX_LAYER_NAME_LEN {
+        return Err(format!(
+            "environment layer name '{name}' exceeds {MAX_LAYER_NAME_LEN} bytes"
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(format!(
+            "environment layer name '{name}' is a relative path element"
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Err(format!(
+            "environment layer name '{name}' contains disallowed character {bad:?}; allowed set is [A-Za-z0-9._-]"
+        ));
     }
     Ok(())
 }
@@ -412,11 +502,16 @@ pub fn validate_environment_composition(comp: &EnvironmentComposition) -> Result
         }
     }
 
-    let sorted: Vec<&str> = comp.toolkits.iter().map(|t| t.name.as_str()).collect();
-    let mut expected = sorted.clone();
-    expected.sort_unstable();
-    if sorted != expected {
-        return Err("toolkit layers must be sorted by name for deterministic overlay order".into());
+    // Overlay order is explicit signed data, not a side effect of naming:
+    // each layer's recorded order must equal its position in the stack, so
+    // renaming a toolkit can never change which layer shadows which.
+    for (position, layer) in comp.ordered_layers().iter().enumerate() {
+        if layer.order as usize != position {
+            return Err(format!(
+                "layer '{}' declares order {} but sits at position {position}",
+                layer.name, layer.order
+            ));
+        }
     }
 
     validate_composition_compatibility_fields(comp)?;
@@ -488,10 +583,19 @@ fn validate_composition_compatibility_fields(comp: &EnvironmentComposition) -> R
     Ok(())
 }
 
-/// Canonical digest binding the ordered layer set plus compatibility.
+/// Canonical digest binding the ordered layer set, per-layer supply-chain
+/// evidence, and compatibility.
 ///
-/// Toolkits must already be sorted by name; [`EnvironmentComposition::new`]
-/// guarantees this.
+/// `version` is deliberately excluded: it is a human release label, so
+/// relabelling a layer must not change its identity. Everything else the
+/// composition records - order, name, content digest, size, media type, and
+/// the SBOM/provenance/signature evidence digests - is bound, so a promotion
+/// or revocation decision keyed on this digest also pins the evidence it
+/// reviewed.
+///
+/// Toolkits are hashed in stored (declared precedence) order; the caller
+/// controls that order, and [`EnvironmentComposition::new`] validates each
+/// layer's recorded order against its position.
 pub fn compute_composition_digest(
     image_id: &str,
     base: &EnvironmentLayer,
@@ -499,12 +603,24 @@ pub fn compute_composition_digest(
     toolkits: &[EnvironmentLayer],
     compatibility: &CompositionCompatibility,
 ) -> String {
+    let layer_json = |l: &EnvironmentLayer| {
+        serde_json::json!({
+            "name": l.name,
+            "order": l.order,
+            "digest": l.digest,
+            "size": l.size,
+            "media_type": l.media_type,
+            "sbom_digest": l.sbom_digest,
+            "provenance_digest": l.provenance_digest,
+            "signature_digest": l.signature_digest,
+        })
+    };
     let canonical = serde_json::json!({
         "schema_version": ENVIRONMENT_SCHEMA_VERSION,
         "image_id": image_id,
-        "base": {"name": base.name, "digest": base.digest, "size": base.size, "media_type": base.media_type},
-        "workspace": {"name": workspace.name, "digest": workspace.digest, "size": workspace.size, "media_type": workspace.media_type},
-        "toolkits": toolkits.iter().map(|t| serde_json::json!({"name": t.name, "digest": t.digest, "size": t.size, "media_type": t.media_type})).collect::<Vec<_>>(),
+        "base": layer_json(base),
+        "workspace": layer_json(workspace),
+        "toolkits": toolkits.iter().map(layer_json).collect::<Vec<_>>(),
         "compatibility": {
             "profile_id": compatibility.profile_id,
             "backends": compatibility.backends.iter().map(|b| serde_json::json!({"family": b.family, "runtime_version": b.runtime_version, "architecture": b.architecture})).collect::<Vec<_>>(),
@@ -539,14 +655,20 @@ pub struct LayerRebuildPlan {
 
 /// Diff two compositions of the same image family.
 ///
+/// Both operands are validated first: `toolkit_only` is the signal callers use
+/// to skip full revalidation, so a malformed or stale `to` composition must not
+/// be able to select the fast path.
+///
 /// # Errors
 ///
-/// Returns [`ImageError::CompositionValidationFailed`] when the two
-/// compositions belong to different image families.
+/// Returns [`ImageError::CompositionValidationFailed`] when either composition
+/// is invalid or the two belong to different image families.
 pub fn plan_rebuild(
     from: &EnvironmentComposition,
     to: &EnvironmentComposition,
 ) -> Result<LayerRebuildPlan, ImageError> {
+    validate_environment_composition(from).map_err(ImageError::CompositionValidationFailed)?;
+    validate_environment_composition(to).map_err(ImageError::CompositionValidationFailed)?;
     if from.image_id != to.image_id {
         return Err(ImageError::CompositionValidationFailed(format!(
             "cannot diff compositions across image families: '{}' vs '{}'",
@@ -708,16 +830,20 @@ pub struct OverlayPlan {
 
 /// Plan the overlay stack for one composition.
 ///
-/// Lowerdirs follow base bottom, workspace middle, toolkits top (sorted by
-/// name). Callers mount them read-only with a per-sandbox writable upper.
-/// Whiteout semantics are preserved by construction: this function never
-/// merges, squashes, or reorders layers, it only orders mount options.
+/// Lowerdirs follow base bottom, workspace middle, then toolkits in declared
+/// precedence order. Callers mount them read-only with a per-sandbox writable
+/// upper. Whiteout semantics are preserved structurally: this function never
+/// merges, squashes, or reorders layers, so overlayfs-generated whiteouts
+/// (`0/0` character devices) and [`OVERLAYFS_OPAQUE_XATTR`] markers in the
+/// upper stay intact.
 ///
 /// # Errors
 ///
-/// Returns [`ImageError::CompositionValidationFailed`] when the composition
-/// is invalid, and [`ImageError::TooManyLayers`] when the layer count
-/// exceeds [`MAX_ENVIRONMENT_LAYERS`].
+/// Returns [`ImageError::TooManyLayers`] when the layer count exceeds
+/// [`MAX_ENVIRONMENT_LAYERS`], [`ImageError::CompositionValidationFailed`]
+/// when the composition is invalid, and
+/// [`ImageError::LayerStorePathInvalid`] when a derived lower path would fall
+/// outside `layer_mount_dir`.
 pub fn plan_overlay_stack(
     composition: &EnvironmentComposition,
     layer_mount_dir: &str,
@@ -725,19 +851,38 @@ pub fn plan_overlay_stack(
     workdir: &str,
     mergedir: &str,
 ) -> Result<OverlayPlan, ImageError> {
-    validate_environment_composition(composition)
-        .map_err(ImageError::CompositionValidationFailed)?;
+    // Check the count first so an over-cap composition reports the typed
+    // `TooManyLayers` reason rather than the generic validation failure.
     if composition.layer_count() > MAX_ENVIRONMENT_LAYERS {
         return Err(ImageError::TooManyLayers {
             count: composition.layer_count(),
             max: MAX_ENVIRONMENT_LAYERS,
         });
     }
-    let lowerdirs: Vec<String> = composition
-        .ordered_layers()
-        .iter()
-        .map(|l| format!("{layer_mount_dir}/{}", l.name))
-        .collect();
+    validate_environment_composition(composition)
+        .map_err(ImageError::CompositionValidationFailed)?;
+    validate_layer_store_dir(layer_mount_dir).map_err(ImageError::CompositionValidationFailed)?;
+
+    let prefix = format!("{layer_mount_dir}/");
+    let mut lowerdirs = Vec::with_capacity(composition.layer_count());
+    for layer in composition.ordered_layers() {
+        let path = format!("{prefix}{}", layer.name);
+        // Inline guard so the name check dominates the sink: a validated name
+        // is a single safe path component, and this rejects any future layer
+        // or separator change that could escape the layer store or inject an
+        // extra lower layer through the `:` separator.
+        if !path.starts_with(&prefix)
+            || path[prefix.len()..].contains('/')
+            || path[prefix.len()..].contains(':')
+            || path.contains("..")
+        {
+            return Err(ImageError::LayerStorePathInvalid {
+                layer: layer.name.clone(),
+                mount_dir: layer_mount_dir.to_string(),
+            });
+        }
+        lowerdirs.push(path);
+    }
     // Overlayfs `lowerdir=` lists the topmost lower first, so reverse the
     // bottom-to-top order for the mount option while keeping `lowerdirs`
     // in stack order for audit and verification.
@@ -755,12 +900,43 @@ pub fn plan_overlay_stack(
     })
 }
 
+/// Validate the host directory that released layers are mounted from.
+///
+/// # Errors
+///
+/// Returns `Err` with a reason when the directory is empty, relative, or
+/// contains a character that is unsafe in a `lowerdir=` list.
+pub fn validate_layer_store_dir(dir: &str) -> Result<(), String> {
+    if dir.is_empty() {
+        return Err("layer mount dir is empty".into());
+    }
+    if !dir.starts_with('/') {
+        return Err(format!("layer mount dir '{dir}' must be absolute"));
+    }
+    if dir.contains(':') {
+        return Err(format!(
+            "layer mount dir '{dir}' contains the ':' lowerdir separator"
+        ));
+    }
+    if dir.contains("//") {
+        return Err(format!(
+            "layer mount dir '{dir}' contains an empty component"
+        ));
+    }
+    if dir.split('/').any(|c| c == "." || c == "..") {
+        return Err(format!(
+            "layer mount dir '{dir}' is not lexically normalized"
+        ));
+    }
+    Ok(())
+}
+
 /// Collapse recommendation when mount count becomes a problem.
 ///
 /// Returns `Some(reason)` when the composition should be collapsed before
 /// adding more toolkits: at or above [`COLLAPSE_THRESHOLD_LAYERS`] layers, or
-/// when the lowerdir option string would exceed typical mount-argument
-/// limits. Returns `None` when the stack is healthy.
+/// at/above the hard [`MAX_ENVIRONMENT_LAYERS`] cap. Returns `None` when the
+/// stack is healthy.
 pub fn collapse_advice(composition: &EnvironmentComposition) -> Option<String> {
     if composition.layer_count() >= MAX_ENVIRONMENT_LAYERS {
         return Some(format!(
@@ -770,7 +946,7 @@ pub fn collapse_advice(composition: &EnvironmentComposition) -> Option<String> {
     }
     if composition.layer_count() >= COLLAPSE_THRESHOLD_LAYERS {
         return Some(format!(
-            "composition has {} layers (threshold {COLLAPSE_THRESHOLD_LAYERS}): squash the least-recently-changed toolkits into one versioned toolkit layer with fresh SBOM/provenance/signature, carry whiteouts ({WHITEOUT_PREFIX}* and {OPAQUE_MARKER}) into the squashed layer, and recompose; never edit a released layer in place",
+            "composition has {} layers (threshold {COLLAPSE_THRESHOLD_LAYERS}): squash the least-recently-changed toolkits into one new toolkit layer with fresh SBOM/provenance/signature, preserve any overlayfs opaque-directory markers ({OVERLAYFS_OPAQUE_XATTR}={OVERLAYFS_OPAQUE_VALUE}) and whiteouts from the upper, and recompose; never edit a released layer in place",
             composition.layer_count()
         ));
     }
@@ -794,9 +970,13 @@ pub struct HostLayerFile<'a> {
 /// post-release edit changes bytes and fails the digest check, so hosts must
 /// mount lowers read-only and keep all writes in the upper.
 ///
+/// The count check plus the per-name lookup already reject missing, extra, and
+/// duplicated entries: with `layer_files.len() == layer_count()` and every
+/// declared name located, the presented set is exactly the declared set.
+///
 /// # Errors
 ///
-/// Returns [`ImageError::MissingHostArtifact`] for a missing or extra layer,
+/// Returns [`ImageError::MissingHostArtifact`] for a missing layer,
 /// [`ImageError::SizeMismatch`] for a size drift, and
 /// [`ImageError::DigestMismatch`] for a content drift.
 pub fn verify_layers_for_host(
@@ -852,20 +1032,6 @@ pub fn verify_layers_for_host(
             });
         }
     }
-    // No extra layers: every presented file must match a declared layer.
-    for f in layer_files {
-        if !composition
-            .ordered_layers()
-            .iter()
-            .any(|l| l.name == f.name)
-        {
-            return Err(ImageError::MissingHostArtifact {
-                artifact: f.name.to_string(),
-                image_id: composition.image_id.clone(),
-                reason: "present on host but not declared in composition".into(),
-            });
-        }
-    }
     Ok(())
 }
 
@@ -883,6 +1049,11 @@ pub struct HostCompatibilityExpectation {
 /// Verify composition compatibility against host capabilities and the
 /// manifest-level contract (ADR-0008 allowlist plus ADR-0004 backend gates).
 ///
+/// Every claim is cross-checked in both directions where the composition and
+/// the manifest each record it (image family, architecture, backend,
+/// compatibility profile, protocol range, snapshot exclusions), so a
+/// composition cannot claim compatibility the manifest does not, or vice versa.
+///
 /// # Errors
 ///
 /// Returns [`ImageError::IncompatibleComposition`] when backend, arch,
@@ -892,29 +1063,33 @@ pub fn verify_composition_compatibility(
     manifest: &crate::types::PicoComputeGuestManifest,
     expected: &HostCompatibilityExpectation,
 ) -> Result<(), ImageError> {
+    let incompatible = |reason: String| ImageError::IncompatibleComposition { reason };
+
     if composition.image_id != manifest.image_id {
-        return Err(ImageError::IncompatibleComposition {
-            reason: format!(
-                "composition image_id '{}' does not match manifest image_id '{}'",
-                composition.image_id, manifest.image_id
-            ),
-        });
+        return Err(incompatible(format!(
+            "composition image_id '{}' does not match manifest image_id '{}'",
+            composition.image_id, manifest.image_id
+        )));
     }
     if composition.compatibility.architecture != expected.architecture {
-        return Err(ImageError::IncompatibleComposition {
-            reason: format!(
-                "composition architecture '{}' does not match host '{}'",
-                composition.compatibility.architecture, expected.architecture
-            ),
-        });
+        return Err(incompatible(format!(
+            "composition architecture '{}' does not match host '{}'",
+            composition.compatibility.architecture, expected.architecture
+        )));
     }
     if manifest.platform.architecture != expected.architecture {
-        return Err(ImageError::IncompatibleComposition {
-            reason: format!(
-                "manifest architecture '{}' does not match host '{}'",
-                manifest.platform.architecture, expected.architecture
-            ),
-        });
+        return Err(incompatible(format!(
+            "manifest architecture '{}' does not match host '{}'",
+            manifest.platform.architecture, expected.architecture
+        )));
+    }
+    // The profile is the tested-compatibility claim; a composition validated
+    // under a different profile was never tested as this set.
+    if composition.compatibility.profile_id != manifest.compatibility.profile_id {
+        return Err(incompatible(format!(
+            "composition profile '{}' does not match manifest profile '{}'",
+            composition.compatibility.profile_id, manifest.compatibility.profile_id
+        )));
     }
     let backend_ok = composition
         .compatibility
@@ -922,12 +1097,10 @@ pub fn verify_composition_compatibility(
         .iter()
         .any(|b| b.family == expected.backend && b.architecture == expected.architecture);
     if !backend_ok {
-        return Err(ImageError::IncompatibleComposition {
-            reason: format!(
-                "backend '{}' on '{}' is not in the composition allowlist",
-                expected.backend, expected.architecture
-            ),
-        });
+        return Err(incompatible(format!(
+            "backend '{}' on '{}' is not in the composition allowlist",
+            expected.backend, expected.architecture
+        )));
     }
     let manifest_backend_ok = manifest
         .compatibility
@@ -935,12 +1108,10 @@ pub fn verify_composition_compatibility(
         .iter()
         .any(|b| b.family == expected.backend && b.architecture == expected.architecture);
     if !manifest_backend_ok {
-        return Err(ImageError::IncompatibleComposition {
-            reason: format!(
-                "backend '{}' on '{}' is not in the manifest allowlist",
-                expected.backend, expected.architecture
-            ),
-        });
+        return Err(incompatible(format!(
+            "backend '{}' on '{}' is not in the manifest allowlist",
+            expected.backend, expected.architecture
+        )));
     }
     let protocol_ok = composition
         .compatibility
@@ -948,12 +1119,23 @@ pub fn verify_composition_compatibility(
         .iter()
         .any(|r| r.major == expected.protocol_major);
     if !protocol_ok {
-        return Err(ImageError::IncompatibleComposition {
-            reason: format!(
-                "protocol major {} is not in the composition allowlist",
-                expected.protocol_major
-            ),
-        });
+        return Err(incompatible(format!(
+            "protocol major {} is not in the composition allowlist",
+            expected.protocol_major
+        )));
+    }
+    // The manifest is what ADR-0003 negotiates against, so the host must be
+    // allowed by the manifest too, not just by the composition.
+    let manifest_protocol_ok = manifest
+        .protocol
+        .supported
+        .iter()
+        .any(|r| r.major == expected.protocol_major);
+    if !manifest_protocol_ok {
+        return Err(incompatible(format!(
+            "protocol major {} is not in the manifest allowlist",
+            expected.protocol_major
+        )));
     }
     // Snapshot exclusion contracts must agree: the composition and the
     // manifest must exclude the same ephemeral classes so restore, fork, and
@@ -963,20 +1145,53 @@ pub fn verify_composition_compatibility(
     let mut manifest_excl = manifest.snapshot.excluded_mount_classes.clone();
     manifest_excl.sort();
     if comp_excl != manifest_excl {
-        return Err(ImageError::IncompatibleComposition {
-            reason: format!(
-                "composition snapshot exclusions {comp_excl:?} do not match manifest {manifest_excl:?}"
-            ),
-        });
+        return Err(incompatible(format!(
+            "composition snapshot exclusions {comp_excl:?} do not match manifest {manifest_excl:?}"
+        )));
     }
     Ok(())
 }
 
-/// Per-layer supply-chain gate: every layer should carry SBOM, provenance,
-/// and signature evidence digests in production.
+/// Required-manifest features this reader understands.
 ///
-/// Returns the list of layer names missing evidence; empty means all gates
-/// hold. Development compositions may omit evidence, production must not.
+/// A manifest may list required features in
+/// `PicoComputeGuestManifest::required_features`; a reader must refuse to boot
+/// a manifest naming anything outside this set (ADR-0008 schema rules).
+pub fn known_required_features() -> &'static [&'static str] {
+    &[ENVIRONMENT_LAYER_FEATURE]
+}
+
+/// Report required manifest features this reader does not understand.
+///
+/// # Errors
+///
+/// Returns [`ImageError::UnknownRequiredFeature`] naming the first
+/// unrecognized feature when the manifest requires behavior this reader
+/// cannot provide.
+pub fn unknown_required_features(
+    manifest: &crate::types::PicoComputeGuestManifest,
+) -> Result<(), ImageError> {
+    for feature in &manifest.required_features {
+        if !known_required_features().contains(&feature.as_str()) {
+            return Err(ImageError::UnknownRequiredFeature {
+                image_id: manifest.image_id.clone(),
+                feature: feature.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Per-layer supply-chain gate: every layer must carry SBOM, provenance, and
+/// signature evidence digests.
+///
+/// ADR-0008 requires those evidence classes for every released artifact, so
+/// a composition is only eligible for promotion when this returns an empty
+/// list. The evidence digests are bound into
+/// [`EnvironmentComposition::composition_digest`], so a decision keyed on that
+/// digest also pins the evidence it reviewed. Enforced by
+/// `validation::check_environment_supply_chain` and surfaced for operator
+/// tooling.
 pub fn layers_missing_supply_chain_evidence(composition: &EnvironmentComposition) -> Vec<String> {
     composition
         .ordered_layers()
@@ -991,8 +1206,8 @@ pub fn layers_missing_supply_chain_evidence(composition: &EnvironmentComposition
 /// Audit record hosts and placement persist on READY.
 ///
 /// Contains image family, composition digest, ordered layer digests, and the
-/// compatibility profile so retinal audits can prove which exact layer set
-/// booted without re-reading the manifest.
+/// compatibility profile so retrospective audits can prove which exact layer
+/// set booted without re-reading the manifest.
 pub fn format_composition_audit_record(
     composition: &EnvironmentComposition,
     manifest_digest: &str,
@@ -1003,6 +1218,7 @@ pub fn format_composition_audit_record(
         .map(|l| {
             serde_json::json!({
                 "name": l.name,
+                "order": l.order,
                 "kind": l.kind.as_str(),
                 "digest": l.digest,
             })
@@ -1014,6 +1230,7 @@ pub fn format_composition_audit_record(
         "manifest_digest": manifest_digest,
         "profile_id": composition.compatibility.profile_id,
         "architecture": composition.compatibility.architecture,
+        "layer_count": composition.layer_count(),
         "layers": layers,
     })
     .to_string()
@@ -1031,6 +1248,7 @@ mod tests {
     ) -> EnvironmentLayer {
         EnvironmentLayer {
             name: name.into(),
+            order: 0,
             kind,
             digest: format!("sha256:{digest_suffix}"),
             size: 1024,
@@ -1082,7 +1300,9 @@ mod tests {
     }
 
     #[test]
-    fn new_sorts_toolkits_for_deterministic_order() {
+    fn new_preserves_declared_toolkit_precedence() {
+        // Declaration order wins over name order: the first toolkit declared is
+        // the topmost, so shadowing never depends on how a layer was named.
         let comp = EnvironmentComposition::new(
             "img",
             test_layer("b", EnvironmentLayerKind::Base, "b1"),
@@ -1096,11 +1316,83 @@ mod tests {
         )
         .unwrap();
         let names: Vec<&str> = comp.toolkits.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["toolkit-a", "toolkit-z"]);
+        assert_eq!(names, vec!["toolkit-z", "toolkit-a"]);
+        let orders: Vec<u32> = comp.toolkits.iter().map(|t| t.order).collect();
+        assert_eq!(orders, vec![2, 3]);
+    }
+
+    #[test]
+    fn toolkit_precedence_changes_composition_digest() {
+        // Two orderings of the same layer set produce different digests, so the
+        // merged view is bound by the composition digest.
+        let mk = |names: (&str, &str)| {
+            EnvironmentComposition::new(
+                "img",
+                test_layer("b", EnvironmentLayerKind::Base, "b1"),
+                test_layer("w", EnvironmentLayerKind::Workspace, "w1"),
+                vec![
+                    test_layer(names.0, EnvironmentLayerKind::Toolkit, "t1"),
+                    test_layer(names.1, EnvironmentLayerKind::Toolkit, "t2"),
+                ],
+                test_compatibility(),
+                1,
+            )
+            .unwrap()
+        };
+        let ab = mk(("toolkit-a", "toolkit-b"));
+        let ba = mk(("toolkit-b", "toolkit-a"));
+        assert_ne!(ab.composition_digest, ba.composition_digest);
+    }
+
+    #[test]
+    fn layer_order_must_match_position() {
+        let mut comp = test_composition();
+        comp.toolkits[0].order = 9;
+        let err = validate_environment_composition(&comp).unwrap_err();
+        assert!(err.contains("order"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn composition_digest_binds_per_layer_evidence() {
+        let base = test_composition();
+        let mut altered = base.clone();
+        altered.toolkits[0].sbom_digest = Some("sha256:different-sbom".into());
+        // The digest is unchanged, so recomposition is required to record it.
+        let recomputed = compute_composition_digest(
+            &altered.image_id,
+            &altered.base,
+            &altered.workspace,
+            &altered.toolkits,
+            &altered.compatibility,
+        );
+        assert_ne!(
+            recomputed, base.composition_digest,
+            "evidence digests must be bound into the composition digest"
+        );
+    }
+
+    #[test]
+    fn composition_digest_ignores_version_label() {
+        let base = test_composition();
+        let mut relabelled = base.clone();
+        relabelled.toolkits[0].version = Some("2099.01.0".into());
+        let recomputed = compute_composition_digest(
+            &relabelled.image_id,
+            &relabelled.base,
+            &relabelled.workspace,
+            &relabelled.toolkits,
+            &relabelled.compatibility,
+        );
+        assert_eq!(
+            recomputed, base.composition_digest,
+            "relabelling must not change layer identity"
+        );
     }
 
     #[test]
     fn ordered_layers_follow_base_workspace_toolkits() {
+        // `test_composition` declares python before node, so python is the
+        // topmost toolkit and therefore last in bottom-to-top order.
         let comp = test_composition();
         let names: Vec<&str> = comp
             .ordered_layers()
@@ -1112,8 +1404,8 @@ mod tests {
             vec![
                 "debian-base",
                 "workspace-seed",
-                "toolkit-node",
-                "toolkit-python"
+                "toolkit-python",
+                "toolkit-node"
             ]
         );
     }
@@ -1171,7 +1463,7 @@ mod tests {
         .unwrap();
         assert!(comp.layer_count() >= COLLAPSE_THRESHOLD_LAYERS);
         let advice = collapse_advice(&comp).expect("must recommend collapse");
-        assert!(advice.contains("whiteout") || advice.contains(WHITEOUT_PREFIX));
+        assert!(advice.contains(OVERLAYFS_OPAQUE_XATTR));
     }
 
     #[test]

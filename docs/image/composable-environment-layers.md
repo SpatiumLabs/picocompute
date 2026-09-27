@@ -11,15 +11,15 @@ One composition binds independently versioned layers:
 ```text
 base (bottom, read-only, released)
   -> workspace (middle, read-only, released)
-    -> toolkits (top, read-only, released, sorted by name)
+    -> toolkits (top, read-only, released, in declared precedence)
       -> local writable upper (per-sandbox, never promoted)
 ```
 
 Implementation: `crates/pico-image/src/layers.rs`.
 
-- `EnvironmentLayer` carries `name`, `kind`, `digest` (`sha256:`), `size`,
-  `media_type`, plus optional per-layer `sbom_digest`, `provenance_digest`,
-  and `signature_digest`.
+- `EnvironmentLayer` carries `name`, `order`, `kind`, `digest` (`sha256:`),
+  `size`, `media_type`, plus the per-layer `sbom_digest`,
+  `provenance_digest`, and `signature_digest` evidence digests.
 - `EnvironmentComposition` binds base, workspace, toolkits, and a
   `CompositionCompatibility` allowlist with one `composition_digest`.
 - `PicoComputeGuestManifest.environment` is `Option<EnvironmentComposition>`.
@@ -29,20 +29,62 @@ Implementation: `crates/pico-image/src/layers.rs`.
 - `VerifiedImage` returns `composition_digest` and
   `composition_audit_record` for placement/host audit on READY.
 
+## Overlay precedence is explicit
+
+`EnvironmentLayer.order` is assigned from declaration order and validated
+against the stored array position, so shadowing order is signed data rather
+than a side effect of naming. Renaming a toolkit cannot change which layer
+wins. `order` is included in the composition digest, so two orderings of the
+same layer set produce different digests because the merged view differs.
+
+`[[environment.layers]]` in the image definition declares layers in
+precedence order, with `role = "base" | "workspace" | "toolkit"`. Exactly one
+base and one workspace are required.
+
+## What the composition digest binds
+
+`compute_composition_digest` hashes, per layer: `name`, `order`, `digest`,
+`size`, `media_type`, `sbom_digest`, `provenance_digest`, and
+`signature_digest`, plus the full compatibility block.
+
+This matters for revocation: promotion and revocation decisions are keyed on
+`composition_digest`, so binding the evidence digests means a decision also
+pins the evidence it reviewed. Re-generating a layer SBOM changes the
+composition digest.
+
+`version` is deliberately excluded. It is a human release label, so relabelling
+a layer must not change its identity.
+
 ## Overlay stack at prepare/boot
 
-`plan_overlay_stack` orders lowerdirs base bottom, workspace middle,
-toolkits top (sorted by name for determinism), with one per-sandbox writable
-upper:
+`plan_overlay_stack` orders lowerdirs base bottom, workspace middle, then
+toolkits in declared precedence, with one per-sandbox writable upper:
 
 - Released lowers mount read-only. Only the upper is writable.
 - Never mutate released layers: any post-release edit changes bytes and fails
   the digest check, so hosts must keep all writes in the upper.
-- Whiteout semantics preserved by never merging down: deletions stay as
-  `.wh.*` files and opaque markers (`trusted.overlay.opaque`) in the upper.
-  Collapse carries them into the squashed layer.
-- The `lowerdir=` mount option lists the topmost lower first (overlayfs
-  convention) while `lowerdirs` stays in stack order for audit.
+- Whiteout semantics are preserved structurally. Overlayfs itself creates and
+  consumes whiteouts (`0/0` character devices in the upper) and opaque
+  directories (`trusted.overlay.opaque=y`). Because Pico never merges the upper
+  down into a released lower, it needs no whiteout parser and cannot
+  accidentally drop a deletion. `OVERLAYFS_OPAQUE_XATTR` /
+  `OVERLAYFS_OPAQUE_VALUE` are the documented markers the collapse policy must
+  preserve.
+- The `lowerdir=` mount option lists the topmost lower first (kernel doc:
+  "stacked beginning from the rightmost one and going left"), so
+  `lowerdir_option` is reversed while `lowerdirs` stays in stack order for
+  audit and verification.
+
+### Layer name safety
+
+Hosts derive mount paths from the layer name and join them with `:` into the
+`lowerdir=` option, so `validate_layer_name` restricts names to
+`[A-Za-z0-9._-]`, rejects `.` and `..`, and caps length at 128 bytes. Without
+this, a name like `toolkit-a:/etc` would inject an extra lower layer and
+`../../etc` would escape the layer store. `plan_overlay_stack` additionally
+validates `layer_mount_dir` (absolute, normalized, no `:`) and keeps an
+inline containment guard at the sink so the name check dominates the path
+join.
 
 ## Rebuild and promotion semantics
 
@@ -50,63 +92,123 @@ upper:
   name, preserves base/workspace digests byte-identical, and recomputes only
   the composition digest. `plan_rebuild` reports `toolkit_only` with the
   changed layer name. This turns O(m*N)/O(k*N) monolithic rebuilds into O(k).
+  Both operands are validated first, so a malformed or stale composition
+  cannot select the fast path.
 - Base or workspace change is the slow path: `plan_rebuild` sets
   `base_or_workspace_changed`, requiring full revalidation.
 - Promotion is monotonic evidence over one digest
   (`Built` -> `Validated` -> `Candidate` -> `Production`). It never rebuilds
   or mutates layers. `CompositionPromotion::advance` rejects skips,
   regressions, and digest changes.
-- Per-layer supply-chain gates: `layers_missing_supply_chain_evidence`
-  reports layers missing SBOM/provenance/signature digests. Production
-  compositions must return empty. Host verification additionally checks
-  per-layer digest/size of materialized bytes.
+- Per-layer supply-chain gates are enforced, not advisory. Every layer must
+  carry SBOM, provenance, and signature digests. Enforced at build time by
+  `check_environment_supply_chain` in `validate_supply_chain` (which
+  `RootfsBuilder::build` runs and which blocks signing when it fails) and at
+  boot time by `verify_environment_supply_chain`.
 
 ## Composition compatibility
 
 `verify_composition_compatibility` enforces the ADR-0008 allowlist plus
-ADR-0004 backend gates:
+ADR-0004 backend gates, cross-checking every claim the composition and the
+manifest both record:
 
 - composition `image_id` matches manifest `image_id`
 - composition and manifest architecture match the host
+- composition `profile_id` matches manifest `profile_id`
 - backend family/arch is in both the composition and manifest allowlists
-- protocol major is in the composition allowlist
+- protocol major is in both the composition and manifest allowlists
 - composition and manifest snapshot exclusions agree (must cover `secret`
   and `runtime_tmp` so restore/fork/warm-snapshot cannot diverge by layer)
 
 Broadening compatibility requires recomposition plus revalidation, never a
 host-time substitution. Scheduler placement (manifest) and host boot
-(composition) cannot diverge.
+(composition) cannot disagree.
+
+## Reader compatibility
+
+`PicoComputeGuestManifest.required_features` lists features a reader must
+understand. A manifest carrying an environment declares
+`ENVIRONMENT_LAYER_FEATURE` (`environment-layers-v1`).
+
+This exists because serde ignores unknown keys: a reader predating the
+`environment` field would otherwise parse a layered manifest, ignore the
+composition, and silently boot `artifacts.rootfs` instead of the layer stack.
+`unknown_required_features` runs in both `validate_manifest` and
+`verify_for_host`, so such a reader refuses the manifest rather than
+downgrading it. Limitation: a reader predating `required_features` itself
+cannot be made to fail closed, since it has no field to inspect. That needs a
+schema major bump, which ADR-0008 requires explicit reader support for.
 
 ## Layer-collapse and threshold policy
 
 - `MAX_ENVIRONMENT_LAYERS = 16` total released layers. Above this,
   composition construction and overlay planning fail closed.
+  `plan_overlay_stack` checks the count before full validation, so an
+  over-cap composition reports the typed `ImageError::TooManyLayers` rather
+  than the generic composition error.
 - `COLLAPSE_THRESHOLD_LAYERS = 8` total layers. At or above this,
   `plan_overlay_stack` sets `collapse_recommended` and `collapse_advice`
   returns a reason.
 - Collapse policy: squash the least-recently-changed toolkits into one new
   versioned toolkit layer with fresh digest, SBOM, provenance, and signature.
-  Carry whiteouts (`.wh.*` and `trusted.overlay.opaque`) into the squashed
-  layer. Recompose and revalidate. Never edit a released layer in place.
+  Preserve any overlayfs opaque-directory markers and whiteouts from the
+  upper. Recompose and revalidate. Never edit a released layer in place.
 - Adding a toolkit to a composition at the threshold should collapse first.
   Adding beyond the max must collapse first.
+
+## Build pipeline integration
+
+`RootfsBuilder::build` attaches the composition when the definition declares
+`[[environment.layers]]`, via
+`manifest::attach_environment_from_definition`. The environment is attached
+before evidence generation, so:
+
+- the SBOM gains one component per layer (`build_layer_component`), carrying
+  the layer content digest and its declared evidence digests;
+- `validate_sbom` fails when a declared layer has no SBOM component;
+- provenance records each layer material and the composition digest as build
+  inputs (`generate_provenance` takes the composition);
+- the manifest signature covers the composition bytes.
 
 ## Audit
 
 `format_composition_audit_record` emits JSON with `image_id`,
-`composition_digest`, `manifest_digest`, `profile_id`, `architecture`, and
-ordered layer name/kind/digest. Placement and host persist this record on
-READY so audits prove which exact layer set booted without re-reading the
-manifest.
+`composition_digest`, `manifest_digest`, `profile_id`, `architecture`,
+`layer_count`, and ordered layer name/order/kind/digest. Placement and host
+persist this record on READY so audits prove which exact layer set booted
+without re-reading the manifest.
+
+## Open limitation
+
+Host-agent and runtime prepare paths still consume configured kernel and
+rootfs paths and do not yet call `verify_for_host` or the `verify_environment_*`
+hooks.
+That is pre-existing (see `docs/robustness/image-prod-readiness-report.md`
+section 11) and remains open; this module provides the hook and its gates but
+does not itself wire the adapters. Overlaying layers inside a guest also
+depends on backend support for a merged rootfs view, which the current
+Firecracker/QEMU adapters do not yet provide.
 
 ## Tests
 
-- Unit: `crates/pico-image/src/layers.rs` (ordering, rebuild, overlay,
-  collapse, promotion, duplicate rejection)
-- Integration: `crates/pico-image/tests/composable_layers.rs` (12 tests:
-  toolkit-only rebuild, signed boot with audit, tamper rejection, per-layer
-  gates, whiteouts, compatibility drift, collapse/max, monolithic compat,
-  static validation, monotonic promotion)
-- Static validation: `environment layer composition` check in
-  `validate_static` (monolithic manifests pass, layered manifests bind
-  image/profile/arch/snapshot)
+- Unit (`layers.rs`): precedence preservation, order/digest binding, evidence
+  binding, version exclusion, overlay planning, collapse advice, promotion
+  monotonicity, duplicate rejection.
+- Integration (`tests/composable_layers.rs`): toolkit-only rebuild, signed
+  boot with audit, tamper rejection, per-layer gates, compatibility drift
+  (backend/arch/protocol/profile/snapshot), required-feature rejection, name
+  and layer-store-dir safety, collapse/max, monolithic compatibility, static
+  validation, monotonic promotion.
+- Pipeline (`tests/pipeline.rs`): `[[environment.layers]]` parsing, absent
+  section, and fail-closed base/workspace arity.
+- Static validation: `environment layer composition` and
+  `security posture: no secrets in environment layers` in `validate_static`;
+  `per-layer supply-chain evidence` in `validate_supply_chain`.
+
+### Secret scanning
+
+The whole-manifest secret scan excludes the `environment` block, because its
+pattern list is deliberately broad and a legitimate layer name such as
+`toolkit-tokenizer` would otherwise fail with a misleading error. Layer
+`name` and `media_type` get a narrower assignment-shaped scan in
+`check_environment_no_secrets` (`token=` matches, `tokenizer` does not).
