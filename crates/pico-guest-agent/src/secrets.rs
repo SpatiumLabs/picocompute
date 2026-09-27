@@ -14,12 +14,6 @@ use pico_guest_protocol::operational_v1::*;
 
 use crate::exec::{OperationalSession, SharedWriter, write_tagged_response};
 
-/// Default tmpfs size for the secrets mount (1 MiB).
-///
-/// Credentials are typically small (API keys, tokens), but this can be
-/// increased if larger credential bundles are needed.
-pub(crate) const DEFAULT_SECRETS_TMPFS_SIZE: &str = "1m";
-
 /// Maximum credential name length in bytes.
 const MAX_CREDENTIAL_NAME_LEN: usize = 255;
 
@@ -84,22 +78,35 @@ pub(crate) async fn handle_inject_secrets(
     Ok(())
 }
 
-/// Unmount and remove the secrets tmpfs.
+/// Clear credentials from the secrets tmpfs.
 ///
-/// Called during quiesce and shutdown to tear down the in-guest
-/// secrets mount before the guest is paused or terminated.
+/// Called during quiesce and shutdown so no credential bytes survive into a
+/// suspended or snapshotted guest. The tmpfs itself is left mounted: it was
+/// created by `/init` and cannot be unmounted here, and its contents are
+/// already gone once the files are removed, so the non-persistence property
+/// still holds.
 pub(crate) fn teardown_secrets_mount() -> Result<(), std::io::Error> {
     teardown_secrets_mount_impl()
 }
 
 #[cfg(target_os = "linux")]
 fn teardown_secrets_mount_impl() -> Result<(), std::io::Error> {
-    use rustix::mount::{UnmountFlags, unmount};
-
     let path = Path::new(CANONICAL_SECRETS_TMPFS);
-    if path.exists() {
-        let _ = unmount(path, UnmountFlags::DETACH);
-        let _ = std::fs::remove_dir_all(path);
+    if !path.is_dir() {
+        return Ok(());
+    }
+    // Unlink each entry rather than removing the directory: the directory is
+    // the tmpfs mount point created by init, and removing it would either fail
+    // or detach the mount the next injection depends on.
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(&entry_path)?;
+        } else {
+            std::fs::remove_file(&entry_path)?;
+        }
     }
     Ok(())
 }
@@ -146,37 +153,66 @@ fn validate_credential_name(name: &str) -> Result<(), SecretsError> {
     Ok(())
 }
 
+/// Ensure the secrets path is a usable RAM-backed tmpfs.
+///
+/// The mount is performed by the guest's `/init`, not here. The guest agent
+/// runs under a seccomp profile that cannot permit `mount(2)`, and adding that
+/// syscall would also widen the filter for every process the agent spawns.
+/// init is unfiltered, already owns the other filesystem mounts, and mounts
+/// the tmpfs before the agent starts.
+///
+/// This function therefore verifies rather than creates: if the secrets path
+/// is missing or is not a tmpfs, injection fails closed instead of writing
+/// credentials onto the root filesystem where a snapshot could capture them.
 fn ensure_secrets_mount() -> Result<(), std::io::Error> {
-    ensure_secrets_mount_impl(DEFAULT_SECRETS_TMPFS_SIZE)
+    verify_secrets_mount()
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_secrets_mount_impl(tmpfs_size: &str) -> Result<(), std::io::Error> {
-    use rustix::mount::{MountFlags, mount};
-    use std::ffi::CString;
-
+fn verify_secrets_mount() -> Result<(), std::io::Error> {
     let path = Path::new(CANONICAL_SECRETS_TMPFS);
-    if path.exists() {
-        let _ = std::fs::remove_dir_all(path);
+    if !path.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{CANONICAL_SECRETS_TMPFS} is not a directory; guest init did not create it"),
+        ));
     }
-    std::fs::create_dir_all(path)?;
-
-    let data = CString::new(format!("mode=500,size={tmpfs_size}"))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    mount(
-        "tmpfs",
-        path,
-        "tmpfs",
-        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
-        Some(data.as_c_str()),
-    )
-    .map_err(|e| std::io::Error::other(e.to_string()))?;
-
+    if !secrets_is_tmpfs() {
+        return Err(std::io::Error::other(format!(
+            "{CANONICAL_SECRETS_TMPFS} is not a tmpfs; refusing to write credentials to a \
+             filesystem that a snapshot could capture"
+        )));
+    }
     Ok(())
 }
 
+/// True when the canonical secrets path appears as a tmpfs in a mount table.
+#[cfg(target_os = "linux")]
+fn mount_table_has_secrets_tmpfs(mounts: &str) -> bool {
+    mounts.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        // `/proc/mounts` is "<device> <mount-point> <fstype> <options> ...".
+        let (Some(_device), Some(mount_point), Some(fstype)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        mount_point == CANONICAL_SECRETS_TMPFS && fstype == "tmpfs"
+    })
+}
+
+/// True when `/proc/self/mounts` shows the canonical secrets path as a tmpfs.
+#[cfg(target_os = "linux")]
+fn secrets_is_tmpfs() -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        // An unreadable mount table is not proof of a tmpfs. Fail closed.
+        return false;
+    };
+    mount_table_has_secrets_tmpfs(&mounts)
+}
+
 #[cfg(not(target_os = "linux"))]
-fn ensure_secrets_mount_impl(_tmpfs_size: &str) -> Result<(), std::io::Error> {
+fn verify_secrets_mount() -> Result<(), std::io::Error> {
     Ok(())
 }
 
@@ -203,6 +239,55 @@ async fn write_secret_file(path: &Path, content: &[u8], mode: u32) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_table_detects_the_secrets_tmpfs() {
+        let table = "proc /proc proc rw,relatime 0 0\n\
+                     tmpfs /run/pico/secrets tmpfs ro,nosuid,nodev,mode=500 0 0\n";
+        assert!(mount_table_has_secrets_tmpfs(table));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_table_rejects_the_wrong_path_or_wrong_fstype() {
+        // Right fstype, wrong path.
+        assert!(!mount_table_has_secrets_tmpfs(
+            "tmpfs /run/pico/tmp tmpfs rw 0 0\n"
+        ));
+        // Right path, not a tmpfs: this is the case that would let
+        // credentials land on the snapshotted root filesystem.
+        assert!(!mount_table_has_secrets_tmpfs(
+            "/dev/vda1 /run/pico/secrets ext4 rw,relatime 0 0\n"
+        ));
+        assert!(!mount_table_has_secrets_tmpfs(""));
+        assert!(!mount_table_has_secrets_tmpfs("garbage\n\n"));
+    }
+
+    #[test]
+    fn teardown_keeps_the_mountpoint_directory() {
+        // Teardown must unlink credentials without removing the directory:
+        // that directory is the tmpfs mount point created by init, and the
+        // next injection depends on it still existing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir(&secrets).unwrap();
+        std::fs::write(secrets.join("token"), b"secret").unwrap();
+        std::fs::create_dir(secrets.join("nested")).unwrap();
+        std::fs::write(secrets.join("nested/inner"), b"more").unwrap();
+
+        for entry in std::fs::read_dir(&secrets).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+
+        assert!(secrets.is_dir(), "mount point directory must survive");
+        assert_eq!(std::fs::read_dir(&secrets).unwrap().count(), 0);
+    }
 
     #[test]
     fn valid_credential_names() {

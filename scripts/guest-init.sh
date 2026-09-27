@@ -15,7 +15,7 @@ boot_fail() {
     exit 1
 }
 
-mkdir -p /var/log/pico /run/pico/tmp
+mkdir -p /var/log/pico /run/pico/tmp /run/pico/secrets
 boot_step "init_started"
 
 [ -r /proc/mounts ] || mount -t proc proc /proc || boot_fail "proc_mount"
@@ -27,6 +27,17 @@ boot_step "dev_mounted"
 
 grep -qs ' /sys sysfs ' /proc/mounts || mount -t sysfs sysfs /sys || boot_fail "sysfs_mount"
 boot_step "sysfs_mounted"
+
+# Secrets live on a private RAM-backed tmpfs so credentials never reach the
+# root filesystem and therefore never reach a snapshot (ADR-0007). This is
+# mounted here in init rather than by the guest agent: the agent runs under a
+# seccomp profile that cannot permit mount(2), and granting it that syscall
+# would also widen the profile for every process the agent spawns. init is
+# unfiltered and already owns the other filesystem mounts.
+grep -qs ' /run/pico/secrets tmpfs ' /proc/mounts || \
+  mount -t tmpfs -o mode=500,nosuid,nodev,noexec,size=1m tmpfs /run/pico/secrets \
+  || boot_fail "secrets_tmpfs_mount"
+boot_step "secrets_mounted"
 
 cmdline="$(cat /proc/cmdline)"
 cmdline_value() {

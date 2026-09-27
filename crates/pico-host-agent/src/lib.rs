@@ -10,6 +10,7 @@ pub mod handshake;
 pub mod health;
 pub mod host_control;
 pub mod identity;
+pub mod image_verify;
 pub mod metrics;
 mod observation;
 pub mod port_forward;
@@ -116,16 +117,24 @@ struct SandboxEntry {
     ssh_private_key: Option<Zeroizing<String>>,
     ssh_home_dir: Option<String>,
     ssh_key_injected: AtomicBool,
+    /// Image family this sandbox was admitted with. Carried for the handshake
+    /// and observation surfaces.
     #[expect(
         dead_code,
-        reason = "retained for observation/handshake fields pending PR6/PR7"
+        reason = "admitted image identity; consumed by the handshake surface added in a follow-up"
     )]
     image_id: Option<String>,
+    /// Digest of the verified manifest, or the requested digest when no
+    /// verifier is configured. Replaces a previously retained-but-unused
+    /// field: the value is now produced by the prepare-path image gate.
     #[expect(
         dead_code,
-        reason = "retained for observation/handshake fields pending PR6/PR7"
+        reason = "admitted image digest; consumed by the handshake surface added in a follow-up"
     )]
     image_digest: Option<String>,
+    /// Evidence from the prepare-path image gate, reported on READY so the
+    /// audit trail names the exact layer set that booted.
+    verified_image: Option<crate::image_verify::VerifiedImageRecord>,
     #[expect(
         dead_code,
         reason = "retained for observation/handshake fields pending PR6/PR7"
@@ -179,6 +188,88 @@ fn default_supported_backends() -> Vec<RuntimeType> {
         RuntimeType::Qemu,
         RuntimeType::GVisor,
     ]
+}
+
+/// Report the verified image on the READY transition.
+///
+/// A layered image emits the composition audit record naming the exact ordered
+/// layer set that booted, which is what makes a placement or host audit
+/// answer "which layers ran" without re-reading the manifest. A monolithic
+/// image reports its verified manifest digest instead.
+fn emit_verified_image_on_ready(entry: &SandboxEntry) {
+    let Some(ref record) = entry.verified_image else {
+        return;
+    };
+    match record.composition_audit_record.as_deref() {
+        Some(composition) => tracing::info!(
+            event = "ready_image_composition",
+            sandbox_id = %entry.id,
+            image_id = %record.image_id,
+            manifest_digest = %record.manifest_digest,
+            composition_digest = record.composition_digest.as_deref().unwrap_or("none"),
+            layer_count = record.layer_count,
+            composition = %composition,
+            "sandbox ready with verified environment layer stack"
+        ),
+        None => tracing::info!(
+            event = "ready_image",
+            sandbox_id = %entry.id,
+            image_id = %record.image_id,
+            manifest_digest = %record.manifest_digest,
+            layer_count = record.layer_count,
+            "sandbox ready with verified monolithic image"
+        ),
+    }
+}
+
+/// Image admission gate, run on the prepare path before any host resource
+/// exists.
+///
+/// Returns the verified image evidence to record on the sandbox entry, or
+/// `None` when no verifier is configured. A configured-but-unusable verifier
+/// fails closed: it never returns `None` to mean "allowed".
+fn admit_image(
+    agent: &HostAgent,
+    runtime: RuntimeType,
+) -> std::result::Result<Option<crate::image_verify::VerifiedImageRecord>, SandboxError> {
+    let Some(verifier) = agent.image_verifier.as_ref() else {
+        return Ok(None);
+    };
+    let capabilities = pico_runtime::declared_capabilities(runtime);
+    match verifier.verify(runtime, &capabilities) {
+        Ok(record) => {
+            tracing::info!(
+                event = "image_verified",
+                image_id = %record.image_id,
+                manifest_digest = %record.manifest_digest,
+                composition_digest = record.composition_digest.as_deref().unwrap_or("none"),
+                layer_count = record.layer_count,
+                signer = record.signer_identity.as_deref().unwrap_or("unsigned"),
+                mode = ?record.mode,
+                "guest image admitted"
+            );
+            if let Some(ref audit) = record.composition_audit_record {
+                tracing::info!(
+                    event = "image_composition",
+                    composition = %audit,
+                    "verified environment layer set"
+                );
+            }
+            Ok(Some(record))
+        }
+        Err(err) => {
+            tracing::warn!(
+                event = "image_rejected",
+                reason = err.reason_label(),
+                detail = %err,
+                runtime = %runtime,
+                "guest image rejected before prepare"
+            );
+            Err(SandboxError::PolicyDenied {
+                reason: format!("image admission failed: {err}"),
+            })
+        }
+    }
 }
 
 /// Parses the sandboxd health advertisement of runnable runtime families.
@@ -353,6 +444,7 @@ pub struct HostAgent {
     snapshot_optimizer: Arc<pico_runtime::snapshot_optimizer::SnapshotOptimizer>,
     supported_backends: Arc<RwLock<Vec<RuntimeType>>>,
     lease_authority: Arc<ParkingLotRwLock<Option<pico_core::LeaseAuthority>>>,
+    image_verifier: Option<Arc<crate::image_verify::ImageVerifier>>,
 }
 
 /// RAII guard for an in-flight create or restore operation.
@@ -429,6 +521,19 @@ impl HostAgent {
         agent.capacity = HostCapacity::detect();
         agent.cross_tenant_host = config.cross_tenant_host;
         agent.shared_host_metric_redaction = config.shared_host_metric_redaction;
+        // Image admission is host policy. `ensure_valid` already rejected a
+        // production mode with no pinned key, so construction here cannot fail
+        // on a well-formed config; treat an impossible construction error as
+        // "no verification" and let the first prepare fail closed loudly.
+        if config.image_verification.is_configured() {
+            match crate::image_verify::ImageVerifier::new(&config.image_verification) {
+                Ok(verifier) => agent.image_verifier = Some(Arc::new(verifier)),
+                Err(err) => tracing::error!(
+                    error = %err,
+                    "image verifier could not be constructed; prepare will reject images"
+                ),
+            }
+        }
         // One flag in `pico-telemetry` covers the host agent, `pico-core`,
         // the network agent, and the observability crate, so a single call
         // enables the policy everywhere in this process.
@@ -618,7 +723,15 @@ impl HostAgent {
             snapshot_optimizer,
             supported_backends: Arc::new(RwLock::new(default_supported_backends())),
             lease_authority: Arc::new(ParkingLotRwLock::new(None)),
+            image_verifier: None,
         })
+    }
+
+    /// Installs the image verifier used on the prepare path.
+    #[must_use]
+    pub fn with_image_verifier(mut self, verifier: crate::image_verify::ImageVerifier) -> Self {
+        self.image_verifier = Some(Arc::new(verifier));
+        self
     }
 
     /// Installs the lease authority used to verify signed access-lease blobs.
@@ -821,7 +934,16 @@ impl HostAgent {
             let now = pico_core::now_iso();
             let ssh_home_dir = default_ssh_home_dir(runtime);
             let image_id = spec.image_id.clone().unwrap_or_else(|| id.clone());
-            let image_digest = spec.image_digest.clone().unwrap_or_default();
+            // Image admission happens before any host resource exists, so a
+            // rejected image leaves nothing to roll back. The requested digest
+            // is retained for the handshake; when a verifier is configured the
+            // verified manifest digest replaces it below, because the request
+            // is only an unverified hint and the signed manifest is authority.
+            let mut image_digest = spec.image_digest.clone().unwrap_or_default();
+            let verified_image = admit_image(self, runtime)?;
+            if let Some(ref record) = verified_image {
+                image_digest = record.manifest_digest.clone();
+            }
             let shared_secret = pico_core::crypto::derive_handshake_shared_secret(&id);
             let credential_request = spec.credential_request.clone();
             let admit_token = FencingToken::default();
@@ -884,6 +1006,7 @@ impl HostAgent {
                 ssh_key_injected: AtomicBool::new(false),
                 image_id: Some(image_id),
                 image_digest: Some(image_digest),
+                verified_image: verified_image.clone(),
                 negotiated_capabilities: ParkingLotMutex::new(Vec::new()),
                 guest_agent_version: ParkingLotMutex::new(None),
                 guest_boot_id: ParkingLotMutex::new(None),
@@ -1287,6 +1410,7 @@ impl HostAgent {
             diagnostics: Vec::new(),
         };
         emit_boot_ready(&report, entry_tenant_id(&entry).as_deref());
+        emit_verified_image_on_ready(&entry);
         self.finish_boot_report(&entry, report).await
     }
 
@@ -1559,6 +1683,12 @@ impl HostAgent {
             ssh_key_injected: AtomicBool::new(false),
             image_id: None,
             image_digest: None,
+            // A rehydrated entry has not passed this host's image gate in this
+            // process, so it carries no verification evidence. Reporting
+            // nothing is correct: the evidence belongs to the prepare that
+            // admitted the image, and inventing a re-derived value would
+            // assert a check that did not run.
+            verified_image: None,
             negotiated_capabilities: ParkingLotMutex::new(Vec::new()),
             guest_agent_version: ParkingLotMutex::new(None),
             guest_boot_id: ParkingLotMutex::new(guest_boot_id),
