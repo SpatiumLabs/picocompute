@@ -2,6 +2,7 @@ pub mod definition;
 pub mod error;
 pub mod host_verify;
 pub mod kernel;
+pub mod layers;
 pub mod lock;
 pub mod manifest;
 pub mod normalize;
@@ -15,7 +16,20 @@ pub(crate) mod util;
 pub mod validation;
 pub mod warm_snapshot;
 
-pub use host_verify::{HostImageLayout, HostVerificationPolicy, VerifiedImage, verify_for_host};
+pub use host_verify::{
+    HostImageLayout, HostVerificationPolicy, VerifiedImage, verify_environment_compatibility,
+    verify_environment_layers, verify_for_host,
+};
+pub use layers::{
+    COLLAPSE_THRESHOLD_LAYERS, CompositionCompatibility, CompositionPromotion,
+    CompositionPromotionStage, ENVIRONMENT_SCHEMA_VERSION, EnvironmentComposition,
+    EnvironmentLayer, EnvironmentLayerKind, HostCompatibilityExpectation, HostLayerFile,
+    LayerRebuildPlan, MAX_ENVIRONMENT_LAYERS, OPAQUE_MARKER, WHITEOUT_PREFIX, collapse_advice,
+    compute_composition_digest, format_composition_audit_record,
+    layers_missing_supply_chain_evidence, plan_overlay_stack, plan_rebuild,
+    validate_environment_composition, validate_environment_layer, verify_composition_compatibility,
+    verify_layers_for_host,
+};
 
 // TODO: Wire warm snapshot generation into the image pipeline.
 // The warm_snapshot module is implemented but not yet called from

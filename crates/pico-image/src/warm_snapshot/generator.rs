@@ -737,6 +737,7 @@ mod tests {
                 memory: false,
                 excluded_mount_classes: vec!["secret".into(), "runtime_tmp".into()],
             },
+            environment: None,
         };
         WarmSnapshotConfig::new(enabled, dir_path, manifest)
     }

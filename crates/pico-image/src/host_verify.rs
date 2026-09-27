@@ -52,6 +52,12 @@ pub struct VerifiedImage {
     pub manifest_digest: String,
     /// Signer identity from the signature bundle, when a signature was present.
     pub signer_identity: Option<String>,
+    /// Composition digest when the manifest carries an environment
+    /// composition. `None` for monolithic manifests.
+    pub composition_digest: Option<String>,
+    /// JSON audit record recording the exact layer set for placement/host
+    /// audit on READY. `None` for monolithic manifests.
+    pub composition_audit_record: Option<String>,
 }
 
 /// Verify a materialized guest image before cache use or boot.
@@ -81,11 +87,75 @@ pub fn verify_for_host(
     let signer_identity = verify_signature(layout, policy, &manifest_bytes, &manifest)?;
     verify_artifacts(layout, &manifest)?;
 
+    let manifest_digest = compute_sha256_digest(&manifest_bytes);
+    let (composition_digest, composition_audit_record) = match &manifest.environment {
+        Some(env) => {
+            crate::layers::validate_environment_composition(env)
+                .map_err(ImageError::CompositionValidationFailed)?;
+            let audit = crate::layers::format_composition_audit_record(env, &manifest_digest);
+            (Some(env.composition_digest.clone()), Some(audit))
+        }
+        None => (None, None),
+    };
+
     Ok(VerifiedImage {
         manifest,
-        manifest_digest: compute_sha256_digest(&manifest_bytes),
+        manifest_digest,
         signer_identity,
+        composition_digest,
+        composition_audit_record,
     })
+}
+
+/// Verify materialized environment layer bytes against a verified manifest.
+///
+/// Call this on the prepare path after [`verify_for_host`] when
+/// `verified.manifest.environment` is present. The manifest signature already
+/// covers the composition record, so this plus [`verify_for_host`] is the
+/// signed composition check before boot. Monolithic manifests (no
+/// environment) return `Ok(())`.
+///
+/// # Errors
+///
+/// Returns [`ImageError::CompositionValidationFailed`] when the manifest has
+/// no environment but layer files were supplied, and propagates
+/// [`crate::layers::verify_layers_for_host`] digest/size errors otherwise.
+pub fn verify_environment_layers(
+    verified: &VerifiedImage,
+    layer_files: &[crate::layers::HostLayerFile<'_>],
+) -> Result<(), ImageError> {
+    match &verified.manifest.environment {
+        Some(env) => crate::layers::verify_layers_for_host(env, layer_files),
+        None => {
+            if layer_files.is_empty() {
+                Ok(())
+            } else {
+                Err(ImageError::CompositionValidationFailed(
+                    "layer files supplied for a manifest without an environment composition".into(),
+                ))
+            }
+        }
+    }
+}
+
+/// Verify composition compatibility (backend, arch, protocol, snapshot)
+/// against host capabilities after [`verify_for_host`].
+///
+/// Monolithic manifests skip the check and return `Ok(())`.
+///
+/// # Errors
+///
+/// Propagates [`crate::layers::verify_composition_compatibility`] failures.
+pub fn verify_environment_compatibility(
+    verified: &VerifiedImage,
+    expected: &crate::layers::HostCompatibilityExpectation,
+) -> Result<(), ImageError> {
+    match &verified.manifest.environment {
+        Some(env) => {
+            crate::layers::verify_composition_compatibility(env, &verified.manifest, expected)
+        }
+        None => Ok(()),
+    }
 }
 
 fn verify_signature(
@@ -333,6 +403,7 @@ mod tests {
                 memory: false,
                 excluded_mount_classes: vec!["secret".into(), "runtime_tmp".into()],
             },
+            environment: None,
         }
     }
 

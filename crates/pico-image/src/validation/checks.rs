@@ -663,6 +663,49 @@ pub(super) fn check_platform_info(manifest: &PicoComputeGuestManifest) -> Result
     Ok(())
 }
 
+/// Validate the optional environment layer composition.
+///
+/// Monolithic manifests without an environment pass. Layered manifests must
+/// bind the same image family, compatibility profile, architecture, and
+/// snapshot exclusions as the manifest so scheduler placement and host boot
+/// cannot diverge by layer.
+pub(super) fn check_environment_composition(
+    manifest: &PicoComputeGuestManifest,
+) -> Result<(), String> {
+    let Some(ref env) = manifest.environment else {
+        return Ok(());
+    };
+    crate::layers::validate_environment_composition(env)?;
+    if env.image_id != manifest.image_id {
+        return Err(format!(
+            "environment image_id '{}' does not match manifest image_id '{}'",
+            env.image_id, manifest.image_id
+        ));
+    }
+    if env.compatibility.profile_id != manifest.compatibility.profile_id {
+        return Err(format!(
+            "environment profile '{}' does not match manifest profile '{}'",
+            env.compatibility.profile_id, manifest.compatibility.profile_id
+        ));
+    }
+    if env.compatibility.architecture != manifest.platform.architecture {
+        return Err(format!(
+            "environment architecture '{}' does not match manifest platform '{}'",
+            env.compatibility.architecture, manifest.platform.architecture
+        ));
+    }
+    let mut env_excl = env.compatibility.snapshot_excluded_classes.clone();
+    env_excl.sort();
+    let mut manifest_excl = manifest.snapshot.excluded_mount_classes.clone();
+    manifest_excl.sort();
+    if env_excl != manifest_excl {
+        return Err(format!(
+            "environment snapshot exclusions {env_excl:?} do not match manifest {manifest_excl:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that the SBOM covers all components declared in the manifest and
 /// lock file.
 pub(super) fn check_sbom_completeness(

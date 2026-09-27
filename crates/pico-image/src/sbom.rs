@@ -474,6 +474,7 @@ mod tests {
                 memory: false,
                 excluded_mount_classes: vec!["runtime_tmp".into(), "secret".into()],
             },
+            environment: None,
         }
     }
 

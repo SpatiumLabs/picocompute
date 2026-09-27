@@ -113,6 +113,7 @@ pub(crate) fn valid_manifest() -> PicoComputeGuestManifest {
             memory: false,
             excluded_mount_classes: vec!["runtime_tmp".into(), "secret".into()],
         },
+        environment: None,
     }
 }
 

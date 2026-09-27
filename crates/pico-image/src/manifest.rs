@@ -101,6 +101,7 @@ pub fn generate_manifest(
         },
         mount_contract: mount_contract.clone(),
         snapshot: snapshot_info,
+        environment: None,
     };
 
     let manifest_path = output_dir.join("manifest.json");
@@ -113,6 +114,59 @@ pub fn generate_manifest(
 
     info!(?manifest_path, "manifest generated");
 
+    Ok((manifest_path, manifest))
+}
+
+/// Generate a manifest with an attached independently versioned environment
+/// composition (base/workspace/toolkit).
+///
+/// The composition is validated before attach; the manifest signature written
+/// later covers the composition bytes, making host verification a signed
+/// composition check.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layered manifest generation mirrors generate_manifest inputs plus one composition"
+)]
+pub fn generate_manifest_with_environment(
+    definition: &ImageDefinition,
+    lock: &PackageLock,
+    rootfs: &OutputInfo,
+    guest_agent: &OutputInfo,
+    output_dir: &Utf8Path,
+    mount_contract: &MountContract,
+    kernel_source: Option<&KernelSource>,
+    environment: crate::layers::EnvironmentComposition,
+) -> Result<(camino::Utf8PathBuf, PicoComputeGuestManifest), ImageError> {
+    crate::layers::validate_environment_composition(&environment)
+        .map_err(ImageError::CompositionValidationFailed)?;
+    let (manifest_path, mut manifest) = generate_manifest(
+        definition,
+        lock,
+        rootfs,
+        guest_agent,
+        output_dir,
+        mount_contract,
+        kernel_source,
+    )?;
+    if environment.image_id != manifest.image_id {
+        return Err(ImageError::CompositionValidationFailed(format!(
+            "environment image_id '{}' does not match manifest image_id '{}'",
+            environment.image_id, manifest.image_id
+        )));
+    }
+    // Compatibility profiles must agree so scheduler placement (manifest)
+    // and host boot (composition) cannot diverge by layer.
+    if environment.compatibility.profile_id != manifest.compatibility.profile_id {
+        return Err(ImageError::CompositionValidationFailed(format!(
+            "environment profile '{}' does not match manifest profile '{}'",
+            environment.compatibility.profile_id, manifest.compatibility.profile_id
+        )));
+    }
+    manifest.environment = Some(environment);
+    let json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| ImageError::ParseError(format!("failed to serialize manifest: {}", e)))?;
+    std::fs::write(&manifest_path, json)?;
+    validate_manifest(&manifest, definition)?;
     Ok((manifest_path, manifest))
 }
 
@@ -193,6 +247,32 @@ pub fn validate_manifest(
             "snapshot.excluded_mount_classes {:?} does not match derived {:?}",
             manifest.snapshot.excluded_mount_classes, derived
         )));
+    }
+
+    if let Some(ref env) = manifest.environment {
+        crate::layers::validate_environment_composition(env)
+            .map_err(ImageError::ManifestValidationFailed)?;
+        if env.image_id != manifest.image_id {
+            return Err(ImageError::ManifestValidationFailed(format!(
+                "environment image_id '{}' does not match manifest image_id '{}'",
+                env.image_id, manifest.image_id
+            )));
+        }
+        if env.compatibility.profile_id != manifest.compatibility.profile_id {
+            return Err(ImageError::ManifestValidationFailed(format!(
+                "environment profile '{}' does not match manifest profile '{}'",
+                env.compatibility.profile_id, manifest.compatibility.profile_id
+            )));
+        }
+        let mut env_excl = env.compatibility.snapshot_excluded_classes.clone();
+        env_excl.sort();
+        let mut manifest_excl = manifest.snapshot.excluded_mount_classes.clone();
+        manifest_excl.sort();
+        if env_excl != manifest_excl {
+            return Err(ImageError::ManifestValidationFailed(format!(
+                "environment snapshot exclusions {env_excl:?} do not match manifest {manifest_excl:?}"
+            )));
+        }
     }
 
     Ok(())

@@ -100,6 +100,10 @@ pub fn validate_static(
             "platform and architecture",
             Box::new(|| checks::check_platform_info(manifest)),
         ),
+        (
+            "environment layer composition",
+            Box::new(|| checks::check_environment_composition(manifest)),
+        ),
     ];
 
     for (name, check_fn) in checks {

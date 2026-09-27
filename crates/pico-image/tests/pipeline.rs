@@ -157,6 +157,7 @@ mod tests {
                 memory: false,
                 excluded_mount_classes: vec!["secret".into(), "runtime_tmp".into()],
             },
+            environment: None,
         };
 
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -373,6 +374,7 @@ uuid = "00000000-0000-4000-a000-000000000001"
                 memory: false,
                 excluded_mount_classes: vec!["secret".into(), "runtime_tmp".into()],
             },
+            environment: None,
         };
 
         let def = simple_definition();
@@ -523,6 +525,7 @@ uuid = "00000000-0000-4000-a000-000000000001"
                 memory: false,
                 excluded_mount_classes: vec!["runtime_tmp".into(), "secret".into()],
             },
+            environment: None,
         }
     }
 
