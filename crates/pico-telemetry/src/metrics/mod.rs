@@ -93,6 +93,9 @@ pub mod attr {
     pub const SOURCE: PlainKey = PlainKey::new("source");
     /// Syscall name, for the syscall-latency histogram.
     pub const SYSCALL: PlainKey = PlainKey::new("syscall");
+    /// Image cache tier (`host_local`, `cell_cache`, ...).
+    /// Bounded allowlist only.
+    pub const TIER: PlainKey = PlainKey::new("tier");
 
     // ── Identity keys ──
     //

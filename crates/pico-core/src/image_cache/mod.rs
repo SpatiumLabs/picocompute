@@ -193,6 +193,29 @@ impl Default for ImageCacheSafetyFlags {
     }
 }
 
+/// On-demand lazy-read mode for one observation window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDemandMode {
+    /// Eager full-bundle fetch (pre-CAP-165 behavior).
+    Disabled,
+    /// Containers: EROFS-style metadata-local plus lazy data.
+    ContainerMetadataLocal,
+    /// VM disks: chunked block path with a local second-level cache.
+    VmChunked,
+}
+
+impl OnDemandMode {
+    /// Identifier used in reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::ContainerMetadataLocal => "container_metadata_local",
+            Self::VmChunked => "vm_chunked",
+        }
+    }
+}
+
 /// One held image-prepare load step.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageCacheObservation {
@@ -247,6 +270,29 @@ pub struct ImageCacheObservation {
     pub scheduler_should_throttle: bool,
     /// Image verification/promotion audit events in this window.
     pub audit_events: u64,
+    /// On-demand lazy-read mode for this window. `Disabled` preserves the
+    /// pre-CAP-165 eager behavior.
+    #[serde(default = "default_on_demand_disabled")]
+    pub on_demand_mode: OnDemandMode,
+    /// True when every on-demand byte in this window was served after a
+    /// verified admission (digest plus attestation plus revocation first).
+    /// A false value with on-demand enabled is class-A.
+    #[serde(default = "default_true")]
+    pub verification_before_serve: bool,
+    /// True when the revocation list was checked before serve.
+    #[serde(default = "default_true")]
+    pub revocation_checked: bool,
+    /// True when lazy-fetch failures failed closed (no unverified bytes).
+    #[serde(default = "default_true")]
+    pub lazy_fetch_failed_closed: bool,
+}
+
+fn default_on_demand_disabled() -> OnDemandMode {
+    OnDemandMode::Disabled
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ImageCacheObservation {
@@ -291,7 +337,25 @@ impl ImageCacheObservation {
             scheduler_placed: true,
             scheduler_should_throttle: false,
             audit_events: concurrent_prepares,
+            on_demand_mode: OnDemandMode::Disabled,
+            verification_before_serve: true,
+            revocation_checked: true,
+            lazy_fetch_failed_closed: true,
         }
+    }
+
+    /// Warm host-local hit served through the on-demand path.
+    pub fn warm_on_demand_at_concurrent(concurrent_prepares: u64, mode: OnDemandMode) -> Self {
+        let mut obs = Self::warm_at_concurrent(concurrent_prepares);
+        obs.on_demand_mode = mode;
+        obs
+    }
+
+    /// Cold miss served through the on-demand path.
+    pub fn cold_on_demand_at_concurrent(concurrent_prepares: u64, mode: OnDemandMode) -> Self {
+        let mut obs = Self::cold_at_concurrent(concurrent_prepares);
+        obs.on_demand_mode = mode;
+        obs
     }
 
     /// Cold miss at `concurrent_prepares` against an empty cache.
@@ -366,6 +430,9 @@ pub enum ImageCacheZoneReason {
     WrongDigest,
     VerificationSkipped,
     TenantLayerLeak,
+    OnDemandServedBeforeVerification,
+    OnDemandRevocationNotChecked,
+    OnDemandFetchNotFailClosed,
 }
 
 /// Classified cold/warm/thrash step.
@@ -725,6 +792,21 @@ pub fn classify_image_cache(
     if observation.timeouts > 0 && observation.unavailable_rejects > 0 {
         reasons.push(ImageCacheZoneReason::TimeoutInsteadOfShed);
     }
+    // On-demand fail-closed rules (class-A per ADR-0012). An on-demand byte
+    // must never be served before verification, without a revocation check,
+    // or after a fetch failure that did not fail closed.
+    let on_demand_enabled = !matches!(observation.on_demand_mode, OnDemandMode::Disabled);
+    if on_demand_enabled {
+        if !observation.verification_before_serve {
+            reasons.push(ImageCacheZoneReason::OnDemandServedBeforeVerification);
+        }
+        if !observation.revocation_checked {
+            reasons.push(ImageCacheZoneReason::OnDemandRevocationNotChecked);
+        }
+        if !observation.lazy_fetch_failed_closed {
+            reasons.push(ImageCacheZoneReason::OnDemandFetchNotFailClosed);
+        }
+    }
 
     let safety_fail = reasons.iter().any(|r| {
         matches!(
@@ -741,6 +823,9 @@ pub fn classify_image_cache(
                 | ImageCacheZoneReason::VerificationSkipped
                 | ImageCacheZoneReason::TenantLayerLeak
                 | ImageCacheZoneReason::TimeoutInsteadOfShed
+                | ImageCacheZoneReason::OnDemandServedBeforeVerification
+                | ImageCacheZoneReason::OnDemandRevocationNotChecked
+                | ImageCacheZoneReason::OnDemandFetchNotFailClosed
         )
     });
 
@@ -1361,6 +1446,21 @@ fn push_image_cache_findings(findings: &mut Vec<CapacityFinding>, step: &Classif
                 FailureClass::A,
                 "timeout_instead_of_shed",
                 "timeouts rose with unavailable rejects; shed path is not clean",
+            )),
+            ImageCacheZoneReason::OnDemandServedBeforeVerification => Some(finding(
+                FailureClass::A,
+                "on_demand_served_before_verification",
+                "on-demand bytes were served before digest, attestation, and revocation checks",
+            )),
+            ImageCacheZoneReason::OnDemandRevocationNotChecked => Some(finding(
+                FailureClass::A,
+                "on_demand_revocation_not_checked",
+                "on-demand serve skipped the revocation check",
+            )),
+            ImageCacheZoneReason::OnDemandFetchNotFailClosed => Some(finding(
+                FailureClass::A,
+                "on_demand_fetch_not_fail_closed",
+                "on-demand fetch failure did not fail closed to reason=image",
             )),
             ImageCacheZoneReason::PrepareLatency => Some(finding(
                 FailureClass::B,

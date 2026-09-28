@@ -435,3 +435,78 @@ fn lab_recommendation_is_stable() {
     assert_eq!(rec.host_local_bytes, 5 * 1024 * 1024 * 1024);
     assert_eq!(rec.cell_cache_bytes, 20 * 1024 * 1024 * 1024);
 }
+
+#[test]
+fn on_demand_cold_miss_stays_safe() {
+    let obs = ImageCacheObservation::cold_on_demand_at_concurrent(2, OnDemandMode::VmChunked);
+    let step = classify_image_cache(
+        &obs,
+        ImageCacheScenario::Cold,
+        &ImageCacheThresholds::default(),
+    );
+    assert_eq!(step.zone, DensityZone::Safe);
+}
+
+#[test]
+fn on_demand_warm_hit_stays_safe() {
+    let obs = ImageCacheObservation::warm_on_demand_at_concurrent(2, OnDemandMode::VmChunked);
+    let step = classify_image_cache(
+        &obs,
+        ImageCacheScenario::Warm,
+        &ImageCacheThresholds::default(),
+    );
+    assert_eq!(step.zone, DensityZone::Safe);
+    assert_eq!(step.reasons, vec![ImageCacheZoneReason::WithinEnvelope]);
+}
+
+#[test]
+fn on_demand_served_before_verification_is_class_a() {
+    let mut obs = ImageCacheObservation::warm_on_demand_at_concurrent(2, OnDemandMode::VmChunked);
+    obs.verification_before_serve = false;
+    let report = analyze_image_cache(input(ImageCacheScenario::Warm, vec![obs], advertised()));
+    assert_eq!(report.steps[0].zone, DensityZone::Saturation);
+    assert_eq!(
+        class_of(&report, "on_demand_served_before_verification"),
+        Some(FailureClass::A)
+    );
+}
+
+#[test]
+fn on_demand_revocation_gap_is_class_a() {
+    let mut obs = ImageCacheObservation::warm_on_demand_at_concurrent(
+        2,
+        OnDemandMode::ContainerMetadataLocal,
+    );
+    obs.revocation_checked = false;
+    let report = analyze_image_cache(input(ImageCacheScenario::Warm, vec![obs], advertised()));
+    assert_eq!(
+        class_of(&report, "on_demand_revocation_not_checked"),
+        Some(FailureClass::A)
+    );
+}
+
+#[test]
+fn on_demand_fetch_not_fail_closed_is_class_a() {
+    let mut obs = ImageCacheObservation::cold_on_demand_at_concurrent(2, OnDemandMode::VmChunked);
+    obs.lazy_fetch_failed_closed = false;
+    let report = analyze_image_cache(input(ImageCacheScenario::Cold, vec![obs], advertised()));
+    assert_eq!(
+        class_of(&report, "on_demand_fetch_not_fail_closed"),
+        Some(FailureClass::A)
+    );
+}
+
+#[test]
+fn on_demand_disabled_needs_no_verification_proof() {
+    // Eager observations keep passing without on-demand evidence.
+    let mut obs = ImageCacheObservation::warm_at_concurrent(2);
+    obs.verification_before_serve = false;
+    obs.revocation_checked = false;
+    obs.lazy_fetch_failed_closed = false;
+    let step = classify_image_cache(
+        &obs,
+        ImageCacheScenario::Warm,
+        &ImageCacheThresholds::default(),
+    );
+    assert_eq!(step.zone, DensityZone::Safe);
+}

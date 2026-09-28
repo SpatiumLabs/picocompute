@@ -396,25 +396,34 @@ pub(crate) fn emit_prepare_started(sandbox_id: &str, tenant_id: Option<&str>) {
     );
 }
 
-pub(crate) fn emit_prepare_completed(sandbox_id: &str, latency_ms: u64, tenant_id: Option<&str>) {
+/// Prepare completion with the real on-demand lookup outcome.
+///
+/// `cache_result` must be one of `hit`/`miss`/`evicted`/`unknown` and is
+/// bounded by [`crate::metrics::image_prepare_latency_attrs`]; digests or
+/// image IDs never become label values.
+pub(crate) fn emit_prepare_completed_with_cache(
+    sandbox_id: &str,
+    latency_ms: u64,
+    cache_result: &str,
+    image_profile: &str,
+    tenant_id: Option<&str>,
+) {
     let latency_attrs = crate::metrics::latency_attrs(val::PREPARE_COMPLETED, tenant_id);
     HOST_METRICS
         .prepare_latency
         .record(latency_ms as f64 / 1000.0, &latency_attrs);
 
     // Image-stage series for the `pico-image-cache` dashboard panel
-    // "Image Prepare Latency by cache_result". Labels stay `unknown` until
-    // host image-cache work reports real lookup results and image profiles,
-    // so hit-filtered recording rules and alerts remain honestly empty.
-    let image_latency_attrs = crate::metrics::image_prepare_latency_attrs(
+    // "Image Prepare Latency by cache_result". The on-demand path reports
+    // real `hit`/`miss`/`evicted` results; paths that bypass the cache keep
+    // `unknown` so hit-filtered recording rules stay honest.
+    crate::metrics::record_image_prepare_latency(
         val::PREPARE_COMPLETED,
-        val::CACHE_RESULT_UNKNOWN,
-        val::IMAGE_PROFILE_UNKNOWN,
+        cache_result,
+        image_profile,
+        latency_ms as f64 / 1000.0,
         tenant_id,
     );
-    HOST_METRICS
-        .image_prepare_latency
-        .record(latency_ms as f64 / 1000.0, &image_latency_attrs);
 
     let event_attrs = crate::metrics::event_attrs(val::PREPARE_COMPLETED, tenant_id);
     HOST_METRICS.prepare_events.inc(&event_attrs);
@@ -440,14 +449,18 @@ pub(crate) fn emit_prepare_completed(sandbox_id: &str, latency_ms: u64, tenant_i
         event = val::PREPARE_COMPLETED,
         sandbox_id = %tracing_identity_label(sandbox_id, tenant_id),
         latency_ms = latency_ms,
+        cache_result = %cache_result,
         "sandbox prepare completed"
     );
 }
 
-pub(crate) fn emit_prepare_failed(
+/// Prepare failure with the real on-demand lookup outcome.
+pub(crate) fn emit_prepare_failed_with_cache(
     sandbox_id: &str,
     latency_ms: u64,
     reason: &str,
+    cache_result: &str,
+    image_profile: &str,
     tenant_id: Option<&str>,
 ) {
     let latency_attrs = crate::metrics::latency_attrs(val::PREPARE_FAILED, tenant_id);
@@ -455,17 +468,15 @@ pub(crate) fn emit_prepare_failed(
         .prepare_latency
         .record(latency_ms as f64 / 1000.0, &latency_attrs);
 
-    // Same image-stage mirror as the completed path. Failed prepares also
-    // carry `unknown` cache labels until the host cache can classify them.
-    let image_latency_attrs = crate::metrics::image_prepare_latency_attrs(
+    // Same image-stage mirror as the completed path, with the real cache
+    // outcome when the on-demand gate classified the failure.
+    crate::metrics::record_image_prepare_latency(
         val::PREPARE_FAILED,
-        val::CACHE_RESULT_UNKNOWN,
-        val::IMAGE_PROFILE_UNKNOWN,
+        cache_result,
+        image_profile,
+        latency_ms as f64 / 1000.0,
         tenant_id,
     );
-    HOST_METRICS
-        .image_prepare_latency
-        .record(latency_ms as f64 / 1000.0, &image_latency_attrs);
 
     let event_attrs = crate::metrics::event_reason_attrs(val::PREPARE_FAILED, reason, tenant_id);
     HOST_METRICS.prepare_events.inc(&event_attrs);
@@ -884,8 +895,31 @@ mod tests {
         emit_create_failed("sbx_test02", 200, "internal_error", None);
 
         emit_prepare_started("sbx_test03", None);
-        emit_prepare_completed("sbx_test03", 150, None);
-        emit_prepare_failed("sbx_test03", 250, "image_unavailable", None);
+        emit_prepare_completed_with_cache(
+            "sbx_test03",
+            150,
+            val::CACHE_RESULT_UNKNOWN,
+            val::IMAGE_PROFILE_UNKNOWN,
+            None,
+        );
+        emit_prepare_failed_with_cache(
+            "sbx_test03",
+            250,
+            "image_unavailable",
+            val::CACHE_RESULT_UNKNOWN,
+            val::IMAGE_PROFILE_UNKNOWN,
+            None,
+        );
+        // Real cache outcomes must also record without panic.
+        emit_prepare_completed_with_cache("sbx_test03", 150, "hit", "minimal", None);
+        emit_prepare_failed_with_cache(
+            "sbx_test03",
+            250,
+            "image_unavailable",
+            "miss",
+            "minimal",
+            None,
+        );
 
         emit_destroy_started("sbx_test04", None);
         emit_destroy_completed("sbx_test04", 300, None);

@@ -25,13 +25,15 @@ or snapshot cache miss/eviction is starving restore/boot.
    Platform log `outcome=image_unavailable` (or verification failed in audit).
 2. `pico-image-cache` -> **Prepare Volume** (`pico_prepare_events_total`)
    and **Prepare Latency**. Then **Image Prepare Latency by cache_result**
-   (`pico_image_prepare_latency_seconds`, currently `cache_result="unknown"`,
-   `image_profile="unknown"` from the live prepare path).
+   (`pico_image_prepare_latency_seconds`; eager prepares report
+   `cache_result="unknown"`, on-demand prepares report real
+   `hit`/`miss`/`evicted`).
 3. **Image Cache Hit Rate**, **Image Cache Misses**, **Image Eviction
    Activity**, **Signature Verify Latency**, and **Overlay Creation Latency**
-   stay empty until the host image cache lands. Do not read an empty panel as
-   healthy. Fall back to prepare events, platform logs, traces, and audit
-   below until then. Expiry: host image-cache work (BSD-184).
+   populate when the on-demand path is enabled (`PICO_IMAGE_ON_DEMAND=1`,
+   CAP-165). On eager-only hosts those panels stay empty. Do not read an
+   empty panel as healthy. Fall back to prepare events, platform logs,
+   traces, and audit below until then.
 4. **Snapshot Cache Hit Rate**, **Cache Misses**, **Eviction Activity**,
    **Snapshot Reference Churn** (restore path, not image layers).
 5. Correlate with [snapshot-fork](snapshot-fork.md) if restore/fork moved

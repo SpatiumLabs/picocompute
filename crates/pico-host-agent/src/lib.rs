@@ -10,6 +10,7 @@ pub mod handshake;
 pub mod health;
 pub mod host_control;
 pub mod identity;
+pub mod image_on_demand;
 pub mod image_verify;
 pub mod metrics;
 mod observation;
@@ -72,8 +73,8 @@ use crate::boot::{
     BootCommand, BootObservation, BootReport, BootStatus, LifecycleReporter,
     TracingLifecycleReporter, emit_boot_cleanup, emit_boot_not_ready, emit_boot_ready,
     emit_boot_start, emit_create_completed, emit_create_failed, emit_create_started,
-    emit_destroy_completed, emit_destroy_failed, emit_destroy_started, emit_prepare_completed,
-    emit_prepare_failed, emit_prepare_started,
+    emit_destroy_completed, emit_destroy_failed, emit_destroy_started,
+    emit_prepare_completed_with_cache, emit_prepare_failed_with_cache, emit_prepare_started,
 };
 use crate::client::{
     emit_exec_not_completed, emit_exec_started, emit_restore_completed, emit_restore_failed,
@@ -445,6 +446,7 @@ pub struct HostAgent {
     supported_backends: Arc<RwLock<Vec<RuntimeType>>>,
     lease_authority: Arc<ParkingLotRwLock<Option<pico_core::LeaseAuthority>>>,
     image_verifier: Option<Arc<crate::image_verify::ImageVerifier>>,
+    image_on_demand: Option<Arc<crate::image_on_demand::OnDemandImageCache>>,
 }
 
 /// RAII guard for an in-flight create or restore operation.
@@ -531,6 +533,19 @@ impl HostAgent {
                 Err(err) => tracing::error!(
                     error = %err,
                     "image verifier could not be constructed; prepare will reject images"
+                ),
+            }
+        }
+        // On-demand lazy reads sit behind the verification gate. Construction
+        // fails closed on bad config or an unreadable revocation file; the
+        // prepare path then rejects on-demand serves rather than running
+        // without revocation data.
+        if config.image_on_demand.enabled {
+            match crate::image_on_demand::OnDemandImageCache::new(config.image_on_demand.clone()) {
+                Ok(cache) => agent.image_on_demand = Some(Arc::new(cache)),
+                Err(err) => tracing::error!(
+                    error = %err,
+                    "on-demand image cache could not be constructed; on-demand serves will fail closed"
                 ),
             }
         }
@@ -724,6 +739,7 @@ impl HostAgent {
             supported_backends: Arc::new(RwLock::new(default_supported_backends())),
             lease_authority: Arc::new(ParkingLotRwLock::new(None)),
             image_verifier: None,
+            image_on_demand: None,
         })
     }
 
@@ -731,6 +747,20 @@ impl HostAgent {
     #[must_use]
     pub fn with_image_verifier(mut self, verifier: crate::image_verify::ImageVerifier) -> Self {
         self.image_verifier = Some(Arc::new(verifier));
+        self
+    }
+
+    /// Installs the verification-gated on-demand cache.
+    ///
+    /// The cache never weakens verification: it only serves digests admitted
+    /// through [`crate::image_verify::ImageVerifier::verify`] plus
+    /// [`crate::image_on_demand::OnDemandImageCache::admit_verified`].
+    #[must_use]
+    pub fn with_image_on_demand(
+        mut self,
+        cache: Arc<crate::image_on_demand::OnDemandImageCache>,
+    ) -> Self {
+        self.image_on_demand = Some(cache);
         self
     }
 
@@ -861,6 +891,11 @@ impl HostAgent {
             .map(|r| r.tenant_id.to_string());
         let started = Instant::now();
         emit_prepare_started(&sandbox_id_hint, tenant_id_hint.as_deref());
+        // Cache outcome for the image-stage latency series. Updated inside
+        // the prepare body once the verification gate classifies the digest;
+        // failures before that point keep `unknown`.
+        let cache_result_for_telemetry = Arc::new(ParkingLotMutex::new(String::from("unknown")));
+        let cache_result_inner = Arc::clone(&cache_result_for_telemetry);
         let result = async {
             self.ensure_new_sandboxes_allowed("prepare")?;
             let id = spec
@@ -940,9 +975,25 @@ impl HostAgent {
             // verified manifest digest replaces it below, because the request
             // is only an unverified hint and the signed manifest is authority.
             let mut image_digest = spec.image_digest.clone().unwrap_or_default();
+            let verify_started = Instant::now();
             let verified_image = admit_image(self, runtime)?;
+            crate::metrics::record_image_verify_latency(verify_started.elapsed().as_secs_f64());
             if let Some(ref record) = verified_image {
                 image_digest = record.manifest_digest.clone();
+                // Verification-gated lazy reads: the digest is admitted for
+                // on-demand serving only after verification (plus revocation)
+                // succeeded. The prepare-level cache outcome is peeked before
+                // admission so cold, warm, and evicted prepares label
+                // honestly for S-CACHE evidence.
+                if let Some(cache) = self.image_on_demand.as_ref() {
+                    let outcome = cache.prepare_result(&record.manifest_digest);
+                    *cache_result_inner.lock() = outcome.as_str().to_string();
+                    cache
+                        .admit_verified(record)
+                        .map_err(|err| SandboxError::PolicyDenied {
+                            reason: format!("on-demand admission failed: {err}"),
+                        })?;
+                }
             }
             let shared_secret = pico_core::crypto::derive_handshake_shared_secret(&id);
             let credential_request = spec.credential_request.clone();
@@ -1026,10 +1077,12 @@ impl HostAgent {
                 1,
                 Duration::from_secs(boot::DEFAULT_BOOT_TIMEOUT_SECS),
             );
+            let overlay_started = Instant::now();
             let outcome = self
                 .sandboxd
                 .prepare(prepare_meta, &config, runtime, host_resources)
                 .await?;
+            crate::metrics::record_image_overlay_latency(overlay_started.elapsed().as_secs_f64());
             if !outcome.succeeded() {
                 let _ = entry.commit_desired(
                     SandboxState::Preparing,
@@ -1082,6 +1135,7 @@ impl HostAgent {
         }
         .await;
         let latency_ms = started.elapsed().as_millis() as u64;
+        let cache_result = cache_result_for_telemetry.lock().clone();
         let target_id = if !sandbox_id_hint.is_empty() {
             &sandbox_id_hint
         } else {
@@ -1089,7 +1143,13 @@ impl HostAgent {
         };
         match &result {
             Ok(info) => {
-                emit_prepare_completed(&info.id, latency_ms, tenant_id_hint.as_deref());
+                emit_prepare_completed_with_cache(
+                    &info.id,
+                    latency_ms,
+                    &cache_result,
+                    crate::metrics::val::IMAGE_PROFILE_UNKNOWN,
+                    tenant_id_hint.as_deref(),
+                );
                 set_span_status_from_outcome(LifecycleOutcome::Success, None);
                 record_bounded_attr(attr::SANDBOX_ID, &info.id);
                 record_bounded_attr(
@@ -1099,10 +1159,12 @@ impl HostAgent {
                 record_bounded_attr(attr::OUTCOME, LifecycleOutcome::Success.as_str());
             }
             Err(e) => {
-                emit_prepare_failed(
+                emit_prepare_failed_with_cache(
                     target_id,
                     latency_ms,
                     &e.to_string(),
+                    &cache_result,
+                    crate::metrics::val::IMAGE_PROFILE_UNKNOWN,
                     tenant_id_hint.as_deref(),
                 );
                 let outcome = error_to_lifecycle_outcome(e);
