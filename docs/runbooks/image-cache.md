@@ -31,7 +31,10 @@ or snapshot cache miss/eviction is starving restore/boot.
 3. **Image Cache Hit Rate**, **Image Cache Misses**, **Image Eviction
    Activity**, **Signature Verify Latency**, and **Overlay Creation Latency**
    populate when the on-demand path is enabled (`PICO_IMAGE_ON_DEMAND=1`,
-   CAP-165). On eager-only hosts those panels stay empty. Do not read an
+   CAP-165). On-demand requires production verification mode
+   (`PICO_IMAGE_VERIFICATION_MODE=production` with a pinned signing key);
+   development admissions never serve lazy bytes. On eager-only hosts those
+   panels stay empty. Do not read an
    empty panel as healthy. Fall back to prepare events, platform logs,
    traces, and audit below until then.
 4. **Snapshot Cache Hit Rate**, **Cache Misses**, **Eviction Activity**,

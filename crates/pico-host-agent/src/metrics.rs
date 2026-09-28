@@ -677,10 +677,10 @@ pub fn record_image_overlay_latency(seconds: f64) {
 
 /// Record image-stage prepare latency with a real cache result.
 ///
-/// Unlike the legacy `unknown` path in `boot.rs`, this carries the
-/// on-demand lookup outcome (`hit`/`miss`/`evicted`) so the
-/// `pico-image-cache` "Image Prepare Latency by cache_result" panel and
-/// `pico:image_prepare:latency:*` recording rules populate.
+/// Carries the on-demand lookup outcome (`hit`/`miss`/`evicted`; `unknown`
+/// for paths that bypass the cache) so the `pico-image-cache` "Image Prepare
+/// Latency by cache_result" panel and `pico:image_prepare:latency:*`
+/// recording rules populate.
 pub fn record_image_prepare_latency(
     status: &str,
     cache_result: &str,

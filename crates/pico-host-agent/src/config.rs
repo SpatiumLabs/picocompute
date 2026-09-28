@@ -313,6 +313,16 @@ fn ensure_valid(config: &HostAgentConfig) -> anyhow::Result<()> {
     if config.image_on_demand.enabled && !config.image_verification.is_configured() {
         anyhow::bail!("PICO_IMAGE_ON_DEMAND requires PICO_IMAGE_DIR (verification gate)")
     }
+    // On-demand serves require production attestation (pinned-signer
+    // signature). A development admission would serve unsigned images with
+    // `verification_before_serve` set, which misstates the evidence.
+    if config.image_on_demand.enabled
+        && config.image_verification.mode != ImageVerificationMode::Production
+    {
+        anyhow::bail!(
+            "PICO_IMAGE_ON_DEMAND requires image verification mode 'production' (PICO_IMAGE_VERIFICATION_MODE=production with PICO_IMAGE_TRUSTED_SIGNING_KEY)"
+        )
+    }
     // A revocation file that cannot be read must not silently disable
     // revocation. Construction of the cache below re-checks, but failing here
     // keeps the operator signal at startup.
@@ -565,6 +575,12 @@ mod tests {
         );
 
         config.image_verification.image_dir = Some("/var/lib/pico/images/standard".into());
+        // Still development mode: production attestation is required.
+        let err = ensure_valid(&config).expect_err("on-demand without production mode must fail");
+        assert!(err.to_string().contains("production"), "unexpected: {err}");
+
+        config.image_verification.mode = ImageVerificationMode::Production;
+        config.image_verification.trusted_signing_key = Some("key".into());
         assert!(ensure_valid(&config).is_ok());
     }
 

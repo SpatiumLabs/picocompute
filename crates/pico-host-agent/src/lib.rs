@@ -536,18 +536,15 @@ impl HostAgent {
                 ),
             }
         }
-        // On-demand lazy reads sit behind the verification gate. Construction
-        // fails closed on bad config or an unreadable revocation file; the
-        // prepare path then rejects on-demand serves rather than running
-        // without revocation data.
+        // On-demand lazy reads sit behind the verification gate. A bad config
+        // or an unreadable revocation file refuses startup: silently falling
+        // back to the eager path would ignore operator intent and mislabel
+        // S-CACHE evidence as `unknown`.
         if config.image_on_demand.enabled {
-            match crate::image_on_demand::OnDemandImageCache::new(config.image_on_demand.clone()) {
-                Ok(cache) => agent.image_on_demand = Some(Arc::new(cache)),
-                Err(err) => tracing::error!(
-                    error = %err,
-                    "on-demand image cache could not be constructed; on-demand serves will fail closed"
-                ),
-            }
+            let cache =
+                crate::image_on_demand::OnDemandImageCache::new(config.image_on_demand.clone())
+                    .map_err(SandboxError::Other)?;
+            agent.image_on_demand = Some(Arc::new(cache));
         }
         // One flag in `pico-telemetry` covers the host agent, `pico-core`,
         // the network agent, and the observability crate, so a single call
@@ -976,8 +973,11 @@ impl HostAgent {
             // is only an unverified hint and the signed manifest is authority.
             let mut image_digest = spec.image_digest.clone().unwrap_or_default();
             let verify_started = Instant::now();
-            let verified_image = admit_image(self, runtime)?;
+            let verified_image = admit_image(self, runtime);
+            // Recorded on denial too: revocation and verification refusal
+            // latency is S-CACHE evidence, not just the happy path.
             crate::metrics::record_image_verify_latency(verify_started.elapsed().as_secs_f64());
+            let verified_image = verified_image?;
             if let Some(ref record) = verified_image {
                 image_digest = record.manifest_digest.clone();
                 // Verification-gated lazy reads: the digest is admitted for
@@ -1081,8 +1081,11 @@ impl HostAgent {
             let outcome = self
                 .sandboxd
                 .prepare(prepare_meta, &config, runtime, host_resources)
-                .await?;
+                .await;
+            // Recorded on transport failure too: a failed materialization
+            // still spent overlay time.
             crate::metrics::record_image_overlay_latency(overlay_started.elapsed().as_secs_f64());
+            let outcome = outcome?;
             if !outcome.succeeded() {
                 let _ = entry.commit_desired(
                     SandboxState::Preparing,

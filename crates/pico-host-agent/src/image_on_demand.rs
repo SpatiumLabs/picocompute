@@ -36,7 +36,7 @@ use hashbrown::HashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::image_verify::VerifiedImageRecord;
+use crate::image_verify::{ImageVerificationMode, VerifiedImageRecord};
 
 /// Chunk size for the VM-disk block path (256 KiB, matches the ublk chunk
 /// described in CAP-165).
@@ -48,6 +48,14 @@ pub const DEFAULT_MAX_CACHED_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Default readahead depth in chunks.
 pub const DEFAULT_READAHEAD_CHUNKS: u64 = 2;
+
+/// Largest single `fetch_range` read (1 GiB). Bounds the assembled buffer and
+/// the chunk loop so a huge `len` cannot OOM the host or spin forever.
+pub const MAX_FETCH_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Largest chunk count per `fetch_range` call. Bounds loop iterations when a
+/// small `chunk_bytes` meets a large `len`.
+pub const MAX_FETCH_CHUNKS: u64 = 16_384;
 
 /// Lazy-read shape selected per runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +229,20 @@ pub enum FetchError {
     /// Requested range is empty.
     #[error("empty read range")]
     EmptyRange,
+    /// The requested range is not servable: arithmetic overflow, over
+    /// [`MAX_FETCH_BYTES`], over [`MAX_FETCH_CHUNKS`] chunks, or not
+    /// representable for allocation.
+    #[error("invalid read range offset={offset} len={len}: {reason}")]
+    InvalidRange {
+        offset: u64,
+        len: u64,
+        reason: String,
+    },
+    /// The record was not admitted in production mode. On-demand serves
+    /// require production attestation (pinned-signer signature); development
+    /// admissions never serve lazy bytes.
+    #[error("digest {digest} lacks production attestation")]
+    MissingAttestation { digest: String },
 }
 
 impl FetchError {
@@ -238,6 +260,8 @@ impl FetchError {
             Self::NetworkFailure { .. } => "image_on_demand_fetch_failed",
             Self::Disabled => "image_on_demand_disabled",
             Self::EmptyRange => "image_on_demand_empty_range",
+            Self::InvalidRange { .. } => "image_on_demand_invalid_range",
+            Self::MissingAttestation { .. } => "image_on_demand_missing_attestation",
         }
     }
 }
@@ -386,6 +410,22 @@ impl OnDemandImageCache {
         if !self.config.enabled {
             return Err(FetchError::Disabled);
         }
+        // Production attestation is part of the gate: a development admission
+        // (unsigned images tolerated) must never serve lazy bytes with
+        // `verification_before_serve` set. Config validation also requires
+        // production mode for on-demand; this check holds even for
+        // programmatically constructed caches that bypass it.
+        if record.mode != ImageVerificationMode::Production {
+            tracing::warn!(
+                event = "image_on_demand_unattested",
+                manifest_digest = %record.manifest_digest,
+                mode = ?record.mode,
+                "on-demand admission refused: production attestation required"
+            );
+            return Err(FetchError::MissingAttestation {
+                digest: record.manifest_digest.clone(),
+            });
+        }
         if self.revocation.is_revoked(&record.manifest_digest) {
             tracing::warn!(
                 event = "image_on_demand_revoked",
@@ -423,28 +463,41 @@ impl OnDemandImageCache {
     /// Prepare-level lookup hint for S-CACHE evidence.
     ///
     /// Returns `Hit` when the digest is already admitted, `Evicted` when it
-    /// lost bytes to eviction since admission, and `Miss` otherwise. Byte
-    /// fetches via [`Self::fetch_range`] refine this into per-chunk
-    /// hit/miss counters; this peek exists so the prepare path can label its
-    /// own latency without serving bytes.
+    /// lost bytes to eviction since admission, and `Miss` otherwise. Reports
+    /// `evicted` once per eviction: peeking consumes the marker so repeated
+    /// prepares converge back to `hit` instead of reporting thrash forever.
+    /// Byte fetches via [`Self::fetch_range`] share the same marker, so an
+    /// eviction is reported once across both paths, whichever peeks first.
     pub fn prepare_result(&self, digest: &str) -> OnDemandCacheResult {
-        let inner = self.inner.lock();
-        if inner.evicted_digests.contains(digest) {
+        let mut inner = self.inner.lock();
+        if !inner.verified.contains(digest) {
+            return OnDemandCacheResult::Miss;
+        }
+        if inner.evicted_digests.remove(digest) {
             OnDemandCacheResult::Evicted
-        } else if inner.verified.contains(digest) {
-            OnDemandCacheResult::Hit
         } else {
-            OnDemandCacheResult::Miss
+            OnDemandCacheResult::Hit
         }
     }
 
     /// Fetches `[offset, offset + len)` for a verified digest.
     ///
     /// The provider supplies one chunk at a time and is called only for
-    /// chunks missing from the second-level cache. A provider failure fails
-    /// closed: nothing is served, nothing is inserted, and the error maps to
-    /// `reason=image` upstream. Returns the bytes plus whether every chunk
-    /// was a cache hit.
+    /// chunks missing from the second-level cache. `len` is capped at
+    /// [`MAX_FETCH_BYTES`] and the span at [`MAX_FETCH_CHUNKS`] chunks;
+    /// overflows and over-limit ranges fail with [`FetchError::InvalidRange`]
+    /// before any provider call or allocation.
+    ///
+    /// A provider failure fails closed: nothing is served and the error maps
+    /// to `reason=image` upstream. Chunks fetched before the failure stay
+    /// cached (they are digest-keyed under a verified admission, so retaining
+    /// them cannot serve unverified bytes); only serving is all-or-nothing.
+    /// Returns the bytes plus whether every chunk was a cache hit.
+    ///
+    /// Reads clamp to the bytes the provider supplies: a short provider
+    /// chunk (for example the final chunk of an image) yields a short read.
+    /// Callers needing exact-length reads must compare the returned length
+    /// to `len`.
     ///
     /// # Errors
     ///
@@ -479,11 +532,42 @@ impl OnDemandImageCache {
         }
 
         let chunk_bytes = self.config.chunk_bytes;
+        let end = offset.checked_add(len).ok_or(FetchError::InvalidRange {
+            offset,
+            len,
+            reason: "offset + len overflows u64".to_string(),
+        })?;
+        if len > MAX_FETCH_BYTES {
+            return Err(FetchError::InvalidRange {
+                offset,
+                len,
+                reason: format!("len exceeds MAX_FETCH_BYTES ({MAX_FETCH_BYTES})"),
+            });
+        }
         let first_chunk = offset / chunk_bytes;
-        let last_chunk = (offset + len - 1) / chunk_bytes;
+        let last_chunk = (end - 1) / chunk_bytes;
+        // Checked `end` with `len >= 1` guarantees `last_chunk >= first_chunk`:
+        // `end - 1 >= offset` and integer division is monotonic. The `len`
+        // cap above also bounds `last_chunk - first_chunk + 1 <= len`, so the
+        // `+ 1` cannot overflow.
+        let chunk_count = last_chunk - first_chunk + 1;
+        if chunk_count > MAX_FETCH_CHUNKS {
+            return Err(FetchError::InvalidRange {
+                offset,
+                len,
+                reason: format!(
+                    "range spans {chunk_count} chunks, over MAX_FETCH_CHUNKS ({MAX_FETCH_CHUNKS})"
+                ),
+            });
+        }
         let mut all_hit = true;
         let mut saw_evicted_digest = false;
-        let mut assembled = Vec::with_capacity(len as usize);
+        let len_usize = usize::try_from(len).map_err(|_| FetchError::InvalidRange {
+            offset,
+            len,
+            reason: "len does not fit in usize".to_string(),
+        })?;
+        let mut assembled = Vec::with_capacity(len_usize);
 
         for chunk_idx in first_chunk..=last_chunk {
             let key = ChunkKey {
@@ -514,9 +598,11 @@ impl OnDemandImageCache {
                     fetched
                 }
             };
-            // Slice the chunk down to the requested window.
+            // Slice the chunk down to the requested window. `saturating_add`
+            // guards against a pathological provider returning a huge chunk
+            // for a range near `u64::MAX`; the window math below then clamps.
             let chunk_start = chunk_idx * chunk_bytes;
-            let chunk_end = chunk_start + chunk_bytes_vec.len() as u64;
+            let chunk_end = chunk_start.saturating_add(chunk_bytes_vec.len() as u64);
             let want_start = offset.max(chunk_start);
             let want_end = (offset + len).min(chunk_end);
             if want_start < want_end {
@@ -634,6 +720,10 @@ mod tests {
     use crate::image_verify::ImageVerificationMode;
 
     fn test_record(digest: &str) -> VerifiedImageRecord {
+        test_record_with_mode(digest, ImageVerificationMode::Production)
+    }
+
+    fn test_record_with_mode(digest: &str, mode: ImageVerificationMode) -> VerifiedImageRecord {
         VerifiedImageRecord {
             image_id: "pico-guest-standard".to_string(),
             manifest_digest: digest.to_string(),
@@ -641,7 +731,7 @@ mod tests {
             composition_digest: None,
             composition_audit_record: None,
             layer_count: 0,
-            mode: ImageVerificationMode::Production,
+            mode,
         }
     }
 
@@ -869,5 +959,139 @@ mod tests {
             cache.fetch_range("sha256:x", 0, 1, &mut provider),
             Err(FetchError::Disabled)
         ));
+    }
+
+    #[test]
+    fn admit_verified_rejects_development_records() {
+        let cache = OnDemandImageCache::test_only(enabled_config(), &[]).unwrap();
+        let err = cache
+            .admit_verified(&test_record_with_mode(
+                "sha256:dev",
+                ImageVerificationMode::Development,
+            ))
+            .expect_err("development admission must fail");
+        assert!(matches!(err, FetchError::MissingAttestation { .. }));
+        assert_eq!(err.reason_label(), "image_on_demand_missing_attestation");
+        assert_eq!(
+            err.non_ready_reason(),
+            pico_core::NonReadyReason::Image,
+            "attestation refusal is an image failure"
+        );
+        // The digest stays unadmitted: fetches still fail closed.
+        let mut provider = |_: u64| Ok(vec![0; 8]);
+        assert!(matches!(
+            cache.fetch_range("sha256:dev", 0, 8, &mut provider),
+            Err(FetchError::NotVerified { .. })
+        ));
+    }
+
+    #[test]
+    fn fetch_range_rejects_invalid_ranges_without_calling_provider() {
+        let cache = OnDemandImageCache::test_only(enabled_config(), &[]).unwrap();
+        let digest = "sha256:ranges";
+        cache.admit_verified(&test_record(digest)).unwrap();
+        let mut called = false;
+        let mut provider = |_: u64| {
+            called = true;
+            Ok(vec![0; 8])
+        };
+        // Overflow.
+        let err = cache
+            .fetch_range(digest, u64::MAX, 2, &mut provider)
+            .expect_err("overflowing range must fail");
+        assert!(matches!(err, FetchError::InvalidRange { .. }));
+        // Over the byte cap.
+        let err = cache
+            .fetch_range(digest, 0, MAX_FETCH_BYTES + 1, &mut provider)
+            .expect_err("oversized range must fail");
+        assert!(matches!(err, FetchError::InvalidRange { .. }));
+        assert!(!called, "provider must not run for invalid ranges");
+        assert_eq!(
+            err.non_ready_reason(),
+            pico_core::NonReadyReason::Image,
+            "invalid range is an image failure"
+        );
+        assert_eq!(err.reason_label(), "image_on_demand_invalid_range");
+    }
+
+    #[test]
+    fn fetch_range_rejects_excessive_chunk_counts() {
+        let mut config = enabled_config();
+        config.chunk_bytes = 1;
+        let cache = OnDemandImageCache::test_only(config, &[]).unwrap();
+        let digest = "sha256:chunks";
+        cache.admit_verified(&test_record(digest)).unwrap();
+        let mut provider = |_: u64| Ok(vec![0; 1]);
+        let err = cache
+            .fetch_range(digest, 0, MAX_FETCH_CHUNKS + 1, &mut provider)
+            .expect_err("excessive chunk span must fail");
+        assert!(matches!(err, FetchError::InvalidRange { .. }));
+    }
+
+    #[test]
+    fn prepare_result_reports_evicted_once() {
+        let cache = OnDemandImageCache::test_only(enabled_config(), &[]).unwrap();
+        let digest = "sha256:peek-evicted";
+        assert_eq!(
+            cache.prepare_result(digest),
+            OnDemandCacheResult::Miss,
+            "unseen digest is a miss"
+        );
+        cache.admit_verified(&test_record(digest)).unwrap();
+        let mut provider = |_: u64| Ok(vec![1; 8]);
+        cache.fetch_range(digest, 0, 8, &mut provider).unwrap();
+        assert_eq!(
+            cache.prepare_result(digest),
+            OnDemandCacheResult::Hit,
+            "admitted digest is a hit"
+        );
+        assert!(cache.evict_digest(digest) > 0);
+        assert_eq!(
+            cache.prepare_result(digest),
+            OnDemandCacheResult::Evicted,
+            "evicted digest reports evicted once"
+        );
+        assert_eq!(
+            cache.prepare_result(digest),
+            OnDemandCacheResult::Hit,
+            "marker is consumed: prepares converge back to hit"
+        );
+    }
+
+    #[test]
+    fn partial_provider_failure_serves_nothing_but_keeps_prior_chunks() {
+        let cache = OnDemandImageCache::test_only(enabled_config(), &[]).unwrap();
+        let digest = "sha256:partial";
+        cache.admit_verified(&test_record(digest)).unwrap();
+        // Chunk 0 succeeds, chunk 1 fails: nothing is served.
+        let mut flaky = |idx: u64| -> Result<Vec<u8>, String> {
+            if idx == 0 {
+                Ok(vec![0xCC; 8])
+            } else {
+                Err("chunk 1 unavailable".to_string())
+            }
+        };
+        let err = cache
+            .fetch_range(digest, 0, 16, &mut flaky)
+            .expect_err("partial failure must fail closed");
+        assert!(matches!(err, FetchError::NetworkFailure { chunk: 1, .. }));
+        // Chunk 0 was valid under a verified admission, so it stays cached; a
+        // follow-up read of that window hits without touching the provider.
+        let mut failing = |_: u64| Err::<Vec<u8>, String>("must not be called".to_string());
+        let (bytes, result) = cache.fetch_range(digest, 0, 8, &mut failing).unwrap();
+        assert_eq!(bytes, vec![0xCC; 8]);
+        assert_eq!(result, OnDemandCacheResult::Hit);
+    }
+
+    #[test]
+    fn short_provider_chunk_clamps_read() {
+        let cache = OnDemandImageCache::test_only(enabled_config(), &[]).unwrap();
+        let digest = "sha256:short";
+        cache.admit_verified(&test_record(digest)).unwrap();
+        // Provider supplies fewer bytes than the chunk size (end of image):
+        // the read clamps instead of failing.
+        let mut provider = |_: u64| Ok(vec![0xDD; 4]);
+        let (bytes, _) = cache.fetch_range(digest, 0, 8, &mut provider).unwrap();
+        assert_eq!(bytes, vec![0xDD; 4]);
     }
 }
