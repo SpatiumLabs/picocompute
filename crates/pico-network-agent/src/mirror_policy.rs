@@ -6,7 +6,7 @@
 //! DNS suffix rules plus lease-bound egress, with dynamic per-stage
 //! policy updates bound to the current policy epoch.
 
-use crate::dns::{DnsAction, DnsPatternType, DnsRule};
+use crate::dns::{DnsAction, DnsPatternType, DnsPolicy, DnsRule, normalize_dns_name};
 
 /// Package-mirror policy class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,20 +70,22 @@ pub struct MirrorPolicy {
 
 impl MirrorPolicy {
     /// Returns true when `domain` is allowed for the current stage.
+    ///
+    /// Matching uses [`normalize_dns_name`], the same normalization as
+    /// [`DnsPolicy::evaluate`], so allow checks compose without
+    /// case or trailing-dot bypasses.
     #[must_use]
     pub fn allows(&self, domain: &str) -> bool {
-        let normalized = domain.trim().trim_end_matches('.').to_lowercase();
+        let normalized = normalize_dns_name(domain);
         if normalized.is_empty() {
-            return false;
-        }
-        // Run stage denies mirrors by default; build and install allow
-        // only their explicitly enabled classes.
-        if self.stage == PipelineStage::Run && self.allowed_classes.is_empty() {
             return false;
         }
         for class in &self.allowed_classes {
             for suffix in class.suffixes() {
-                if normalized == *suffix || normalized.ends_with(&format!(".{suffix}")) {
+                let normalized_suffix = normalize_dns_name(suffix);
+                if normalized == normalized_suffix
+                    || normalized.ends_with(&format!(".{normalized_suffix}"))
+                {
                     return true;
                 }
             }
@@ -91,7 +93,42 @@ impl MirrorPolicy {
         false
     }
 
+    /// Mirror access always requires a current lease.
+    #[must_use]
+    pub fn requires_lease(&self) -> bool {
+        !self.allowed_classes.is_empty()
+    }
+
+    /// Returns true when this policy carries the lease that authorizes it.
+    #[must_use]
+    pub fn has_lease(&self) -> bool {
+        self.lease_id
+            .as_ref()
+            .is_some_and(|lease| !lease.trim().is_empty())
+    }
+
+    /// Converts this policy to a [`DnsPolicy`] with default deny.
+    ///
+    /// Patterns use bare suffixes so apex and subdomains match.
+    /// Identity fields carry over so DNS audit
+    /// attributes mirror decisions to tenant, sandbox, and epoch.
+    #[must_use]
+    pub fn to_dns_policy(&self) -> DnsPolicy {
+        DnsPolicy {
+            tenant_id: self.tenant_id.clone(),
+            sandbox_id: self.sandbox_id.clone(),
+            policy_decision_id: self.policy_decision_id.clone(),
+            policy_epoch: self.policy_epoch,
+            workload_class: Some(format!("mirror-{}", self.stage.as_str())),
+            rules: self.dns_rules(),
+            default_action: DnsAction::Deny,
+        }
+    }
+
     /// Converts this policy to ordered DNS rules (first-wins).
+    ///
+    /// Patterns use bare suffixes (`pypi.org`) so both the apex and
+    /// subdomains match, the same semantics as [`Self::allows`].
     #[must_use]
     pub fn dns_rules(&self) -> Vec<DnsRule> {
         let mut rules = Vec::new();
@@ -108,11 +145,18 @@ impl MirrorPolicy {
         rules
     }
 
-    /// Validates a stage transition: epochs must advance and the new
-    /// policy must not inherit stale mirror allowances implicitly.
+    /// Validates a stage transition.
+    ///
+    /// The next policy must carry the same tenant and sandbox, a strictly
+    /// greater policy epoch, and its own explicit `allowed_classes`.
+    /// Allowances are never inherited: the caller must set the next
+    /// stage's classes explicitly (empty for deny).
     pub fn transition_to(&self, next: &MirrorPolicy) -> Result<(), MirrorPolicyError> {
         if next.sandbox_id != self.sandbox_id {
             return Err(MirrorPolicyError::SandboxMismatch);
+        }
+        if next.tenant_id != self.tenant_id {
+            return Err(MirrorPolicyError::TenantMismatch);
         }
         if next.policy_epoch <= self.policy_epoch {
             return Err(MirrorPolicyError::StaleEpoch {
@@ -128,6 +172,8 @@ impl MirrorPolicy {
 pub enum MirrorPolicyError {
     #[error("mirror policy sandbox mismatch")]
     SandboxMismatch,
+    #[error("mirror policy tenant mismatch")]
+    TenantMismatch,
     #[error("stale policy epoch: current {current}, next {next}")]
     StaleEpoch { current: u64, next: u64 },
 }
@@ -149,6 +195,16 @@ mod tests {
     }
 
     #[test]
+    fn class_and_stage_names() {
+        assert_eq!(MirrorClass::Pypi.as_str(), "pypi");
+        assert_eq!(MirrorClass::Npm.as_str(), "npm");
+        assert_eq!(MirrorClass::GoProxy.as_str(), "go-proxy");
+        assert_eq!(PipelineStage::Build.as_str(), "build");
+        assert_eq!(PipelineStage::Install.as_str(), "install");
+        assert_eq!(PipelineStage::Run.as_str(), "run");
+    }
+
+    #[test]
     fn pypi_class_allows_only_pypi_suffixes() {
         let p = policy(PipelineStage::Install, vec![MirrorClass::Pypi], 1);
         assert!(p.allows("pypi.org"));
@@ -156,6 +212,36 @@ mod tests {
         assert!(p.allows("a.files.pythonhosted.org"));
         assert!(!p.allows("proxy.golang.org"));
         assert!(!p.allows("registry.npmjs.org"));
+    }
+
+    #[test]
+    fn allows_matches_dns_policy_evaluation() {
+        let p = policy(
+            PipelineStage::Install,
+            vec![MirrorClass::Pypi, MirrorClass::GoProxy],
+            1,
+        );
+        let dns = p.to_dns_policy();
+        for domain in [
+            "pypi.org",
+            "PYPI.ORG.",
+            "files.pythonhosted.org",
+            "proxy.golang.org",
+            "a.proxy.golang.org.",
+        ] {
+            assert!(p.allows(domain), "{domain} should be allowed");
+            assert!(
+                dns.evaluate(domain, "A").allowed,
+                "{domain} should evaluate allowed"
+            );
+        }
+        for domain in ["evil-mirror.example.com", "169.254.169.254", ""] {
+            assert!(!p.allows(domain), "{domain} should be denied");
+            assert!(
+                !dns.evaluate(domain, "A").allowed,
+                "{domain} should evaluate denied"
+            );
+        }
     }
 
     #[test]
@@ -176,6 +262,17 @@ mod tests {
         assert!(!p.allows("pypi.org"));
         assert!(!p.allows("proxy.golang.org"));
         assert!(p.dns_rules().is_empty());
+        assert!(!p.requires_lease());
+    }
+
+    #[test]
+    fn mirror_access_requires_lease() {
+        let p = policy(PipelineStage::Install, vec![MirrorClass::Pypi], 1);
+        assert!(p.requires_lease());
+        assert!(p.has_lease());
+        let mut without_lease = p.clone();
+        without_lease.lease_id = None;
+        assert!(!without_lease.has_lease());
     }
 
     #[test]
@@ -197,7 +294,18 @@ mod tests {
     }
 
     #[test]
-    fn dns_rules_cover_every_allowed_suffix() {
+    fn stage_transition_rejects_tenant_mismatch() {
+        let build = policy(PipelineStage::Build, vec![MirrorClass::Pypi], 1);
+        let mut other_tenant = policy(PipelineStage::Install, vec![MirrorClass::Pypi], 2);
+        other_tenant.tenant_id = "other".into();
+        assert_eq!(
+            build.transition_to(&other_tenant),
+            Err(MirrorPolicyError::TenantMismatch)
+        );
+    }
+
+    #[test]
+    fn dns_rules_use_bare_suffix_convention() {
         let p = policy(
             PipelineStage::Install,
             vec![MirrorClass::Pypi, MirrorClass::GoProxy],
@@ -207,5 +315,6 @@ mod tests {
         assert!(rules.iter().any(|r| r.pattern == "pypi.org"));
         assert!(rules.iter().any(|r| r.pattern == "proxy.golang.org"));
         assert!(rules.iter().all(|r| r.action == DnsAction::Allow));
+        assert_eq!(p.to_dns_policy().policy_epoch, 1);
     }
 }

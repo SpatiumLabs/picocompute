@@ -170,7 +170,7 @@ const DEFAULT_PREFIX_PATHS: &[&str] = &[
     "/boot",
 ];
 
-fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return String::new();

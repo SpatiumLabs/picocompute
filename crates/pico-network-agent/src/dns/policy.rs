@@ -48,25 +48,42 @@ pub struct DnsPolicy {
     pub default_action: DnsAction,
 }
 
+/// Normalize a DNS name for policy matching.
+///
+/// DNS names are case-insensitive; a single trailing dot denotes the root
+/// and carries no policy meaning. Both are normalized so allow rules and
+/// queries compose without bypasses.
+#[must_use]
+pub fn normalize_dns_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_lowercase()
+}
+
 impl DnsPolicy {
     /// Evaluate whether a DNS query is allowed under this policy.
     ///
     /// Rules are evaluated first-to-last. The first rule whose pattern
     /// and (optional) record types match determines the decision.
     /// If no rule matches, the default action applies.
+    ///
+    /// Both the query name and rule patterns are normalized with
+    /// [`normalize_dns_name`] before matching.
     #[must_use]
     pub fn evaluate(&self, qname: &str, qtype: &str) -> DnsDecision {
+        let normalized_qname = normalize_dns_name(qname);
         for rule in &self.rules {
+            let normalized_pattern = normalize_dns_name(&rule.pattern);
             let domain_matches = match rule.pattern_type {
-                DnsPatternType::Exact => qname == rule.pattern.as_str(),
+                DnsPatternType::Exact => normalized_qname == normalized_pattern,
                 DnsPatternType::Suffix => {
-                    if !qname.ends_with(&rule.pattern) {
+                    if !normalized_qname.ends_with(normalized_pattern.as_str()) {
                         false
-                    } else if rule.pattern.starts_with('.') || qname.len() == rule.pattern.len() {
+                    } else if normalized_pattern.starts_with('.')
+                        || normalized_qname.len() == normalized_pattern.len()
+                    {
                         true
                     } else {
-                        let prefix_len = qname.len() - rule.pattern.len();
-                        prefix_len > 0 && qname.as_bytes()[prefix_len - 1] == b'.'
+                        let prefix_len = normalized_qname.len() - normalized_pattern.len();
+                        prefix_len > 0 && normalized_qname.as_bytes()[prefix_len - 1] == b'.'
                     }
                 }
             };

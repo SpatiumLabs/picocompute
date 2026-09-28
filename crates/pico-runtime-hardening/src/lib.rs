@@ -21,9 +21,11 @@ pub use fim::{
 };
 pub use guest_paths::{GuestHostOwnedBaseline, is_host_owned};
 pub use identity::no_new_privs;
-pub use ioctl_policy::{DeniedIoctlClass, denied_class, is_allowed as ioctl_is_allowed};
+pub use ioctl_policy::{
+    DeniedIoctlClass, denied_class, is_allowed as ioctl_is_allowed, review_profile_allowlist,
+};
 pub use namespaces::{NamespaceConfig, unshare_namespaces};
-pub use output_quota::{OutputQuota, QuotaDecision};
+pub use output_quota::{OutputQuota, OutputQuotaSet, QuotaDecision};
 pub use proc_policy::{ProcPolicyError, validate_proc_read};
 
 pub fn init() {

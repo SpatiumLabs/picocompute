@@ -4,6 +4,11 @@
 //! `/proc/kpagecgroup`. The guest `/proc` view masks hazardous entries,
 //! applies hidepid semantics, and bounds read sizes and timeouts so
 //! scans cannot crash the kernel or leak unapproved state.
+//!
+//! Callers must pass absolute guest paths. Relative paths never match
+//! because kernel-resolved enforcement paths are absolute.
+
+use crate::fim::baseline::normalize_path as normalize_guest_path;
 
 /// Hazardous `/proc` entries masked from the guest view.
 pub const MASKED_PROC_PATHS: &[&str] = &[
@@ -21,9 +26,14 @@ pub const MASKED_PROC_PATHS: &[&str] = &[
 pub const PROC_READ_MAX_BYTES: usize = 64 * 1024;
 
 /// Returns true when `path` is a masked `/proc` hazard.
+///
+/// `path` must be absolute. Relative paths return false.
 #[must_use]
 pub fn is_masked_proc_path(path: &str) -> bool {
-    let normalized = normalize(path);
+    let normalized = normalize_guest_path(path);
+    if !normalized.starts_with('/') {
+        return false;
+    }
     MASKED_PROC_PATHS.contains(&normalized.as_str())
 }
 
@@ -52,30 +62,6 @@ pub enum ProcPolicyError {
     ReadTooLarge { requested: usize, max: usize },
 }
 
-fn normalize(path: &str) -> String {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let mut out = String::with_capacity(trimmed.len());
-    let mut prev_slash = false;
-    for ch in trimmed.chars() {
-        if ch == '/' {
-            if !prev_slash {
-                out.push('/');
-            }
-            prev_slash = true;
-        } else {
-            out.push(ch);
-            prev_slash = false;
-        }
-    }
-    if out.len() > 1 {
-        out = out.trim_end_matches('/').to_string();
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +88,10 @@ mod tests {
     fn benign_proc_read_within_bounds_is_allowed() {
         assert!(validate_proc_read("/proc/cpuinfo", 4096).is_ok());
         assert!(validate_proc_read("/proc/self/status", PROC_READ_MAX_BYTES).is_ok());
+    }
+
+    #[test]
+    fn relative_proc_paths_never_match() {
+        assert!(!is_masked_proc_path("proc/kpagecgroup"));
     }
 }

@@ -330,7 +330,7 @@ mean the risk remains launch-gated.
 | R-20 | Platform cannot safely continue or recover during dependency, host, regional, or organizational failure | Cascading retry, no rebuild path, stale runbook, unowned alert, capacity exhaustion | High | Possible | Medium | High | Load shedding, drain, quarantine, bounded retry, backups, rebuild, runbooks, incident exercises |,; SRE and Control Plane |
 | R-21 | Workload forges RPCs to an agent socket or tampers host-owned guest paths such as sockets and logs | Guest-reachable Unix socket or vsock listener without peer authentication; writable `/run/pico`, `/var/log/pico`, or image binaries such as `/bin/bash` | Critical | Possible | Low | Critical | Host-owned guest path protections with read-only mounts, kernel peer credentials, mutual session authentication, FIM enforce on sockets/logs/binaries | Guest agent socket and log tamper tests; FIM baseline tests; Runtime and Security |
 | R-22 | Residual answers or credentials leak through logs, console capture, or retained tool output | Verbose logging, unbounded retention, missing redaction, log scraping by a later workload step | High | Likely | Low | High | Source redaction allowlists, secret exclusion from logs and telemetry, bounded retention, snapshot exclusion for log mounts | Log redaction and residual-answer tests; Observability and Security |
-| R-23 | Workload abuses `SWAPEXT`-class or clone-range ioctls to corrupt or alias filesystem extents | Overly broad ioctl allowlist, shared filesystem, missing extent-swap review | Critical | Possible | Low | Critical | Ioctl allowlist review denying extent-swap and clone-range classes by default, seccomp ioctl filtering, minimal device model, read-only image layers | Ioctl allowlist and seccomp tests; Runtime and Security |
+| R-23 | Workload abuses `SWAPEXT`-class or clone-range ioctls to corrupt or alias filesystem extents | Overly broad ioctl allowlist, shared filesystem, missing extent-swap review | Critical | Possible | Low | Critical | Ioctl allowlist review denying extent-swap and clone-range classes by default, seccomp profile review, minimal device model, read-only image layers | Ioctl allowlist and seccomp tests; Runtime and Security |
 | R-24 | Workload triggers a `/proc` or pseudo-filesystem hazard such as a `kpagecgroup` crash via `grep` | Unfiltered `/proc` exposure, unrestricted read sizes, missing hidepid and mask review | High | Possible | Medium | High | `/proc` hardening review with masked entries, hidepid, read size and timeout bounds, seccomp and mount policy | `/proc` hardening and bounded-read tests; Runtime and Security |
 | R-25 | Workload exfiltrates data or pulls unapproved code through package mirrors, proxies, port or mirror scans | Implicit mirror trust, static egress policy, stale leases, unclassified proxy destinations | High | Likely | Medium | High | Package-mirror policy classes (PyPI/NPM/Go proxy) via DNS proxy plus lease model, default-deny egress, dynamic per-stage policy updates | Mirror-class DNS and lease tests; dynamic policy tests; Networking and Security |
 | R-26 | Workload floods output capture with unbounded streams such as `yes` producing tens of GB | Missing per-stream quotas, no truncation, host-side capture without bounds or deadlines | High | Likely | High | High | Output-capture quotas with truncation, per-frame and total byte limits, deadlines, process termination on excess | Output-quota and truncation tests; Runtime and Security |
@@ -365,7 +365,7 @@ the outcome to be impossible.
 | R-20 | Failure-domain isolation; bounded retry; capacity reserve; tested recovery | SLO burn, dependency, backlog, host, and ownership alerts | Shed load; fail over; restore; roll back; execute incident runbook |
 | R-21 | Host-owned guest paths read-only; socket peer credentials; mutual session authentication; FIM enforce | Socket tamper alerts; FIM violations; protocol misbinding events | Terminate session; revoke sandbox; rebuild guest paths; incident review |
 | R-22 | Redaction allowlists; secret exclusion from logs; bounded retention; log mount classification | Secret scanning on logs; retention audits; residual-answer probes | Rotate exposed secrets; purge logs; notify tenant; fix redaction |
-| R-23 | Ioctl allowlist review; default-deny extent-swap and clone-range; seccomp filtering | Seccomp denials; syscall audit anomalies; filesystem integrity alerts | Kill workload; quarantine host; patch profile; restore from clean image |
+| R-23 | Ioctl allowlist review; default-deny extent-swap and clone-range; seccomp profile review | Seccomp denials; syscall audit anomalies; filesystem integrity alerts | Kill workload; quarantine host; patch profile; restore from clean image |
 | R-24 | Masked `/proc` entries; hidepid; read size and timeout bounds; mount policy | Bounded-read violations; anomaly detection on `/proc` access | Kill workload; remount hardened `/proc`; rebuild guest profile |
 | R-25 | Default-deny egress; DNS proxy mirror classes; lease-bound proxy destinations; per-stage policy | DNS deny counters; lease audit; flow metadata; mirror-class conformance tests | Revoke lease; remove mapping; isolate namespace; rotate network identity |
 | R-26 | Per-stream and total output quotas; truncation; deadlines; termination on excess | Quota-hit signals; truncation counters; OOM and pressure metrics | Kill or pause workload; shed load; drain host; reconcile accounting |
@@ -381,12 +381,15 @@ hard invariants, or launch gates defined in ADR-0004 and ADR-0006.
   host-owned inside the guest view. They are mounted read-only where the
   workload does not require writes, validated by kernel peer credentials
   on local sockets, bound to the fresh boot session, and monitored by
-  file integrity enforcement. Socket and log tamper tests prove forged
-  RPCs without a current session are detectable and rejected.
+  file integrity enforcement. Socket and log tamper tests show forged
+  RPCs without a current session are visible at wire level for host
+  session authentication to reject.
 - Ioctl allowlist review (R-23): the seccomp and device profile review
   denies `SWAPEXT`-class, clone-range, and other extent-aliasing ioctls
   by default. Each backend profile names the exact allowed ioctl set;
   additions require a reviewed compatibility case plus negative tests.
+  Request-code filtering belongs in seccomp arg filters or eBPF ioctl
+  inspection; the symbolic allowlist gates profile review.
 - Output-capture quotas with truncation (R-26): every exec stream has a
   per-frame limit (64 KiB), a per-stream byte quota, and a deadline.
   Excess output truncates with an explicit marker, terminates the
