@@ -7,9 +7,9 @@
 
 use async_trait::async_trait;
 use pico_core::{
-    ExecRequest, ExecResponse, FileInfo, FileReadResponse, FileWriteRequest, PortForwardEndpoint,
-    PortForwardRequest, PortForwardResponse, Result, SandboxError, SandboxInfo, SandboxSpec,
-    SshInfo, TaskEvent, TaskInfo, TaskRequest,
+    ExecRequest, ExecResponse, FileInfo, FileReadResponse, FileWriteRequest, JobOutcome,
+    JobPauseSignal, JobResumeSignal, PortForwardEndpoint, PortForwardRequest, PortForwardResponse,
+    Result, SandboxError, SandboxInfo, SandboxSpec, SshInfo, TaskEvent, TaskInfo, TaskRequest,
 };
 use tokio::sync::broadcast;
 
@@ -158,6 +158,14 @@ impl pico_core::SandboxService for HostAgent {
 
     async fn resume(&self, id: &str) -> Result<()> {
         HostAgent::resume(self, id).await
+    }
+
+    async fn pause_job(&self, signal: JobPauseSignal) -> Result<JobOutcome> {
+        HostAgent::pause_job(self, signal).await
+    }
+
+    async fn resume_job(&self, signal: JobResumeSignal) -> Result<JobOutcome> {
+        HostAgent::resume_job(self, signal).await
     }
 }
 

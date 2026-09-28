@@ -11,8 +11,9 @@ use tokio::sync::broadcast;
 
 use crate::{
     AccessLease, ExecRequest, ExecResponse, FileInfo, FileReadResponse, FileWriteRequest,
-    LeaseAction, LeaseScope, PortForwardEndpoint, PortForwardRequest, PortForwardResponse, Result,
-    SandboxError, SandboxInfo, SandboxSpec, SshInfo, TaskEvent, TaskInfo, TaskRequest,
+    JobOutcome, JobPauseSignal, JobResumeSignal, LeaseAction, LeaseScope, PortForwardEndpoint,
+    PortForwardRequest, PortForwardResponse, Result, SandboxError, SandboxInfo, SandboxSpec,
+    SshInfo, TaskEvent, TaskInfo, TaskRequest,
 };
 
 /// Narrow control contract for lifecycle consumers.
@@ -187,6 +188,23 @@ pub trait SandboxService: Send + Sync {
     async fn resume(&self, _id: &str) -> Result<()> {
         Err(SandboxError::NotImplemented(
             "resume is not implemented by this service",
+        ))
+    }
+
+    /// Pauses a whole job with per-backend reclaim behind the suspend contract.
+    ///
+    /// The default fails closed so backends without job support cannot
+    /// silently accept a bulk pause.
+    async fn pause_job(&self, _signal: JobPauseSignal) -> Result<JobOutcome> {
+        Err(SandboxError::NotImplemented(
+            "job pause is not implemented by this service",
+        ))
+    }
+
+    /// Resumes a whole job with fresh authority behind the suspend contract.
+    async fn resume_job(&self, _signal: JobResumeSignal) -> Result<JobOutcome> {
+        Err(SandboxError::NotImplemented(
+            "job resume is not implemented by this service",
         ))
     }
 }

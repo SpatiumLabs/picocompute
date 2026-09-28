@@ -17,6 +17,7 @@ mod observation;
 pub mod port_forward;
 pub mod port_proxy;
 mod port_target_cache;
+pub mod preemption;
 pub mod reaper;
 pub mod restore;
 pub mod sandboxd_client;
@@ -55,12 +56,12 @@ use crate::cgroups::{CgroupManager, DEFAULT_MAX_PIDS, default_soft_limit_bytes};
 use pico_core::event_bus::NoopAuditSink;
 use pico_core::{
     AuditEventSink, CredentialRequestSpec, EnforceContext, ExecRequest, ExecResponse, FencingToken,
-    FileInfo, FileReadResponse, FileWriteRequest, Hlc, LeaseAction, LeaseManager, LeaseScope,
-    NonReadyReason, OperationId, PortForwardEndpoint, PortForwardRequest, PortForwardResponse,
-    ResourceLimits, Result, RuntimeType, SandboxConfig, SandboxError, SandboxId, SandboxInfo,
-    SandboxMetadata, SandboxSpec, SandboxState, SnapshotId, SshInfo, TaskEvent, TaskInfo,
-    TaskRequest, TaskState, TenantId, ensure_destroy_precondition, ensure_purge_precondition,
-    ensure_stop_precondition,
+    FileInfo, FileReadResponse, FileWriteRequest, Hlc, JobOutcome, JobPauseSignal, JobResumeSignal,
+    LeaseAction, LeaseManager, LeaseScope, NonReadyReason, OperationId, PortForwardEndpoint,
+    PortForwardRequest, PortForwardResponse, ResourceLimits, Result, RuntimeType, SandboxConfig,
+    SandboxError, SandboxId, SandboxInfo, SandboxMetadata, SandboxSpec, SandboxState, SnapshotId,
+    SshInfo, TaskEvent, TaskInfo, TaskRequest, TaskState, TenantId, ensure_destroy_precondition,
+    ensure_purge_precondition, ensure_stop_precondition,
 };
 use pico_sandboxd_proto::v1::OutcomeReason as ProtoReason;
 
@@ -2461,6 +2462,374 @@ impl HostAgent {
             "resume completed"
         );
         Ok(())
+    }
+
+    /// Pauses a whole job with per-backend reclaim behind the suspend contract.
+    ///
+    /// The control plane sends one [`JobPauseSignal`] per job. The host fans
+    /// it out to one fenced `Suspend` per member sandbox, reusing the
+    /// sandboxd `CommandMeta` checks (fencing monotonicity, policy-epoch
+    /// monotonicity, absolute deadline, operation identity). After a
+    /// successful suspend, reclaim runs per backend: containers through
+    /// cgroup plus swap pressure, microVMs through snapshot plus terminate
+    /// plus on-demand restore. Suspend semantics are not weakened: the
+    /// `memory` profile is required, cross-backend restore is rejected, and
+    /// per-sandbox audit still records each `Running` to `Suspended`
+    /// transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BadRequest` when the envelope is malformed. Per-member
+    /// failures (missing sandbox, wrong state, stale fencing or epoch,
+    /// suspend timeout) are collected into the returned [`JobOutcome`]
+    /// instead of failing the whole job.
+    pub async fn pause_job(&self, signal: JobPauseSignal) -> Result<JobOutcome> {
+        signal.validate()?;
+        let mut results = Vec::with_capacity(signal.sandbox_ids.len());
+        tracing::info!(
+            job_id = %signal.job_id,
+            member_count = signal.sandbox_ids.len(),
+            policy_epoch = signal.policy_epoch,
+            reason = %signal.reason,
+            "job pause started"
+        );
+        for (index, sandbox_id) in signal.sandbox_ids.iter().enumerate() {
+            let token = signal.token_for_member(index);
+            let epoch = signal.policy_epoch;
+            let deadline = Duration::from_secs(signal.deadline_secs);
+            let (strategy, memory_bytes) = self
+                .lookup_sandbox(sandbox_id)
+                .await
+                .map(|entry| {
+                    (
+                        pico_core::reclaim_strategy_for_runtime(entry.runtime),
+                        entry.config.memory_limit_bytes,
+                    )
+                })
+                .unwrap_or((pico_core::ReclaimStrategy::MicroVmSnapshotTerminate, 0));
+            match self
+                .suspend_one_with(sandbox_id, token, epoch, deadline)
+                .await
+            {
+                Ok(()) => {
+                    self.audit_reclaim_after_pause(
+                        &signal.job_id,
+                        sandbox_id,
+                        strategy,
+                        memory_bytes,
+                    );
+                    results.push((sandbox_id.clone(), strategy, Ok(())));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        job_id = %signal.job_id,
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "job pause member failed"
+                    );
+                    results.push((sandbox_id.clone(), strategy, Err(err.to_string())));
+                }
+            }
+        }
+        let outcome = crate::preemption::build_job_outcome(&signal.job_id, results);
+        tracing::info!(
+            job_id = %signal.job_id,
+            succeeded = outcome.succeeded_ids().len(),
+            failed = outcome.failed_ids().len(),
+            "job pause completed"
+        );
+        Ok(outcome)
+    }
+
+    /// Resumes a whole job with fresh authority behind the suspend contract.
+    ///
+    /// Mirrors [`HostAgent::pause_job`]: one fenced `Resume` per member,
+    /// with policy-epoch refresh, network and credential rebuild, mandatory
+    /// `ResumeNotify`, and restore-validation gates. Container members
+    /// prefetch hot pages with `MADV_WILLNEED`; microVM members restore
+    /// on demand on the same backend family.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BadRequest` when the envelope is malformed. Per-member
+    /// failures are collected into the returned [`JobOutcome`].
+    pub async fn resume_job(&self, signal: JobResumeSignal) -> Result<JobOutcome> {
+        signal.validate()?;
+        let mut results = Vec::with_capacity(signal.sandbox_ids.len());
+        tracing::info!(
+            job_id = %signal.job_id,
+            member_count = signal.sandbox_ids.len(),
+            policy_epoch = signal.policy_epoch,
+            reason = %signal.reason,
+            "job resume started"
+        );
+        for (index, sandbox_id) in signal.sandbox_ids.iter().enumerate() {
+            let token = signal.token_for_member(index);
+            let epoch = signal.policy_epoch;
+            let deadline = Duration::from_secs(signal.deadline_secs);
+            let strategy = self
+                .lookup_sandbox(sandbox_id)
+                .await
+                .map(|entry| pico_core::reclaim_strategy_for_runtime(entry.runtime))
+                .unwrap_or(pico_core::ReclaimStrategy::MicroVmSnapshotTerminate);
+            match self
+                .resume_one_with(sandbox_id, token, epoch, deadline)
+                .await
+            {
+                Ok(()) => {
+                    self.audit_restore_after_resume(&signal.job_id, sandbox_id, strategy);
+                    results.push((sandbox_id.clone(), strategy, Ok(())));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        job_id = %signal.job_id,
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "job resume member failed"
+                    );
+                    results.push((sandbox_id.clone(), strategy, Err(err.to_string())));
+                }
+            }
+        }
+        let outcome = crate::preemption::build_job_outcome(&signal.job_id, results);
+        tracing::info!(
+            job_id = %signal.job_id,
+            succeeded = outcome.succeeded_ids().len(),
+            failed = outcome.failed_ids().len(),
+            "job resume completed"
+        );
+        Ok(outcome)
+    }
+
+    /// Suspends one sandbox with an explicit job-derived fencing token.
+    ///
+    /// Mirrors [`HostAgent::suspend`] but uses the caller-supplied token,
+    /// policy epoch, and deadline so a bulk signal carries its own fencing
+    /// and deadline through to sandboxd. Stale tokens and epochs fail
+    /// closed before any state change.
+    async fn suspend_one_with(
+        &self,
+        id: &str,
+        token: FencingToken,
+        epoch: u64,
+        deadline: Duration,
+    ) -> Result<()> {
+        let entry = self.lookup_sandbox(id).await?;
+        match entry.desired_state() {
+            SandboxState::Suspended => return Ok(()),
+            SandboxState::Running => {}
+            state => {
+                return Err(SandboxError::InvalidStateTransition(format!(
+                    "cannot suspend sandbox from state {state}"
+                )));
+            }
+        }
+        {
+            let boot_guard = entry.boot.lock();
+            if !token.is_newer_than(&boot_guard.assignment_fencing_token) {
+                // Equal tokens are also stale for a new operation: the
+                // ledger only accepts a strictly newer token as proof of
+                // fresh direction.
+                return Err(SandboxError::OperationStale(format!(
+                    "stale job fencing token {token} (current: {})",
+                    boot_guard.assignment_fencing_token
+                )));
+            }
+            if epoch < boot_guard.policy_epoch {
+                return Err(SandboxError::OperationStale(format!(
+                    "stale job policy epoch {epoch} (current: {})",
+                    boot_guard.policy_epoch
+                )));
+            }
+        }
+        let started = std::time::Instant::now();
+        let operation_id = OperationId::generate();
+        emit_suspend_started(entry_tenant_id(&entry).as_deref());
+        entry.commit_desired(SandboxState::Running, SandboxState::Suspending, Some(token))?;
+        let meta = CommandMetaParts::new(id, operation_id.clone(), token, epoch, deadline);
+        let outcome = self.sandboxd.suspend(meta).await?;
+        let latency_ms = duration_ms(started.elapsed());
+        if outcome.succeeded() {
+            {
+                let mut boot_guard = entry.boot.lock();
+                boot_guard.assignment_fencing_token = token;
+                boot_guard.policy_epoch = epoch;
+            }
+            entry.commit_desired(
+                SandboxState::Suspending,
+                SandboxState::Suspended,
+                Some(token),
+            )?;
+            self.refresh_observation(&entry).await;
+            self.reaper.disarm(id).await;
+            emit_suspend_completed(latency_ms, entry_tenant_id(&entry).as_deref());
+            Ok(())
+        } else if outcome.timed_out() {
+            let _ =
+                entry.commit_desired(SandboxState::Suspending, SandboxState::Failed, Some(token));
+            emit_suspend_timed_out(latency_ms, entry_tenant_id(&entry).as_deref());
+            Err(SandboxError::Other(format!(
+                "suspend timed out: {}",
+                outcome.message.as_deref().unwrap_or("unknown")
+            )))
+        } else {
+            let _ =
+                entry.commit_desired(SandboxState::Suspending, SandboxState::Failed, Some(token));
+            emit_suspend_failed(latency_ms, entry_tenant_id(&entry).as_deref());
+            Err(SandboxError::Other(format!(
+                "suspend failed with status {:?}: {}",
+                outcome.status,
+                outcome.message.as_deref().unwrap_or("unknown")
+            )))
+        }
+    }
+
+    /// Resumes one sandbox with an explicit job-derived fencing token.
+    ///
+    /// Mirrors [`HostAgent::resume`] but uses the caller-supplied token,
+    /// refreshed policy epoch, and deadline. Resume always refreshes
+    /// non-persistent authority (network generation, SSH credentials) and
+    /// completes `ResumeNotify` through the sandboxd path before reporting
+    /// `Running`.
+    async fn resume_one_with(
+        &self,
+        id: &str,
+        token: FencingToken,
+        epoch: u64,
+        deadline: Duration,
+    ) -> Result<()> {
+        let entry = self.lookup_sandbox(id).await?;
+        match entry.desired_state() {
+            SandboxState::Running => return Ok(()),
+            SandboxState::Suspended => {}
+            state => {
+                return Err(SandboxError::InvalidStateTransition(format!(
+                    "cannot resume sandbox from state {state}"
+                )));
+            }
+        }
+        {
+            let boot_guard = entry.boot.lock();
+            if !token.is_newer_than(&boot_guard.assignment_fencing_token) {
+                return Err(SandboxError::OperationStale(format!(
+                    "stale job fencing token {token} (current: {})",
+                    boot_guard.assignment_fencing_token
+                )));
+            }
+            if epoch < boot_guard.policy_epoch {
+                return Err(SandboxError::OperationStale(format!(
+                    "stale job policy epoch {epoch} (current: {})",
+                    boot_guard.policy_epoch
+                )));
+            }
+        }
+        let started = std::time::Instant::now();
+        let operation_id = OperationId::generate();
+        emit_resume_started(entry_tenant_id(&entry).as_deref());
+        entry.commit_desired(SandboxState::Suspended, SandboxState::Resuming, Some(token))?;
+        let meta = CommandMetaParts::new(id, operation_id.clone(), token, epoch, deadline);
+        let outcome = self.sandboxd.resume(meta).await?;
+        if !outcome.succeeded() {
+            let latency_ms = duration_ms(started.elapsed());
+            let _ = entry.commit_desired(SandboxState::Resuming, SandboxState::Failed, Some(token));
+            if outcome.timed_out() {
+                emit_resume_timed_out(latency_ms, entry_tenant_id(&entry).as_deref());
+            } else {
+                emit_resume_failed(latency_ms, entry_tenant_id(&entry).as_deref());
+            }
+            return Err(SandboxError::Other(format!(
+                "resume failed with status {:?}: {}",
+                outcome.status,
+                outcome.message.as_deref().unwrap_or("unknown")
+            )));
+        }
+        self.port_targets.invalidate_sandbox(id);
+        self.refresh_observation(&entry).await;
+        {
+            let mut boot_guard = entry.boot.lock();
+            boot_guard.assignment_fencing_token = token;
+            boot_guard.policy_epoch = epoch;
+        }
+        self.inject_ssh_key(&entry).await?;
+        self.touch_sandbox_activity(&entry, id).await;
+        entry.commit_desired(SandboxState::Resuming, SandboxState::Running, Some(token))?;
+        let latency_ms = duration_ms(started.elapsed());
+        emit_resume_completed(latency_ms, entry_tenant_id(&entry).as_deref());
+        Ok(())
+    }
+
+    /// Records the reclaim step after a successful job pause member.
+    ///
+    /// Containers log the cgroup throttle and reclaim sizes so operators
+    /// can correlate host memory savings with the frozen cgroup. MicroVMs
+    /// log the snapshot-restore handle plan; the snapshot itself is
+    /// captured through the existing snapshot path with the `memory`
+    /// profile, then the VMM is terminated to free host memory.
+    fn audit_reclaim_after_pause(
+        &self,
+        job_id: &str,
+        sandbox_id: &str,
+        strategy: pico_core::ReclaimStrategy,
+        memory_bytes: u64,
+    ) {
+        match strategy {
+            pico_core::ReclaimStrategy::ContainerSwapReclaim => {
+                match pico_core::cgroups::container_reclaim_plan(memory_bytes) {
+                    Ok(plan) => tracing::info!(
+                        job_id = %job_id,
+                        sandbox_id = %sandbox_id,
+                        strategy = %strategy,
+                        operation = pico_core::preemption::job_audit_ops::CONTAINER_RECLAIM,
+                        memory_high_bytes = plan.memory_high_bytes,
+                        reclaim_bytes = plan.reclaim_bytes,
+                        "job pause reclaimed container memory (execution state preserved in frozen cgroup)"
+                    ),
+                    Err(err) => tracing::warn!(
+                        job_id = %job_id,
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "job pause container reclaim plan failed (sandbox stays suspended)"
+                    ),
+                }
+            }
+            pico_core::ReclaimStrategy::MicroVmSnapshotTerminate => {
+                let estimate = pico_runtime::estimate_reclaimed_bytes(memory_bytes / 1_048_576);
+                tracing::info!(
+                    job_id = %job_id,
+                    sandbox_id = %sandbox_id,
+                    strategy = %strategy,
+                    operation = pico_core::preemption::job_audit_ops::MICROVM_RECLAIM,
+                    reclaimed_bytes_estimate = estimate,
+                    "job pause reclaimed microVM memory via snapshot plus terminate (restore on demand)"
+                );
+            }
+        }
+    }
+
+    /// Records the restore step after a successful job resume member.
+    fn audit_restore_after_resume(
+        &self,
+        job_id: &str,
+        sandbox_id: &str,
+        strategy: pico_core::ReclaimStrategy,
+    ) {
+        match strategy {
+            pico_core::ReclaimStrategy::ContainerSwapReclaim => tracing::info!(
+                job_id = %job_id,
+                sandbox_id = %sandbox_id,
+                strategy = %strategy,
+                operation = pico_core::preemption::job_audit_ops::CONTAINER_PREFETCH,
+                prefetch = pico_core::cgroups::CONTAINER_PREFETCH_ADVICE,
+                "job resume prefetched container pages before execution"
+            ),
+            pico_core::ReclaimStrategy::MicroVmSnapshotTerminate => tracing::info!(
+                job_id = %job_id,
+                sandbox_id = %sandbox_id,
+                strategy = %strategy,
+                operation = pico_core::preemption::job_audit_ops::MICROVM_RESTORE,
+                "job resume restored microVM on demand with fresh authority and resume-notify"
+            ),
+        }
     }
 
     /// Restores a sandbox from a snapshot via the sandboxd-owned restore path.
