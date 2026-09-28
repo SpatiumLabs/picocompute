@@ -2,8 +2,12 @@ pub mod anomaly;
 pub mod ebpf;
 pub mod error;
 pub mod fim;
+pub mod guest_paths;
 pub mod identity;
+pub mod ioctl_policy;
 pub mod namespaces;
+pub mod output_quota;
+pub mod proc_policy;
 pub mod telemetry;
 
 pub use anomaly::{
@@ -15,8 +19,12 @@ pub use fim::{
     FileIntegrityChecker, FimAlert, FimHook, FimMode, FimOperation, FimProcessInfo, FimStats,
     IntegrityBaseline, open_flags_write_intent,
 };
+pub use guest_paths::{GuestHostOwnedBaseline, is_host_owned};
 pub use identity::no_new_privs;
+pub use ioctl_policy::{DeniedIoctlClass, denied_class, is_allowed as ioctl_is_allowed};
 pub use namespaces::{NamespaceConfig, unshare_namespaces};
+pub use output_quota::{OutputQuota, QuotaDecision};
+pub use proc_policy::{ProcPolicyError, validate_proc_read};
 
 pub fn init() {
     tracing::info!("pico-runtime-hardening library initialized");

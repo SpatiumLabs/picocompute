@@ -48,6 +48,7 @@ pub mod identity;
 pub mod interface_stats;
 pub mod lifecycle;
 pub mod metrics;
+pub mod mirror_policy;
 pub mod nat;
 pub mod netlink;
 pub mod nftables;
