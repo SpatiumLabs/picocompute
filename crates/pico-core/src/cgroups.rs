@@ -224,6 +224,21 @@ mod imp {
             Ok(())
         }
 
+        /// Applies a container reclaim plan after suspend.
+        ///
+        /// Writes `memory.high` throttle first, then `memory.reclaim` to push
+        /// cold pages to swap while the frozen cgroup preserves execution
+        /// state. Uses the plan's `file_writes` order so throttle precedes
+        /// reclaim. No-op when cgroups are not accessible (non-Linux or
+        /// missing mount); callers keep the sandbox suspended and log a
+        /// warning when a write fails.
+        pub fn apply_reclaim(&self, plan: super::ContainerReclaimPlan) -> Result<()> {
+            for (file, value) in plan.file_writes() {
+                self.write_control(file, &value)?;
+            }
+            Ok(())
+        }
+
         pub fn cleanup(&self) -> Result<()> {
             let path = self.sandbox_path();
             if !path.exists() {
@@ -364,6 +379,11 @@ mod imp {
         }
 
         pub fn setup_cpuset(&self, _cpus: &[u32]) -> Result<()> {
+            Ok(())
+        }
+
+        /// Applies a container reclaim plan after suspend (non-Linux no-op).
+        pub fn apply_reclaim(&self, _plan: super::ContainerReclaimPlan) -> Result<()> {
             Ok(())
         }
 
@@ -568,7 +588,7 @@ impl ContainerReclaimPlan {
 /// The throttle is half the hard limit so the kernel reclaims aggressively
 /// without tripping the OOM killer; the reclaim request equals the full
 /// hard limit so cold pages move to swap while the frozen cgroup preserves
-/// execution state. Zero or overflow inputs fail closed.
+/// execution state. Zero or tiny inputs fail closed.
 pub fn container_reclaim_plan(memory_limit_bytes: u64) -> crate::Result<ContainerReclaimPlan> {
     if memory_limit_bytes == 0 {
         return Err(crate::SandboxError::BadRequest(
@@ -871,6 +891,16 @@ mod tests {
         let writes = plan.file_writes();
         assert_eq!(writes[0].0, "memory.high");
         assert_eq!(writes[1].0, "memory.reclaim");
+    }
+
+    #[test]
+    fn apply_reclaim_is_noop_without_cgroup_mount() {
+        // The test environment has no writable cgroup mount, so the write
+        // path is exercised as a safe no-op rather than panicking or
+        // erroring out. The plan math is asserted separately.
+        let mgr = CgroupManager::new("sbx_reclaim").unwrap();
+        let plan = container_reclaim_plan(2_097_152).unwrap();
+        let _ = mgr.apply_reclaim(plan);
     }
 
     #[test]

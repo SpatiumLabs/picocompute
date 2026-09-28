@@ -81,6 +81,11 @@ pub enum ReclaimStrategy {
     ContainerSwapReclaim,
     /// MicroVM path: snapshot plus terminate plus on-demand restore.
     MicroVmSnapshotTerminate,
+    /// Fallback for missing sandboxes where the runtime is unknown.
+    ///
+    /// Used only in job outcomes when the member lookup fails before the
+    /// runtime is known, so the outcome does not misattribute a strategy.
+    Unknown,
 }
 
 impl ReclaimStrategy {
@@ -90,6 +95,7 @@ impl ReclaimStrategy {
         match self {
             Self::ContainerSwapReclaim => "container_swap_reclaim",
             Self::MicroVmSnapshotTerminate => "microvm_snapshot_terminate",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -115,6 +121,29 @@ pub fn reclaim_strategy_for_runtime(runtime: RuntimeType) -> ReclaimStrategy {
     }
 }
 
+/// Validates a tenant identifier for job scoping.
+///
+/// Jobs are single-tenant: all members must belong to the signal tenant
+/// when the signal carries one. Tenant ids use `tnt_` plus ASCII
+/// alphanumerics and `_`.
+pub fn validate_job_tenant_id(id: &str) -> Result<()> {
+    if id.contains("..") || id.contains('/') || id.contains('\\') {
+        return Err(SandboxError::PathEscape(id.into()));
+    }
+    let Some(suffix) = id.strip_prefix("tnt_") else {
+        return Err(SandboxError::BadRequest(format!("invalid tenant id: {id}")));
+    };
+    if suffix.is_empty()
+        || suffix.len() > 96
+        || !suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(SandboxError::BadRequest(format!("invalid tenant id: {id}")));
+    }
+    Ok(())
+}
+
 /// Job-scoped pause signal from the control plane to a host.
 ///
 /// The host fans this out to one fenced `Suspend` per member sandbox. Each
@@ -131,13 +160,27 @@ pub struct JobPauseSignal {
     pub fencing_token: FencingToken,
     /// Current policy epoch at the control plane.
     pub policy_epoch: u64,
-    /// Per-sandbox deadline in seconds (1..=300).
+    /// Per-sandbox deadline in seconds. Zero means `DEFAULT_JOB_DEADLINE_SECS`.
+    #[serde(default)]
     pub deadline_secs: u64,
     /// Operator-visible reason (e.g. `preemptible-reclaim`).
     pub reason: String,
+    /// Optional tenant scope. When present, every member must belong to it.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 impl JobPauseSignal {
+    /// Effective per-sandbox deadline, applying the default when zero.
+    #[must_use]
+    pub fn effective_deadline_secs(&self) -> u64 {
+        if self.deadline_secs == 0 {
+            DEFAULT_JOB_DEADLINE_SECS
+        } else {
+            self.deadline_secs
+        }
+    }
+
     /// Validates the envelope without touching host state.
     ///
     /// Fencing freshness against each member's ledger and policy-epoch
@@ -145,6 +188,9 @@ impl JobPauseSignal {
     /// malformed envelopes fail-closed before any side effect.
     pub fn validate(&self) -> Result<()> {
         validate_job_id(&self.job_id)?;
+        if let Some(ref tenant) = self.tenant_id {
+            validate_job_tenant_id(tenant)?;
+        }
         if self.sandbox_ids.is_empty() {
             return Err(SandboxError::BadRequest(
                 "job pause requires at least one sandbox".into(),
@@ -170,7 +216,9 @@ impl JobPauseSignal {
                 "job pause policy epoch must be non-zero".into(),
             ));
         }
-        if self.deadline_secs == 0 || self.deadline_secs > MAX_JOB_DEADLINE_SECS {
+        if self.effective_deadline_secs() == 0
+            || self.effective_deadline_secs() > MAX_JOB_DEADLINE_SECS
+        {
             return Err(SandboxError::BadRequest(format!(
                 "job pause deadline must be 1..={}s",
                 MAX_JOB_DEADLINE_SECS
@@ -216,16 +264,33 @@ pub struct JobResumeSignal {
     pub fencing_token: FencingToken,
     /// Current policy epoch at resume time (refresh, not restore).
     pub policy_epoch: u64,
-    /// Per-sandbox deadline in seconds (1..=300).
+    /// Per-sandbox deadline in seconds. Zero means `DEFAULT_JOB_DEADLINE_SECS`.
+    #[serde(default)]
     pub deadline_secs: u64,
     /// Operator-visible reason (e.g. `capacity-restored`).
     pub reason: String,
+    /// Optional tenant scope. When present, every member must belong to it.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 impl JobResumeSignal {
+    /// Effective per-sandbox deadline, applying the default when zero.
+    #[must_use]
+    pub fn effective_deadline_secs(&self) -> u64 {
+        if self.deadline_secs == 0 {
+            DEFAULT_JOB_DEADLINE_SECS
+        } else {
+            self.deadline_secs
+        }
+    }
+
     /// Validates the envelope without touching host state.
     pub fn validate(&self) -> Result<()> {
         validate_job_id(&self.job_id)?;
+        if let Some(ref tenant) = self.tenant_id {
+            validate_job_tenant_id(tenant)?;
+        }
         if self.sandbox_ids.is_empty() {
             return Err(SandboxError::BadRequest(
                 "job resume requires at least one sandbox".into(),
@@ -251,7 +316,9 @@ impl JobResumeSignal {
                 "job resume policy epoch must be non-zero".into(),
             ));
         }
-        if self.deadline_secs == 0 || self.deadline_secs > MAX_JOB_DEADLINE_SECS {
+        if self.effective_deadline_secs() == 0
+            || self.effective_deadline_secs() > MAX_JOB_DEADLINE_SECS
+        {
             return Err(SandboxError::BadRequest(format!(
                 "job resume deadline must be 1..={}s",
                 MAX_JOB_DEADLINE_SECS
@@ -287,6 +354,13 @@ pub struct JobMemberOutcome {
     pub strategy: ReclaimStrategy,
     /// Human-readable detail (empty on success).
     pub message: String,
+    /// MicroVM snapshot id for reclaim plus restore correlation.
+    ///
+    /// Present only for microVM pause members where a reclaim handle was
+    /// planned. Absent for containers, unknown runtimes, and failures
+    /// before planning.
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
 }
 
 /// Aggregate outcome of a job pause or resume.
@@ -424,6 +498,7 @@ mod tests {
             policy_epoch: 7,
             deadline_secs: 120,
             reason: "preemptible-reclaim".into(),
+            tenant_id: None,
         }
     }
 
@@ -438,6 +513,7 @@ mod tests {
             policy_epoch: 8,
             deadline_secs: 120,
             reason: "capacity-restored".into(),
+            tenant_id: None,
         }
     }
 
@@ -473,14 +549,25 @@ mod tests {
         let mut bad_epoch = pause_signal();
         bad_epoch.policy_epoch = 0;
         assert!(bad_epoch.validate().is_err());
+        let mut default_deadline = pause_signal();
+        default_deadline.deadline_secs = 0;
+        assert!(default_deadline.validate().is_ok());
+        assert_eq!(
+            default_deadline.effective_deadline_secs(),
+            DEFAULT_JOB_DEADLINE_SECS
+        );
         let mut bad_deadline = pause_signal();
-        bad_deadline.deadline_secs = 0;
-        assert!(bad_deadline.validate().is_err());
         bad_deadline.deadline_secs = MAX_JOB_DEADLINE_SECS + 1;
         assert!(bad_deadline.validate().is_err());
         let mut bad_reason = pause_signal();
         bad_reason.reason = "  ".into();
         assert!(bad_reason.validate().is_err());
+        let mut bad_tenant = pause_signal();
+        bad_tenant.tenant_id = Some("bad".into());
+        assert!(bad_tenant.validate().is_err());
+        let mut ok_tenant = pause_signal();
+        ok_tenant.tenant_id = Some("tnt_abc123".into());
+        assert!(ok_tenant.validate().is_ok());
     }
 
     #[test]
@@ -545,18 +632,25 @@ mod tests {
                     succeeded: true,
                     strategy: ReclaimStrategy::ContainerSwapReclaim,
                     message: String::new(),
+                    snapshot_id: None,
                 },
                 JobMemberOutcome {
                     sandbox_id: "sbx_b".into(),
                     succeeded: false,
                     strategy: ReclaimStrategy::MicroVmSnapshotTerminate,
                     message: "suspend timed out".into(),
+                    snapshot_id: None,
                 },
             ],
         };
         assert!(!outcome.all_succeeded());
         assert_eq!(outcome.succeeded_ids(), vec!["sbx_a"]);
         assert_eq!(outcome.failed_ids(), vec!["sbx_b"]);
+    }
+
+    #[test]
+    fn unknown_strategy_marks_missing_runtime() {
+        assert_eq!(ReclaimStrategy::Unknown.as_str(), "unknown");
     }
 
     #[test]

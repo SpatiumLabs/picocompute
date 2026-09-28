@@ -10,6 +10,10 @@ pattern that makes that safe: the rollout owner lives outside the
 preemptible pool, workers live inside it, and a job-scoped pause/resume
 signal coordinates reclaim behind the suspend contract.
 
+Jobs are single-tenant. A bulk signal whose members span tenants, or
+whose `tenant_id` does not match a member's tenant, fails closed before
+any pause or resume side effect.
+
 ## Topology
 
 ```text
@@ -42,10 +46,14 @@ when capacity returns.
 3. Suspend follows the standard contract: operation fence, exec drain,
    cooperative quiesce, workspace freeze, `memory` profile capture.
 4. Reclaim runs per backend after suspend succeeds:
-   - containers: pause plus swap plus `memory.reclaim` with frozen cgroup
-     preserving execution state, `MADV_WILLNEED` prefetch on resume.
-   - microVMs: snapshot plus terminate plus on-demand restore on the same
-     backend family.
+   - containers: `memory.high` throttle plus `memory.reclaim` written to
+     the sandbox cgroup, with the frozen cgroup preserving execution
+     state and `MADV_WILLNEED` prefetch on resume.
+   - microVMs: a `memory`-profile reclaim handle is planned and validated
+     (same backend, no cross-backend restore), the snapshot id is
+     reported in the outcome, and the paused VMM gets the same cgroup
+     pressure relief. Terminate plus on-demand restore is driven by the
+     snapshot path for the recorded snapshot id.
 5. Per-sandbox audit records each `Running` to `Suspended` transition with
    the job envelope (`job.pause`, `job.reclaim_container` or
    `job.reclaim_microvm`) for correlation.
@@ -78,6 +86,9 @@ when capacity returns.
 ## Failure handling
 
 - Malformed envelopes fail closed before any side effect.
+- Mixed-tenant member sets, or a signal tenant that does not match a
+  member, fail the whole job with `BadRequest` before any pause or
+  resume runs. Jobs are single-tenant.
 - Stale fencing tokens or policy epochs fail per member with
   `OperationStale`; other members still proceed and the outcome reports
   per-sandbox success plus failure detail.
@@ -86,6 +97,10 @@ when capacity returns.
   members that already transitioned.
 - Partial reclaim (cgroup write failure, missing snapshot) leaves the
   sandbox suspended with a warning audit; execution state stays preserved.
+- Reclaim runs sequentially per member to keep sandboxd load bounded.
+  Worst-case wall time is `members * member deadline`, so the control
+  plane should chunk large jobs rather than sending one envelope with
+  the full member list.
 
 ## API
 
@@ -93,3 +108,8 @@ when capacity returns.
 - `POST /v1/jobs/{job_id}/resume` with `JobResumeSignal` returns `JobOutcome`.
 - Both routes require bearer auth and pass the existing suspend/resume
   policy gates.
+- Response status is `200` when every member succeeded and `207` when any
+  member failed, so a status-only caller cannot mistake a partial
+  application for success. `deadline_secs: 0` means the default budget.
+- Both envelopes accept an optional `tenant_id` used for the single-tenant
+  scope check.

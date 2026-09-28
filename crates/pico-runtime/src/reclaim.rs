@@ -123,7 +123,7 @@ impl ContainerReclaimHandle {
             ));
         }
         let plan = pico_core::cgroups::container_reclaim_plan(memory_limit_bytes)
-            .map_err(|err| ReclaimError::Contract(err.to_string()))?;
+            .map_err(|err| ReclaimError::InvalidHandle(err.to_string()))?;
         Ok(Self {
             sandbox_id: sandbox_id.to_string(),
             memory_high_bytes: plan.memory_high_bytes,

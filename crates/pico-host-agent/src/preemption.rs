@@ -35,7 +35,7 @@ impl MemberCommand {
         Self {
             token: signal.token_for_member(index),
             policy_epoch: signal.policy_epoch,
-            deadline: Duration::from_secs(signal.deadline_secs),
+            deadline: Duration::from_secs(signal.effective_deadline_secs()),
         }
     }
 
@@ -44,22 +44,25 @@ impl MemberCommand {
         Self {
             token: signal.token_for_member(index),
             policy_epoch: signal.policy_epoch,
-            deadline: Duration::from_secs(signal.deadline_secs),
+            deadline: Duration::from_secs(signal.effective_deadline_secs()),
         }
     }
 }
+
+/// One member's fan-out result before aggregation.
+///
+/// The snapshot id is present only for microVM pause members where a
+/// reclaim handle was planned.
+pub type MemberResult = (String, ReclaimStrategy, Option<String>, Result<(), String>);
 
 /// Builds the aggregate outcome for a job fan-out.
 ///
 /// Members stay in request order so operators can correlate the job
 /// envelope with per-sandbox audit events.
-pub fn build_job_outcome(
-    job_id: &str,
-    results: Vec<(String, ReclaimStrategy, Result<(), String>)>,
-) -> JobOutcome {
+pub fn build_job_outcome(job_id: &str, results: Vec<MemberResult>) -> JobOutcome {
     let members = results
         .into_iter()
-        .map(|(sandbox_id, strategy, result)| {
+        .map(|(sandbox_id, strategy, snapshot_id, result)| {
             let (succeeded, message) = match result {
                 Ok(()) => (true, String::new()),
                 Err(message) => (false, message),
@@ -69,6 +72,7 @@ pub fn build_job_outcome(
                 succeeded,
                 strategy,
                 message,
+                snapshot_id,
             }
         })
         .collect();
@@ -127,6 +131,7 @@ mod tests {
             policy_epoch: 5,
             deadline_secs: 120,
             reason: "preemptible-reclaim".into(),
+            tenant_id: None,
         }
     }
 
@@ -141,6 +146,7 @@ mod tests {
             policy_epoch: 6,
             deadline_secs: 120,
             reason: "capacity-restored".into(),
+            tenant_id: None,
         }
     }
 
@@ -169,11 +175,13 @@ mod tests {
                 (
                     "sbx_aaa111".into(),
                     ReclaimStrategy::ContainerSwapReclaim,
+                    None,
                     Ok(()),
                 ),
                 (
                     "sbx_bbb222".into(),
                     ReclaimStrategy::MicroVmSnapshotTerminate,
+                    Some("snp_test123".into()),
                     Err("suspend timed out".into()),
                 ),
             ],

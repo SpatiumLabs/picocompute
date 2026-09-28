@@ -217,6 +217,63 @@ async fn suspend_and_resume_fail_closed_when_backend_is_unsupported() {
 }
 
 #[tokio::test]
+async fn job_routes_require_auth() {
+    for uri in ["/v1/jobs/job_x/pause", "/v1/jobs/job_x/resume"] {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn job_routes_fail_closed_when_backend_is_unsupported() {
+    for uri in ["/v1/jobs/job_x/pause", "/v1/jobs/job_x/resume"] {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", "Bearer secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"job_id":"job_x","sandbox_ids":["sbx_abc123"],"fencing_token":{"epoch":1,"sequence":1},"policy_epoch":1,"deadline_secs":60,"reason":"test"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+}
+
+#[tokio::test]
+async fn job_route_rejects_path_body_id_mismatch() {
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/jobs/job_path/pause")
+                .header("authorization", "Bearer secret")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"job_id":"job_body","sandbox_ids":["sbx_abc123"],"fencing_token":{"epoch":1,"sequence":1},"policy_epoch":1,"deadline_secs":60,"reason":"test"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn app_errors_are_returned_as_json() {
     let response = app()
         .oneshot(

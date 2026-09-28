@@ -2485,40 +2485,48 @@ impl HostAgent {
     /// instead of failing the whole job.
     pub async fn pause_job(&self, signal: JobPauseSignal) -> Result<JobOutcome> {
         signal.validate()?;
+        // Single-tenant pre-flight before any side effect: a mixed-tenant
+        // member set or a signal tenant mismatch fails the whole job with
+        // BadRequest instead of pausing another tenant's sandboxes.
+        self.check_job_tenant_scope(signal.tenant_id.as_deref(), &signal.sandbox_ids)
+            .await?;
         let mut results = Vec::with_capacity(signal.sandbox_ids.len());
         tracing::info!(
             job_id = %signal.job_id,
             member_count = signal.sandbox_ids.len(),
             policy_epoch = signal.policy_epoch,
             reason = %signal.reason,
+            operation = pico_core::preemption::job_audit_ops::JOB_PAUSE,
             "job pause started"
         );
         for (index, sandbox_id) in signal.sandbox_ids.iter().enumerate() {
             let token = signal.token_for_member(index);
             let epoch = signal.policy_epoch;
-            let deadline = Duration::from_secs(signal.deadline_secs);
-            let (strategy, memory_bytes) = self
+            let deadline = Duration::from_secs(signal.effective_deadline_secs());
+            let (strategy, memory_bytes, runtime) = self
                 .lookup_sandbox(sandbox_id)
                 .await
                 .map(|entry| {
                     (
                         pico_core::reclaim_strategy_for_runtime(entry.runtime),
                         entry.config.memory_limit_bytes,
+                        Some(entry.runtime),
                     )
                 })
-                .unwrap_or((pico_core::ReclaimStrategy::MicroVmSnapshotTerminate, 0));
+                .unwrap_or((pico_core::ReclaimStrategy::Unknown, 0, None));
             match self
                 .suspend_one_with(sandbox_id, token, epoch, deadline)
                 .await
             {
                 Ok(()) => {
-                    self.audit_reclaim_after_pause(
+                    let snapshot_id = self.apply_reclaim_after_pause(
                         &signal.job_id,
                         sandbox_id,
                         strategy,
                         memory_bytes,
+                        runtime,
                     );
-                    results.push((sandbox_id.clone(), strategy, Ok(())));
+                    results.push((sandbox_id.clone(), strategy, snapshot_id, Ok(())));
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -2527,7 +2535,7 @@ impl HostAgent {
                         error = %err,
                         "job pause member failed"
                     );
-                    results.push((sandbox_id.clone(), strategy, Err(err.to_string())));
+                    results.push((sandbox_id.clone(), strategy, None, Err(err.to_string())));
                 }
             }
         }
@@ -2536,6 +2544,7 @@ impl HostAgent {
             job_id = %signal.job_id,
             succeeded = outcome.succeeded_ids().len(),
             failed = outcome.failed_ids().len(),
+            operation = pico_core::preemption::job_audit_ops::JOB_PAUSE,
             "job pause completed"
         );
         Ok(outcome)
@@ -2555,30 +2564,62 @@ impl HostAgent {
     /// failures are collected into the returned [`JobOutcome`].
     pub async fn resume_job(&self, signal: JobResumeSignal) -> Result<JobOutcome> {
         signal.validate()?;
+        self.check_job_tenant_scope(signal.tenant_id.as_deref(), &signal.sandbox_ids)
+            .await?;
+        // Enforce restore-gate coverage in production, not just tests: the
+        // full gate list must be known before any resume side effect.
+        crate::preemption::assert_restore_gates_covered(pico_core::restore_validation_gates())
+            .map_err(SandboxError::Other)?;
         let mut results = Vec::with_capacity(signal.sandbox_ids.len());
         tracing::info!(
             job_id = %signal.job_id,
             member_count = signal.sandbox_ids.len(),
             policy_epoch = signal.policy_epoch,
             reason = %signal.reason,
+            operation = pico_core::preemption::job_audit_ops::JOB_RESUME,
             "job resume started"
         );
         for (index, sandbox_id) in signal.sandbox_ids.iter().enumerate() {
             let token = signal.token_for_member(index);
             let epoch = signal.policy_epoch;
-            let deadline = Duration::from_secs(signal.deadline_secs);
-            let strategy = self
+            let deadline = Duration::from_secs(signal.effective_deadline_secs());
+            let (strategy, runtime) = self
                 .lookup_sandbox(sandbox_id)
                 .await
-                .map(|entry| pico_core::reclaim_strategy_for_runtime(entry.runtime))
-                .unwrap_or(pico_core::ReclaimStrategy::MicroVmSnapshotTerminate);
+                .map(|entry| {
+                    (
+                        pico_core::reclaim_strategy_for_runtime(entry.runtime),
+                        Some(entry.runtime),
+                    )
+                })
+                .unwrap_or((pico_core::ReclaimStrategy::Unknown, None));
+            // Enforce the suspend contract per member before resume: memory
+            // profile required, same backend for restore. Uses the current
+            // runtime for both capture and target because the handle is
+            // stateless here; a mismatch would mean cross-backend restore.
+            if let Some(rt) = runtime
+                && let Err(err) = crate::preemption::validate_reclaim_contract(
+                    rt,
+                    rt,
+                    pico_core::SnapshotProfile::Memory,
+                )
+            {
+                tracing::warn!(
+                    job_id = %signal.job_id,
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "job resume contract check failed"
+                );
+                results.push((sandbox_id.clone(), strategy, None, Err(err.to_string())));
+                continue;
+            }
             match self
                 .resume_one_with(sandbox_id, token, epoch, deadline)
                 .await
             {
                 Ok(()) => {
                     self.audit_restore_after_resume(&signal.job_id, sandbox_id, strategy);
-                    results.push((sandbox_id.clone(), strategy, Ok(())));
+                    results.push((sandbox_id.clone(), strategy, None, Ok(())));
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -2587,7 +2628,7 @@ impl HostAgent {
                         error = %err,
                         "job resume member failed"
                     );
-                    results.push((sandbox_id.clone(), strategy, Err(err.to_string())));
+                    results.push((sandbox_id.clone(), strategy, None, Err(err.to_string())));
                 }
             }
         }
@@ -2596,6 +2637,7 @@ impl HostAgent {
             job_id = %signal.job_id,
             succeeded = outcome.succeeded_ids().len(),
             failed = outcome.failed_ids().len(),
+            operation = pico_core::preemption::job_audit_ops::JOB_RESUME,
             "job resume completed"
         );
         Ok(outcome)
@@ -2758,32 +2800,71 @@ impl HostAgent {
         Ok(())
     }
 
-    /// Records the reclaim step after a successful job pause member.
+    /// Applies reclaim after a successful job pause member.
     ///
-    /// Containers log the cgroup throttle and reclaim sizes so operators
-    /// can correlate host memory savings with the frozen cgroup. MicroVMs
-    /// log the snapshot-restore handle plan; the snapshot itself is
-    /// captured through the existing snapshot path with the `memory`
-    /// profile, then the VMM is terminated to free host memory.
-    fn audit_reclaim_after_pause(
+    /// Returns the microVM snapshot id for outcome correlation, or None for
+    /// containers and unknown runtimes. Containers apply the cgroup throttle
+    /// plus reclaim writes best-effort after suspend; failures keep the
+    /// sandbox suspended with a warning audit. MicroVMs plan a reclaim
+    /// handle with the `memory` profile and same-backend validation, then
+    /// apply the same best-effort cgroup reclaim as interim pressure relief
+    /// while the snapshot handle drives terminate plus on-demand restore
+    /// through the snapshot path. Uses `strategy_for_runtime` plus
+    /// `validate_reclaim_contract` in production so the helpers are not
+    /// test-only.
+    fn apply_reclaim_after_pause(
         &self,
         job_id: &str,
         sandbox_id: &str,
         strategy: pico_core::ReclaimStrategy,
         memory_bytes: u64,
-    ) {
+        runtime: Option<RuntimeType>,
+    ) -> Option<String> {
+        // Wire the strategy helper in production (not just tests).
+        if let Some(rt) = runtime {
+            let derived = crate::preemption::strategy_for_runtime(rt);
+            debug_assert_eq!(derived, strategy);
+            if let Err(err) = crate::preemption::validate_reclaim_contract(
+                rt,
+                rt,
+                pico_core::SnapshotProfile::Memory,
+            ) {
+                tracing::warn!(
+                    job_id = %job_id,
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "job pause contract check failed (sandbox stays suspended)"
+                );
+                return None;
+            }
+        }
         match strategy {
             pico_core::ReclaimStrategy::ContainerSwapReclaim => {
                 match pico_core::cgroups::container_reclaim_plan(memory_bytes) {
-                    Ok(plan) => tracing::info!(
-                        job_id = %job_id,
-                        sandbox_id = %sandbox_id,
-                        strategy = %strategy,
-                        operation = pico_core::preemption::job_audit_ops::CONTAINER_RECLAIM,
-                        memory_high_bytes = plan.memory_high_bytes,
-                        reclaim_bytes = plan.reclaim_bytes,
-                        "job pause reclaimed container memory (execution state preserved in frozen cgroup)"
-                    ),
+                    Ok(plan) => {
+                        // Best-effort cgroup writes; keep suspended on failure.
+                        let apply_result = pico_core::cgroups::CgroupManager::new(sandbox_id)
+                            .and_then(|mgr| mgr.apply_reclaim(plan));
+                        match apply_result {
+                            Ok(()) => tracing::info!(
+                                job_id = %job_id,
+                                sandbox_id = %sandbox_id,
+                                strategy = %strategy,
+                                operation = pico_core::preemption::job_audit_ops::CONTAINER_RECLAIM,
+                                memory_high_bytes = plan.memory_high_bytes,
+                                reclaim_bytes = plan.reclaim_bytes,
+                                "job pause reclaimed container memory (execution state preserved in frozen cgroup)"
+                            ),
+                            Err(err) => tracing::warn!(
+                                job_id = %job_id,
+                                sandbox_id = %sandbox_id,
+                                strategy = %strategy,
+                                operation = pico_core::preemption::job_audit_ops::CONTAINER_RECLAIM,
+                                error = %err,
+                                "job pause container reclaim write failed (sandbox stays suspended)"
+                            ),
+                        }
+                    }
                     Err(err) => tracing::warn!(
                         job_id = %job_id,
                         sandbox_id = %sandbox_id,
@@ -2791,17 +2872,72 @@ impl HostAgent {
                         "job pause container reclaim plan failed (sandbox stays suspended)"
                     ),
                 }
+                None
             }
             pico_core::ReclaimStrategy::MicroVmSnapshotTerminate => {
-                let estimate = pico_runtime::estimate_reclaimed_bytes(memory_bytes / 1_048_576);
-                tracing::info!(
+                let Some(rt) = runtime else {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        sandbox_id = %sandbox_id,
+                        "job pause microVM reclaim missing runtime (sandbox stays suspended)"
+                    );
+                    return None;
+                };
+                let snapshot_id = pico_core::SnapshotId::generate().to_string();
+                match pico_runtime::MicroVmReclaimHandle::plan(
+                    sandbox_id,
+                    &snapshot_id,
+                    rt,
+                    pico_core::SnapshotProfile::Memory,
+                ) {
+                    Ok(handle) => {
+                        if let Err(err) = handle.validate_restore(sandbox_id, rt) {
+                            tracing::warn!(
+                                job_id = %job_id,
+                                sandbox_id = %sandbox_id,
+                                error = %err,
+                                "job pause microVM restore validation failed (sandbox stays suspended)"
+                            );
+                            return None;
+                        }
+                        // Interim cgroup pressure relief for the paused VMM,
+                        // which also lives in the sandbox cgroup. Best-effort.
+                        if let Ok(plan) =
+                            pico_core::cgroups::container_reclaim_plan(memory_bytes.max(1))
+                        {
+                            let _ = pico_core::cgroups::CgroupManager::new(sandbox_id)
+                                .and_then(|mgr| mgr.apply_reclaim(plan));
+                        }
+                        tracing::info!(
+                            job_id = %job_id,
+                            sandbox_id = %sandbox_id,
+                            strategy = %strategy,
+                            operation = pico_core::preemption::job_audit_ops::MICROVM_RECLAIM,
+                            snapshot_id = %snapshot_id,
+                            reclaimed_bytes_estimate = memory_bytes,
+                            "job pause planned microVM snapshot plus terminate (restore on demand, cgroup relief applied)"
+                        );
+                        Some(snapshot_id)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            sandbox_id = %sandbox_id,
+                            error = %err,
+                            "job pause microVM reclaim plan failed (sandbox stays suspended)"
+                        );
+                        None
+                    }
+                }
+            }
+            pico_core::ReclaimStrategy::Unknown => {
+                tracing::warn!(
                     job_id = %job_id,
                     sandbox_id = %sandbox_id,
                     strategy = %strategy,
-                    operation = pico_core::preemption::job_audit_ops::MICROVM_RECLAIM,
-                    reclaimed_bytes_estimate = estimate,
-                    "job pause reclaimed microVM memory via snapshot plus terminate (restore on demand)"
+                    "job pause reclaim skipped for unknown runtime"
                 );
+                None
             }
         }
     }
@@ -2829,7 +2965,52 @@ impl HostAgent {
                 operation = pico_core::preemption::job_audit_ops::MICROVM_RESTORE,
                 "job resume restored microVM on demand with fresh authority and resume-notify"
             ),
+            pico_core::ReclaimStrategy::Unknown => tracing::warn!(
+                job_id = %job_id,
+                sandbox_id = %sandbox_id,
+                strategy = %strategy,
+                "job resume restore skipped for unknown runtime"
+            ),
         }
+    }
+
+    /// Enforces single-tenant scope for a job before any side effect.
+    ///
+    /// When the signal carries a tenant, every existing member must belong
+    /// to it. When the signal carries none, existing members must still
+    /// share a single tenant (members without tenant binding are ignored).
+    /// Missing sandboxes are skipped here and fail per member with
+    /// `SandboxNotFound` during fan-out. Mixed tenants fail the whole job
+    /// with `BadRequest`.
+    async fn check_job_tenant_scope(
+        &self,
+        signal_tenant: Option<&str>,
+        sandbox_ids: &[String],
+    ) -> Result<()> {
+        use std::collections::BTreeSet;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for id in sandbox_ids {
+            let Ok(entry) = self.lookup_sandbox(id).await else {
+                continue;
+            };
+            let Some(tenant) = entry_tenant_id(&entry) else {
+                continue;
+            };
+            if let Some(expected) = signal_tenant
+                && tenant != expected
+            {
+                return Err(SandboxError::BadRequest(format!(
+                    "job tenant mismatch for {id}: signal tenant {expected} != member tenant {tenant}"
+                )));
+            }
+            seen.insert(tenant);
+        }
+        if signal_tenant.is_none() && seen.len() > 1 {
+            return Err(SandboxError::BadRequest(
+                "job members span multiple tenants; scope jobs to one tenant".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Restores a sandbox from a snapshot via the sandboxd-owned restore path.

@@ -382,7 +382,10 @@ Expected operations:
 `PauseJob` and `ResumeJob` are job-scoped bulk signals. The control plane
 sends one envelope per job; the host fans out to one fenced `Suspend` or
 `Resume` per member sandbox with shared fencing, policy-epoch, and
-deadline handling. See
+deadline handling. Jobs are single-tenant: a mixed-tenant member set or a
+tenant mismatch fails the whole signal before any side effect. Bulk
+outcomes return `207` when any member fails, so a status-only caller
+cannot mistake a partial application for success. See
 [worker-container topology](docs/design/worker-container-topology.md).
 
 ### 5.3 Lifecycle state
