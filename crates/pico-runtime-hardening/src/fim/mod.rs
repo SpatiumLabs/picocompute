@@ -45,7 +45,7 @@
 //! checker.unregister_sandbox("sb-1");
 //! ```
 
-mod baseline;
+pub(crate) mod baseline;
 mod checker;
 mod types;
 

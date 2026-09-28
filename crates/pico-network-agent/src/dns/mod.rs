@@ -10,5 +10,7 @@ pub mod policy;
 pub mod resolver;
 pub mod server;
 
-pub use policy::{DnsAction, DnsDecision, DnsPatternType, DnsPolicy, DnsProxyConfig, DnsRule};
+pub use policy::{
+    DnsAction, DnsDecision, DnsPatternType, DnsPolicy, DnsProxyConfig, DnsRule, normalize_dns_name,
+};
 pub use server::{DnsAuditContext, DnsAuditSink, DnsProxy, NoopDnsAuditSink};

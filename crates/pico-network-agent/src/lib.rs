@@ -27,6 +27,8 @@
 //! - **lifecycle** -- network lifecycle semantics for suspend, resume, and
 //!   fork: policy epoch validation, identity independence, and
 //!   port-forwarding inheritance blocking.
+//! - **mirror_policy** -- package-mirror policy classes (PyPI/NPM/Go proxy)
+//!   via DNS proxy plus lease model, with dynamic per-stage updates.
 //! - **reconciliation** -- stale resource detection, safe cleanup, and
 //!   host health assessment after host-agent restart.
 //! - **error** -- `thiserror` error types.
@@ -48,6 +50,7 @@ pub mod identity;
 pub mod interface_stats;
 pub mod lifecycle;
 pub mod metrics;
+pub mod mirror_policy;
 pub mod nat;
 pub mod netlink;
 pub mod nftables;

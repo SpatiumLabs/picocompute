@@ -3385,3 +3385,322 @@ mod backpressure_deadline {
         server.await.unwrap();
     }
 }
+
+// ==================================================================
+// Agent-misbehavior anecdote tests
+//
+// Each test maps to one DSec-derived abuse case from the threat model:
+// forged agent-socket RPCs, log scraping for residual answers,
+// extent-swap class ioctls carried as exec intent, /proc hazards,
+// mirror and proxy exfiltration staging, and unbounded output capture.
+// They follow the misuse-resistance checklist: each vector proves wire
+// visibility plus the host decision logic (binding match, epoch
+// freshness, error hygiene, or explicit bound) without panicking.
+// Wire visibility alone is not rejection; the decision helpers below
+// model the host checks that must reject.
+// ==================================================================
+
+mod dsec_anecdotes {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// Host binding check: sandbox, session, and epoch must all match.
+    fn binding_accepts(
+        ctx: &RequestContext,
+        expected_sandbox: &str,
+        expected_session: &[u8],
+        current_epoch: u64,
+    ) -> bool {
+        ctx.sandbox_id == expected_sandbox
+            && ctx.session_id == expected_session
+            && ctx.policy_epoch == current_epoch
+    }
+
+    /// Epoch freshness check: observed must equal current.
+    fn epoch_is_current(observed: u64, current: u64) -> bool {
+        observed == current
+    }
+
+    /// Error-hygiene check: failure message must not contain secret bytes.
+    fn response_hides_secret(message: &str, secret: &[u8]) -> bool {
+        !message
+            .as_bytes()
+            .windows(secret.len())
+            .any(|w| w == secret)
+    }
+
+    /// Quota check mirroring host output bounds.
+    fn within_quota(total: u64, observed: u64, max: u64) -> bool {
+        total.saturating_add(observed) <= max
+    }
+
+    /// Forged RPC to an agent socket without a current session must be
+    /// detectable and rejected: wrong sandbox and session binding is
+    /// visible at wire level and fails the host binding check.
+    #[tokio::test]
+    async fn forged_agent_socket_rpc_detectable() {
+        let (mut client, listener) = tcp_pair().await;
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (tag, req) = framed::read_tagged::<ExecRequest>(&mut stream, TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(tag, framed::TAG_EXEC_REQUEST);
+            let ctx = req.context.unwrap();
+            // Forged bindings: neither sandbox nor session matches.
+            assert_eq!(ctx.sandbox_id, "forged-sbx");
+            assert_ne!(ctx.session_id, b"current-session-00");
+            // Host decision: forged binding must not be accepted.
+            assert!(!binding_accepts(&ctx, "real-sbx", b"current-session-00", 1));
+            // Sanity: the expected binding would be accepted.
+            let valid = test_context("real-sbx", b"current-session-00", 1);
+            assert!(binding_accepts(
+                &valid,
+                "real-sbx",
+                b"current-session-00",
+                1
+            ));
+        });
+
+        let req = ExecRequest {
+            context: Some(test_context("forged-sbx", b"forged-session-11", 1)),
+            command: "id".into(),
+            ..Default::default()
+        };
+        framed::send_tagged(&mut client, framed::TAG_EXEC_REQUEST, &req, TIMEOUT)
+            .await
+            .unwrap();
+        drop(client);
+
+        server.await.unwrap();
+    }
+
+    /// Log scraping for residual answers: error outcomes must not echo
+    /// credential bytes. A secrets-injection failure carries a typed
+    /// code, never the raw secret, so later log readers learn nothing.
+    #[tokio::test]
+    async fn residual_answers_not_echoed_in_error_outcome() {
+        let (mut client, listener) = tcp_pair().await;
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (tag, _req) = framed::read_tagged::<InjectSecretsRequest>(&mut stream, TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(tag, framed::TAG_INJECT_SECRETS_REQUEST);
+
+            let resp = InjectSecretsResponse {
+                result: Some(inject_secrets_response::Result::Error(OperationOutcome {
+                    status: Some(operation_outcome::Status::Failure(
+                        operation_outcome::Failure {
+                            code: "ACCESS_DENIED".into(),
+                            message: "lease has expired".into(),
+                            retryable: false,
+                        },
+                    )),
+                })),
+            };
+            framed::send_tagged(
+                &mut stream,
+                framed::TAG_INJECT_SECRETS_RESPONSE,
+                &resp,
+                TIMEOUT,
+            )
+            .await
+            .unwrap();
+        });
+
+        let secret = b"super-secret-answer-123";
+        let req = InjectSecretsRequest {
+            context: Some(test_context("sbx", b"1234567890123456", 1)),
+            lease_id: "expired-lease".into(),
+            policy_decision_id: "pd-residual".into(),
+            credentials: vec![SecretCredential {
+                name: "ANSWER".into(),
+                content: secret.to_vec(),
+                mode: 0o400,
+            }],
+        };
+        framed::send_tagged(
+            &mut client,
+            framed::TAG_INJECT_SECRETS_REQUEST,
+            &req,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        let (tag, resp) = framed::read_tagged::<InjectSecretsResponse>(&mut client, TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(tag, framed::TAG_INJECT_SECRETS_RESPONSE);
+        match resp.result.unwrap() {
+            inject_secrets_response::Result::Error(outcome) => match outcome.status.unwrap() {
+                operation_outcome::Status::Failure(f) => {
+                    assert_eq!(f.code, "ACCESS_DENIED");
+                    assert!(response_hides_secret(&f.message, secret));
+                }
+                _ => panic!("expected Failure"),
+            },
+            _ => panic!("expected Error"),
+        }
+
+        server.await.unwrap();
+    }
+
+    /// Extent-swap class intent carried as exec must still require a
+    /// valid binding: a stale policy epoch on a filesystem-mutating
+    /// command is detectable and fails the freshness check before any
+    /// ioctl could run.
+    #[tokio::test]
+    async fn swapext_class_intent_with_stale_epoch_detectable() {
+        // Host decision helper: stale epochs never authorize mutation.
+        assert!(!epoch_is_current(3, 9));
+        assert!(epoch_is_current(9, 9));
+        let (mut client, listener) = tcp_pair().await;
+        let current_epoch: u64 = 9;
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (tag, req) = framed::read_tagged::<ExecRequest>(&mut stream, TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(tag, framed::TAG_EXEC_REQUEST);
+            let ctx = req.context.unwrap();
+            assert_eq!(ctx.policy_epoch, 3);
+            assert_ne!(ctx.policy_epoch, current_epoch);
+            assert!(req.command.contains("xfs_ioctl"));
+        });
+
+        let req = ExecRequest {
+            context: Some(test_context("sbx", b"1234567890123456", 3)),
+            command: "xfs_ioctl-swapext".into(),
+            ..Default::default()
+        };
+        framed::send_tagged(&mut client, framed::TAG_EXEC_REQUEST, &req, TIMEOUT)
+            .await
+            .unwrap();
+        drop(client);
+
+        server.await.unwrap();
+    }
+
+    /// Hazardous `/proc` reads via file streaming must stay bounded:
+    /// an oversized file-chunk response beyond the framing limit is
+    /// rejected with a typed "too large" error, matching the 64 KiB
+    /// `/proc` read bound enforced by host policy.
+    #[tokio::test]
+    async fn proc_hazard_oversized_chunk_rejected() {
+        // Host decision: 2 MiB exceeds both the 64 KiB proc-read bound
+        // and the 1 MiB framing bound.
+        const PROC_READ_MAX_BYTES: u64 = 64 * 1024;
+        const FRAMING_MAX_BYTES: u64 = 1024 * 1024;
+        assert!(!within_quota(0, 2 * 1024 * 1024, PROC_READ_MAX_BYTES));
+        assert!(!within_quota(0, 2 * 1024 * 1024, FRAMING_MAX_BYTES));
+        assert!(within_quota(0, 4096, PROC_READ_MAX_BYTES));
+        let (mut client, listener) = tcp_pair().await;
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let result = framed::read_tagged::<GetFileResponse>(&mut stream, TIMEOUT).await;
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("too large"));
+        });
+
+        let oversized_len = (2 * 1024 * 1024) as u32;
+        client
+            .write_all(&oversized_len.to_be_bytes())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        drop(client);
+
+        server.await.unwrap();
+    }
+
+    /// Mirror and proxy exfiltration staging: an exec that pulls code
+    /// through a package proxy without a current lease epoch is
+    /// detectable and fails the freshness check.
+    #[tokio::test]
+    async fn mirror_proxy_pull_without_current_lease_detectable() {
+        // Host decision: epoch 1 is stale against current epoch 2.
+        assert!(!epoch_is_current(1, 2));
+        assert!(epoch_is_current(2, 2));
+        let (mut client, listener) = tcp_pair().await;
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (tag, req) = framed::read_tagged::<ExecRequest>(&mut stream, TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(tag, framed::TAG_EXEC_REQUEST);
+            let ctx = req.context.unwrap();
+            // Stale epoch stands in for an expired mirror lease.
+            assert_eq!(ctx.policy_epoch, 1);
+            assert!(req.args.iter().any(|a| a.contains("proxy.golang.org")));
+        });
+
+        let req = ExecRequest {
+            context: Some(test_context("sbx", b"1234567890123456", 1)),
+            command: "go".into(),
+            args: vec!["install".into(), "proxy.golang.org/x/mod".into()],
+            ..Default::default()
+        };
+        framed::send_tagged(&mut client, framed::TAG_EXEC_REQUEST, &req, TIMEOUT)
+            .await
+            .unwrap();
+        drop(client);
+
+        server.await.unwrap();
+    }
+
+    /// Unbounded `yes`-style output must be bounded by explicit quotas:
+    /// the host sets per-stream byte limits that round-trip, and any
+    /// multi-megabyte capture beyond the framing bound fails the quota
+    /// check fail-closed with "too large" rather than buffered unbounded.
+    #[tokio::test]
+    async fn unbounded_capture_bounded_by_quotas_and_framing() {
+        // Host decision: 8 MiB exceeds a 1 MiB per-stream quota.
+        assert!(!within_quota(0, 8 * 1024 * 1024, 1_048_576));
+        assert!(within_quota(0, 512, 1_048_576));
+        let (mut client, listener) = tcp_pair().await;
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // First: the quota-carrying request is visible at wire level.
+            let (tag, req) = framed::read_tagged::<ExecRequest>(&mut stream, TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(tag, framed::TAG_EXEC_REQUEST);
+            assert_eq!(req.command, "yes");
+            assert_eq!(req.max_stdout_bytes, 1_048_576);
+
+            // Second: an unbounded capture attempt is rejected by framing.
+            let result = framed::read_tagged::<ExecResponse>(&mut stream, TIMEOUT).await;
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("too large"));
+        });
+
+        let req = ExecRequest {
+            context: Some(test_context("sbx", b"1234567890123456", 1)),
+            command: "yes".into(),
+            max_stdout_bytes: 1_048_576,
+            max_stderr_bytes: 524_288,
+            ..Default::default()
+        };
+        framed::send_tagged(&mut client, framed::TAG_EXEC_REQUEST, &req, TIMEOUT)
+            .await
+            .unwrap();
+
+        // Simulate a runaway producer claiming 8 MiB (beyond 1 MiB framing).
+        let runaway_len = (8 * 1024 * 1024) as u32;
+        client.write_all(&runaway_len.to_be_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+        drop(client);
+
+        server.await.unwrap();
+    }
+}

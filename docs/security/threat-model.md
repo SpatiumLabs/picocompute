@@ -292,6 +292,13 @@ flowchart TD
 | Hide actions by damaging evidence | Drop, reorder, forge, redact incorrectly, or overwhelm audit and telemetry pipelines | R-09, R-15, R-20 |
 | Abuse operator authority | Use broad credentials, unsafe tooling, or an erroneous command to bypass policy, expose data, or destroy evidence | R-01, R-04, R-09, R-19 |
 | Infer co-tenant activity | Observe CPU, memory, cache, disk, network, snapshot, error, or telemetry behavior across shared resources | R-15 |
+| Forge RPCs to agent sockets | Send crafted RPCs to a guest agent Unix socket or vsock listener to invoke tools outside the authenticated host session | R-07, R-13, R-21 |
+| Scrape logs for residual answers | Read agent logs, console output, or retained tool results to recover answers or credentials from a prior operation | R-11, R-15, R-22 |
+| Overwrite system binaries | Replace `/bin/bash` or another image binary from workload code to persist control across execs | R-13, R-14, R-21 |
+| Abuse extent-swap class ioctls | Issue `SWAPEXT`-class or clone-range ioctls against a shared filesystem to corrupt or alias file extents | R-13, R-23 |
+| Probe pseudo-filesystem hazards | Read or grep hazardous `/proc` entries such as `kpagecgroup` to crash the kernel or leak kernel state | R-13, R-24 |
+| Pull code through mirrors and proxies | Fetch packages through PyPI/NPM/Go proxies, scan ports or mirrors, and exfiltrate data over an approved egress path | R-10, R-12, R-25 |
+| Flood output capture | Emit unbounded output such as `yes` to fill agent capture buffers with tens of GB and exhaust host resources | R-06, R-15, R-26 |
 
 ## Failure Modes and Effects Analysis
 
@@ -321,6 +328,12 @@ mean the risk remains launch-gated.
 | R-18 | Tampered or incompatible snapshot is restored, causing compromise, corruption, or stale authority | Storage attack, version drift, CPU/device mismatch, integrity-check bypass | Critical | Possible | High | Critical | Authenticated encryption, provenance, exact compatibility validation, fresh boot and protocol identity |,; Runtime and Security |
 | R-19 | Destroy leaves resources, credentials, routes, mappings, files, or identity reusable | Crash, partial cleanup, host loss, lost receipt, early success, manual intervention | Critical | Likely | Medium | Critical | Receipt-based cleanup, revoke first, absence proof, quarantine, reconciliation, delayed reuse |,; Runtime and Networking |
 | R-20 | Platform cannot safely continue or recover during dependency, host, regional, or organizational failure | Cascading retry, no rebuild path, stale runbook, unowned alert, capacity exhaustion | High | Possible | Medium | High | Load shedding, drain, quarantine, bounded retry, backups, rebuild, runbooks, incident exercises |,; SRE and Control Plane |
+| R-21 | Workload forges RPCs to an agent socket or tampers host-owned guest paths such as sockets and logs | Guest-reachable Unix socket or vsock listener without peer authentication; writable `/run/pico`, `/var/log/pico`, or image binaries such as `/bin/bash` | Critical | Possible | Low | Critical | Host-owned guest path protections with read-only mounts, kernel peer credentials, mutual session authentication, FIM enforce on sockets/logs/binaries | Guest agent socket and log tamper tests; FIM baseline tests; Runtime and Security |
+| R-22 | Residual answers or credentials leak through logs, console capture, or retained tool output | Verbose logging, unbounded retention, missing redaction, log scraping by a later workload step | High | Likely | Low | High | Source redaction allowlists, secret exclusion from logs and telemetry, bounded retention, snapshot exclusion for log mounts | Log redaction and residual-answer tests; Observability and Security |
+| R-23 | Workload abuses `SWAPEXT`-class or clone-range ioctls to corrupt or alias filesystem extents | Overly broad ioctl allowlist, shared filesystem, missing extent-swap review | Critical | Possible | Low | Critical | Ioctl allowlist review denying extent-swap and clone-range classes by default, seccomp profile review, minimal device model, read-only image layers | Ioctl allowlist and seccomp tests; Runtime and Security |
+| R-24 | Workload triggers a `/proc` or pseudo-filesystem hazard such as a `kpagecgroup` crash via `grep` | Unfiltered `/proc` exposure, unrestricted read sizes, missing hidepid and mask review | High | Possible | Medium | High | `/proc` hardening review with masked entries, hidepid, read size and timeout bounds, seccomp and mount policy | `/proc` hardening and bounded-read tests; Runtime and Security |
+| R-25 | Workload exfiltrates data or pulls unapproved code through package mirrors, proxies, port or mirror scans | Implicit mirror trust, static egress policy, stale leases, unclassified proxy destinations | High | Likely | Medium | High | Package-mirror policy classes (PyPI/NPM/Go proxy) via DNS proxy plus lease model, default-deny egress, dynamic per-stage policy updates | Mirror-class DNS and lease tests; dynamic policy tests; Networking and Security |
+| R-26 | Workload floods output capture with unbounded streams such as `yes` producing tens of GB | Missing per-stream quotas, no truncation, host-side capture without bounds or deadlines | High | Likely | High | High | Output-capture quotas with truncation, per-frame and total byte limits, deadlines, process termination on excess | Output-quota and truncation tests; Runtime and Security |
 
 ## Control Matrix
 
@@ -350,6 +363,53 @@ the outcome to be impossible.
 | R-18 | Authenticated encryption; provenance; exact compatibility gate | Integrity failures; compatibility reports; negative restore tests | Reject restore; quarantine artifact; select valid recovery point |
 | R-19 | Revoke-first destroy; receipt ledger; absence proof; no early reuse | Orphan scans; cleanup age and quarantine alerts; negative probes | Continue cleanup; quarantine host and identifiers; rebuild host if needed |
 | R-20 | Failure-domain isolation; bounded retry; capacity reserve; tested recovery | SLO burn, dependency, backlog, host, and ownership alerts | Shed load; fail over; restore; roll back; execute incident runbook |
+| R-21 | Host-owned guest paths read-only; socket peer credentials; mutual session authentication; FIM enforce | Socket tamper alerts; FIM violations; protocol misbinding events | Terminate session; revoke sandbox; rebuild guest paths; incident review |
+| R-22 | Redaction allowlists; secret exclusion from logs; bounded retention; log mount classification | Secret scanning on logs; retention audits; residual-answer probes | Rotate exposed secrets; purge logs; notify tenant; fix redaction |
+| R-23 | Ioctl allowlist review; default-deny extent-swap and clone-range; seccomp profile review | Seccomp denials; syscall audit anomalies; filesystem integrity alerts | Kill workload; quarantine host; patch profile; restore from clean image |
+| R-24 | Masked `/proc` entries; hidepid; read size and timeout bounds; mount policy | Bounded-read violations; anomaly detection on `/proc` access | Kill workload; remount hardened `/proc`; rebuild guest profile |
+| R-25 | Default-deny egress; DNS proxy mirror classes; lease-bound proxy destinations; per-stage policy | DNS deny counters; lease audit; flow metadata; mirror-class conformance tests | Revoke lease; remove mapping; isolate namespace; rotate network identity |
+| R-26 | Per-stream and total output quotas; truncation; deadlines; termination on excess | Quota-hit signals; truncation counters; OOM and pressure metrics | Kill or pause workload; shed load; drain host; reconcile accounting |
+
+## Agent-Misbehavior Controls
+
+The following controls elaborate the FMEA entries for R-21 through R-26.
+They add enforcement detail without changing the isolation floors,
+hard invariants, or launch gates defined in ADR-0004 and ADR-0006.
+
+- Host-owned guest path protections (R-21): `/run/pico`, guest agent
+  sockets, `/var/log/pico`, and image binaries such as `/bin/bash` are
+  host-owned inside the guest view. They are mounted read-only where the
+  workload does not require writes, validated by kernel peer credentials
+  on local sockets, bound to the fresh boot session, and monitored by
+  file integrity enforcement. Socket and log tamper tests show forged
+  RPCs without a current session are visible at wire level for host
+  session authentication to reject.
+- Ioctl allowlist review (R-23): the seccomp and device profile review
+  denies `SWAPEXT`-class, clone-range, and other extent-aliasing ioctls
+  by default. Each backend profile names the exact allowed ioctl set;
+  additions require a reviewed compatibility case plus negative tests.
+  Request-code filtering belongs in seccomp arg filters or eBPF ioctl
+  inspection; the symbolic allowlist gates profile review.
+- Output-capture quotas with truncation (R-26): every exec stream has a
+  per-frame limit (64 KiB), a per-stream byte quota, and a deadline.
+  Excess output truncates with an explicit marker, terminates the
+  producer, and returns a typed `OutputLimitExceeded` outcome. Host
+  capture never buffers unbounded output; the 1 MiB framing bound is the
+  outer fail-closed limit.
+- `/proc` hardening review (R-24): the guest `/proc` view masks hazardous
+  entries (including `kpagecgroup`-class crash vectors), applies hidepid,
+  and bounds read sizes and timeouts. Grep-style scans over `/proc`
+  cannot crash the host kernel or leak unapproved kernel state.
+- Package-mirror policy classes via DNS proxy plus lease model (R-25):
+  PyPI, NPM, and Go proxy destinations are explicit policy classes, not
+  ambient egress. Each class maps to DNS suffix rules plus lease-bound
+  egress CIDRs. Mirror and port scans without a current lease are denied
+  by default and audited.
+- Dynamic per-stage policy updates (R-25): build, install, and run stages
+  carry separate DNS and egress rules bound to the current policy epoch.
+  Stage transitions atomically replace the active ruleset; stale epochs
+  are rejected and revocation removes network authority without guest
+  cooperation.
 
 ## Residual-Risk Register
 
@@ -377,14 +437,15 @@ review.
 | Evidence area | Risks covered | Primary follow-up |
 |---|---|---|
 | Production readiness and owner gates | R-02, R-03, R-10, R-20 | |
-| Seccomp and capability minimization | R-05, R-13 | |
-| Runtime process confinement | R-05, R-13, R-14 | |
-| Resource containment | R-02, R-06, R-20 | |
+| Seccomp and capability minimization | R-05, R-13, R-23 | |
+| Runtime process confinement | R-05, R-13, R-14, R-21, R-24 | |
+| Resource containment | R-02, R-06, R-20, R-26 | |
 | Runtime credential broker | R-10, R-11 | |
 | Snapshot credential exclusion | R-11, R-16 | |
-| Isolation boundary validation | R-03, R-05, R-13, R-14, R-16, R-19 | |
-| Durable audit evidence | R-01, R-08, R-09, R-10, R-15, R-20 | |
+| Isolation boundary validation | R-03, R-05, R-13, R-14, R-16, R-19, R-21, R-23, R-24 | |
+| Durable audit evidence | R-01, R-08, R-09, R-10, R-15, R-20, R-22 | |
 | Side-channel and covert-channel assessment | R-15 | |
+| Agent-misbehavior controls (socket and log tamper, ioctl review, output quotas, `/proc` hardening, mirror classes, per-stage policy) | R-21, R-22, R-23, R-24, R-25, R-26 | |
 | Security assurance case and accepted risk | All | [assurance case](assurance-case.md) |
 
 Supporting implementation and evidence issues are referenced directly in the
