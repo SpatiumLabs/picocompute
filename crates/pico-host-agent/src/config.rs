@@ -9,6 +9,7 @@ use pico_core::cpu_isolation::CpuIsolationPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::HostIdentity;
+use crate::image_on_demand::OnDemandConfig;
 use crate::image_verify::{ImageVerificationConfig, ImageVerificationMode};
 
 use zeroize::Zeroizing;
@@ -64,6 +65,11 @@ pub struct HostAgentConfig {
     #[serde(default)]
     pub image_verification: ImageVerificationConfig,
 
+    /// Verification-gated on-demand reads (CAP-165). Disabled by default;
+    /// enablement never weakens the verification gate.
+    #[serde(default)]
+    pub image_on_demand: OnDemandConfig,
+
     #[serde(skip)]
     pub draining: bool,
 }
@@ -91,6 +97,7 @@ impl std::fmt::Debug for HostAgentConfig {
                 &self.shared_host_metric_redaction,
             )
             .field("image_verification", &self.image_verification)
+            .field("image_on_demand", &self.image_on_demand)
             .field("draining", &self.draining)
             .finish()
     }
@@ -130,6 +137,7 @@ impl Default for HostAgentConfig {
             cross_tenant_host: false,
             shared_host_metric_redaction: false,
             image_verification: ImageVerificationConfig::default(),
+            image_on_demand: OnDemandConfig::default(),
         }
     }
 }
@@ -230,6 +238,29 @@ fn apply_env_overrides(config: &mut HostAgentConfig) {
             _ => ImageVerificationMode::Production,
         };
     }
+    if let Ok(val) = std::env::var("PICO_IMAGE_ON_DEMAND") {
+        config.image_on_demand.enabled = val.eq_ignore_ascii_case("true") || val == "1";
+    }
+    if let Ok(val) = std::env::var("PICO_IMAGE_ON_DEMAND_CHUNK_BYTES")
+        && let Ok(v) = val.parse::<u64>()
+    {
+        config.image_on_demand.chunk_bytes = v;
+    }
+    if let Ok(val) = std::env::var("PICO_IMAGE_ON_DEMAND_MAX_BYTES")
+        && let Ok(v) = val.parse::<u64>()
+    {
+        config.image_on_demand.max_cached_bytes = v;
+    }
+    if let Ok(val) = std::env::var("PICO_IMAGE_ON_DEMAND_TIER")
+        && !val.is_empty()
+    {
+        config.image_on_demand.tier = val;
+    }
+    if let Ok(val) = std::env::var("PICO_IMAGE_REVOCATION_FILE")
+        && !val.is_empty()
+    {
+        config.image_on_demand.revocation_file = Some(val);
+    }
 }
 
 fn apply_identity_env_overrides(identity: &mut HostIdentity) {
@@ -273,6 +304,32 @@ fn ensure_valid(config: &HostAgentConfig) -> anyhow::Result<()> {
         anyhow::bail!(
             "image verification mode 'production' requires PICO_IMAGE_TRUSTED_SIGNING_KEY"
         )
+    }
+    if let Err(reason) = config.image_on_demand.validated() {
+        anyhow::bail!("invalid on-demand image config: {reason}")
+    }
+    // On-demand serves are meaningless without a verifier to gate them. Fail
+    // closed at startup rather than running an ungated lazy path.
+    if config.image_on_demand.enabled && !config.image_verification.is_configured() {
+        anyhow::bail!("PICO_IMAGE_ON_DEMAND requires PICO_IMAGE_DIR (verification gate)")
+    }
+    // On-demand serves require production attestation (pinned-signer
+    // signature). A development admission would serve unsigned images with
+    // `verification_before_serve` set, which misstates the evidence.
+    if config.image_on_demand.enabled
+        && config.image_verification.mode != ImageVerificationMode::Production
+    {
+        anyhow::bail!(
+            "PICO_IMAGE_ON_DEMAND requires image verification mode 'production' (PICO_IMAGE_VERIFICATION_MODE=production with PICO_IMAGE_TRUSTED_SIGNING_KEY)"
+        )
+    }
+    // A revocation file that cannot be read must not silently disable
+    // revocation. Construction of the cache below re-checks, but failing here
+    // keeps the operator signal at startup.
+    if let Err(reason) =
+        crate::image_on_demand::RevocationList::from_config(&config.image_on_demand).map(|_| ())
+    {
+        anyhow::bail!("{reason}")
     }
     Ok(())
 }
@@ -501,5 +558,61 @@ mod tests {
         };
         let err = ensure_valid(&config).unwrap_err();
         assert!(err.to_string().contains("PICO_SANDBOXD_TOKEN"));
+    }
+
+    #[test]
+    fn on_demand_requires_a_verification_gate() {
+        let mut config = HostAgentConfig {
+            auth_token: Zeroizing::new("host".into()),
+            sandboxd_token: Zeroizing::new("sandboxd".into()),
+            ..HostAgentConfig::default()
+        };
+        config.image_on_demand.enabled = true;
+        let err = ensure_valid(&config).expect_err("on-demand without image_dir must fail");
+        assert!(
+            err.to_string().contains("PICO_IMAGE_DIR"),
+            "unexpected: {err}"
+        );
+
+        config.image_verification.image_dir = Some("/var/lib/pico/images/standard".into());
+        // Still development mode: production attestation is required.
+        let err = ensure_valid(&config).expect_err("on-demand without production mode must fail");
+        assert!(err.to_string().contains("production"), "unexpected: {err}");
+
+        config.image_verification.mode = ImageVerificationMode::Production;
+        config.image_verification.trusted_signing_key = Some("key".into());
+        assert!(ensure_valid(&config).is_ok());
+    }
+
+    #[test]
+    fn on_demand_env_overrides_enablement_and_tier() {
+        unsafe {
+            std::env::set_var("PICO_IMAGE_ON_DEMAND", "true");
+            std::env::set_var("PICO_IMAGE_ON_DEMAND_TIER", "host_local");
+            std::env::set_var("PICO_IMAGE_ON_DEMAND_CHUNK_BYTES", "262144");
+        }
+        let mut config = HostAgentConfig::default();
+        apply_env_overrides(&mut config);
+        assert!(config.image_on_demand.enabled);
+        assert_eq!(config.image_on_demand.tier, "host_local");
+        assert_eq!(config.image_on_demand.chunk_bytes, 262144);
+        unsafe {
+            std::env::remove_var("PICO_IMAGE_ON_DEMAND");
+            std::env::remove_var("PICO_IMAGE_ON_DEMAND_TIER");
+            std::env::remove_var("PICO_IMAGE_ON_DEMAND_CHUNK_BYTES");
+        }
+    }
+
+    #[test]
+    fn on_demand_rejects_invalid_chunk_config() {
+        let mut config = HostAgentConfig {
+            auth_token: Zeroizing::new("host".into()),
+            sandboxd_token: Zeroizing::new("sandboxd".into()),
+            ..HostAgentConfig::default()
+        };
+        config.image_verification.image_dir = Some("/var/lib/pico/images/standard".into());
+        config.image_on_demand.enabled = true;
+        config.image_on_demand.chunk_bytes = 0;
+        assert!(ensure_valid(&config).is_err());
     }
 }

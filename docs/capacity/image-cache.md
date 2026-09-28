@@ -105,15 +105,15 @@ instead of shed, boot error ratio at 0.5%.
 | Audit | `image_verification` on admit, deny, and eviction |
 
 P0 does not scrape Grafana. Named evidence must still appear on the report.
-`pico_image_prepare_latency_seconds` with `cache_result="unknown"` and
-`image_profile="unknown"` is live from the host-agent prepare path, so the
-**Image Prepare Latency by cache_result** panel and the unfiltered
-`pico:image_prepare:latency:*` recording rules populate. Hit-filtered rules
-(`cache_result="hit"`) stay empty by design until real hits exist.
-`pico_image_cache_hits`/`misses`/`evictions`, verify/overlay histograms,
-and `tier` labels are not yet emitted; those image panels stay empty until the
-host image cache (BSD-184) emits them. Do not compute hit rates from the
-`unknown` prepare series.
+`pico_image_prepare_latency_seconds` is live from the host-agent prepare path.
+Eager prepares report `cache_result="unknown"`; on-demand prepares
+(CAP-165, `PICO_IMAGE_ON_DEMAND=1`) report real `hit`/`miss`/`evicted`
+outcomes from the verification gate, so the **Image Prepare Latency by
+cache_result** panel and `pico:image_prepare:latency:*` rules populate by
+outcome. `pico_image_cache_hits`/`misses`/`evictions` (by `tier`),
+`pico_image_verify_latency_seconds`, and `pico_image_overlay_latency_seconds`
+are emitted by the on-demand path. Do not compute hit rates from the
+`unknown` prepare series; use the `tier`-labeled counters.
 
 ## How to fill this file from a real run
 

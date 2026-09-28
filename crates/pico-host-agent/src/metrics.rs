@@ -109,6 +109,18 @@ const PREPARE_LATENCY_SECONDS: &str = "pico_prepare_latency_seconds";
 /// read this series. Hit-filtered rules (`cache_result="hit"`) stay empty
 /// until real hits exist, keeping `PicoComputeImagePrepareSaturated` silent.
 const IMAGE_PREPARE_LATENCY_SECONDS: &str = "pico_image_prepare_latency_seconds";
+/// Host image-cache lookup outcomes, keyed by `tier` (`host_local`, ...).
+/// Backs the `pico-image-cache` dashboard panels "Image Cache Hit Rate",
+/// "Image Cache Misses", and "Image Eviction Activity".
+const IMAGE_CACHE_HITS: &str = "pico_image_cache_hits";
+const IMAGE_CACHE_MISSES: &str = "pico_image_cache_misses";
+const IMAGE_CACHE_EVICTIONS: &str = "pico_image_cache_evictions";
+/// Signature verification latency on the prepare path.
+/// Backs "Signature Verify Latency" (`pico_image_verify_latency_seconds`).
+const IMAGE_VERIFY_LATENCY_SECONDS: &str = "pico_image_verify_latency_seconds";
+/// Per-sandbox rootfs overlay materialization latency.
+/// Backs "Overlay Creation Latency" (`pico_image_overlay_latency_seconds`).
+const IMAGE_OVERLAY_LATENCY_SECONDS: &str = "pico_image_overlay_latency_seconds";
 const DESTROY_EVENTS_TOTAL: &str = "pico_destroy_events_total";
 const DESTROY_LATENCY_SECONDS: &str = "pico_destroy_latency_seconds";
 const FORK_EVENTS_TOTAL: &str = "pico_fork_events_total";
@@ -257,6 +269,12 @@ pub mod val {
         &["minimal", "agent", "session", IMAGE_PROFILE_UNKNOWN],
         IMAGE_PROFILE_UNKNOWN,
     );
+
+    /// Allowlist for the `tier` label on image-cache counters.
+    pub const CACHE_TIERS: Allowlist = Allowlist::new(
+        &["host_local", "cell_cache", "regional_object_store", UNKNOWN],
+        UNKNOWN,
+    );
 }
 
 pub struct HostMetrics {
@@ -265,11 +283,18 @@ pub struct HostMetrics {
     pub prepare_events: Counter,
     pub prepare_latency: Histogram,
     /// Image-stage prepare latency with `cache_result` and `image_profile` labels.
-    /// Populated from the real prepare path with `unknown` labels until the
-    /// host image cache provides real values. Hit/miss/eviction counters and
-    /// verify/overlay histograms stay unregistered until then, so their
-    /// panels remain honestly empty instead of reporting fabricated ratios.
+    /// The on-demand cache now reports real `hit`/`miss`/`evicted` results;
+    /// `unknown` remains only for paths that bypass the cache.
     pub image_prepare_latency: Histogram,
+    /// Host image-cache lookup outcomes by `tier`.
+    /// Populates the `pico-image-cache` hit-rate, miss, and eviction panels.
+    pub image_cache_hits: Counter,
+    pub image_cache_misses: Counter,
+    pub image_cache_evictions: Counter,
+    /// Signature verification latency on the prepare path.
+    pub image_verify_latency: Histogram,
+    /// Per-sandbox rootfs overlay materialization latency.
+    pub image_overlay_latency: Histogram,
     pub boot_events: Counter,
     pub boot_latency: Histogram,
     pub destroy_events: Counter,
@@ -342,6 +367,11 @@ impl HostMetrics {
             prepare_events: Counter::register(PREPARE_EVENTS_TOTAL),
             prepare_latency: Histogram::register(PREPARE_LATENCY_SECONDS),
             image_prepare_latency: Histogram::register(IMAGE_PREPARE_LATENCY_SECONDS),
+            image_cache_hits: Counter::register(IMAGE_CACHE_HITS),
+            image_cache_misses: Counter::register(IMAGE_CACHE_MISSES),
+            image_cache_evictions: Counter::register(IMAGE_CACHE_EVICTIONS),
+            image_verify_latency: Histogram::register(IMAGE_VERIFY_LATENCY_SECONDS),
+            image_overlay_latency: Histogram::register(IMAGE_OVERLAY_LATENCY_SECONDS),
             boot_events: Counter::register(BOOT_EVENTS_TOTAL),
             boot_latency: Histogram::register(BOOT_LATENCY_SECONDS),
             destroy_events: Counter::register(DESTROY_EVENTS_TOTAL),
@@ -602,6 +632,64 @@ pub fn record_cgroup_memory_pressure_read_error(count: u64) {
             .cgroup_memory_pressure_read_errors
             .inc_by(count, &Labels::host());
     }
+}
+
+/// Build image-cache counter attributes: `tier` only (host aggregate).
+///
+/// `tier` is normalized to a bounded allowlist so digests or paths cannot
+/// become label values.
+pub(crate) fn image_cache_attrs(tier: &str) -> Labels<'_> {
+    Labels::host().with(attr::TIER, val::CACHE_TIERS.bound(tier).as_str())
+}
+
+/// Record one image-cache hit on `tier`.
+pub fn record_image_cache_hit(tier: &str) {
+    HOST_METRICS.image_cache_hits.inc(&image_cache_attrs(tier));
+}
+
+/// Record one image-cache miss on `tier`.
+pub fn record_image_cache_miss(tier: &str) {
+    HOST_METRICS
+        .image_cache_misses
+        .inc(&image_cache_attrs(tier));
+}
+
+/// Record one image-cache eviction on `tier`.
+pub fn record_image_cache_eviction(tier: &str) {
+    HOST_METRICS
+        .image_cache_evictions
+        .inc(&image_cache_attrs(tier));
+}
+
+/// Record signature verification latency for one prepare.
+pub fn record_image_verify_latency(seconds: f64) {
+    HOST_METRICS
+        .image_verify_latency
+        .record(seconds, &Labels::host());
+}
+
+/// Record per-sandbox rootfs overlay materialization latency.
+pub fn record_image_overlay_latency(seconds: f64) {
+    HOST_METRICS
+        .image_overlay_latency
+        .record(seconds, &Labels::host());
+}
+
+/// Record image-stage prepare latency with a real cache result.
+///
+/// Carries the on-demand lookup outcome (`hit`/`miss`/`evicted`; `unknown`
+/// for paths that bypass the cache) so the `pico-image-cache` "Image Prepare
+/// Latency by cache_result" panel and `pico:image_prepare:latency:*`
+/// recording rules populate.
+pub fn record_image_prepare_latency(
+    status: &str,
+    cache_result: &str,
+    image_profile: &str,
+    seconds: f64,
+    tenant_id: Option<&str>,
+) {
+    let attrs = image_prepare_latency_attrs(status, cache_result, image_profile, tenant_id);
+    HOST_METRICS.image_prepare_latency.record(seconds, &attrs);
 }
 
 #[cfg(test)]

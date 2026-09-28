@@ -474,6 +474,7 @@ mod tests {
             attr::ACTION,
             attr::SOURCE,
             attr::SYSCALL,
+            attr::TIER,
         ] {
             let name = key.as_str();
             assert_ne!(name, attr::TENANT_ID, "{name} collided with tenant_id");
