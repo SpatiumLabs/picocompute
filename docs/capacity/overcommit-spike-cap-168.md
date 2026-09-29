@@ -46,8 +46,8 @@ Suite mapping:
 
 | Validation area | Suite | Location |
 |---|---|---|
-| Service class, policy gate, controls, sched, reclaim math | 25 overcommit tests | `crates/pico-core/src/overcommit.rs` |
-| Scheduler gate, overcommit bit, serde compat | cell_scheduler tests | `crates/pico-core/src/cell_scheduler/` |
+| Service class, policy gate, controls, sched, reclaim math | 22 overcommit module tests | `crates/pico-core/src/overcommit.rs` |
+| Scheduler gate, overcommit bit, serde compat | 88 cell_scheduler tests (incl. 11 new gate tests) | `crates/pico-core/src/cell_scheduler/` |
 | Packing model calibration | 69 capacity tests | `crates/pico-core/src/capacity/` |
 | cgroup controls | 38 cgroups tests | `crates/pico-core/src/cgroups.rs` |
 | Burst placement (class default) | placement_burst | `crates/pico-core/tests/placement_burst.rs` |
@@ -209,7 +209,7 @@ SKU, pinned by unit tests (not measurements):
 | Packing | vCPU bound | Memory bound | Admitted |
 |---|---|---:|---:|
 | Strict (both classes, gate off) | 32 | 128 | **32** |
-| BE, 2x CPU/mem, 128 MiB shared base | 64 | 170 | **64** |
+| BE, 2x CPU/mem, 128 MiB shared base | 64 | 341 | **64** |
 | LS, gate on | 32 | 128 | **32** |
 
 Disk (488), process slots (100), and network never bind first on this
@@ -295,9 +295,9 @@ class-A invariants after P1; until then they are blocked on evidence:
 
 ```bash
 cargo test -p pico-core --all-features --lib overcommit
-# 25 passed
+# 27 passed (22 module tests plus 5 gate tests matched by the filter)
 cargo test -p pico-core --all-features --lib cell_scheduler
-# 85 passed
+# 88 passed (incl. 11 new gate tests)
 cargo test -p pico-core --all-features --lib capacity
 # 69 passed
 cargo test -p pico-core --all-features --lib cgroups

@@ -724,3 +724,77 @@ fn fill_config_gaps(config: &mut SandboxConfig, host: &HostResourceSpec) {
         config.max_pids = Some(DEFAULT_MAX_PIDS);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pico_core::ServiceClass;
+
+    fn test_manager(root: &std::path::Path) -> HostResourceManager {
+        HostResourceManager::new(HostResourceConfig::new(root.to_path_buf()))
+    }
+
+    fn config_with_class(id: &str, class: ServiceClass) -> SandboxConfig {
+        SandboxConfig {
+            id: id.into(),
+            service_class: class,
+            ..SandboxConfig::default()
+        }
+    }
+
+    #[test]
+    fn materialize_applies_be_class_controls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(dir.path());
+        let workspaces =
+            WorkspaceManager::new(dir.path().join("workspaces")).expect("workspace root");
+        let mut config = config_with_class("sbx_be_class01", ServiceClass::BestEffort);
+        let host = HostResourceSpec::default();
+
+        let receipts = manager
+            .materialize(&workspaces, &mut config, &host)
+            .unwrap_or_else(|e| panic!("best-effort materialize must succeed: {}", e.message));
+        assert!(
+            receipts
+                .iter()
+                .any(|r| r.name == cgroup_receipt_name("sbx_be_class01")),
+            "cgroup receipt must be recorded"
+        );
+
+        let report = manager.teardown(&workspaces, "sbx_be_class01");
+        assert!(
+            report.remaining.is_empty(),
+            "teardown must release everything: {:?}",
+            report.remaining
+        );
+    }
+
+    #[test]
+    fn materialize_keeps_ls_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(dir.path());
+        let workspaces =
+            WorkspaceManager::new(dir.path().join("workspaces")).expect("workspace root");
+        let mut config = config_with_class("sbx_ls_class01", ServiceClass::LatencySensitive);
+        let host = HostResourceSpec::default();
+
+        let receipts = manager
+            .materialize(&workspaces, &mut config, &host)
+            .unwrap_or_else(|e| {
+                panic!("latency-sensitive materialize must succeed: {}", e.message)
+            });
+        assert!(
+            receipts
+                .iter()
+                .any(|r| r.name == cgroup_receipt_name("sbx_ls_class01")),
+            "cgroup receipt must be recorded"
+        );
+
+        let report = manager.teardown(&workspaces, "sbx_ls_class01");
+        assert!(
+            report.remaining.is_empty(),
+            "teardown must release everything: {:?}",
+            report.remaining
+        );
+    }
+}

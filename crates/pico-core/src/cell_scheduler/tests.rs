@@ -1314,6 +1314,46 @@ fn be_rejection_names_overcommit_budget_while_staying_typed() {
 }
 
 #[test]
+fn be_rejection_message_is_exact_when_budget_binds() {
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let host = make_full_host("hst_1");
+    let mut be = be_request();
+    be.vcpus = 200;
+    let err = scheduler
+        .check_hard_constraints(&host, &be)
+        .expect_err("over-budget BE must fail the constraint");
+    assert_eq!(
+        err,
+        "insufficient capacity (best-effort overcommit budget exhausted)"
+    );
+}
+
+#[test]
+fn be_rejection_stays_plain_when_disk_binds() {
+    // Disk is never overcommitted: a disk-bound failure must not blame
+    // the overcommit budget even for best-effort under an enabled policy.
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let mut host = make_host("hst_1", HostHealth::Healthy);
+    host.capacity.used_disk_mb = host.capacity.total_disk_mb;
+    let err = scheduler
+        .check_hard_constraints(&host, &be_request())
+        .expect_err("disk-full host must fail the constraint");
+    assert_eq!(err, "insufficient capacity");
+}
+
+#[test]
+fn be_rejection_stays_plain_when_slots_bind() {
+    // Process slots are never overcommitted either.
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let mut host = make_host("hst_1", HostHealth::Healthy);
+    host.capacity.used_process_slots = host.capacity.max_process_slots;
+    let err = scheduler
+        .check_hard_constraints(&host, &be_request())
+        .expect_err("slot-full host must fail the constraint");
+    assert_eq!(err, "insufficient capacity");
+}
+
+#[test]
 fn invalid_overcommit_policy_fails_placement_closed() {
     let bad = OvercommitPolicy {
         enabled: true,

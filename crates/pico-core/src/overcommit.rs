@@ -133,6 +133,15 @@ impl BaseSharingMode {
 /// beyond measured evidence still requires a P1/P2 report per ADR-0012.
 pub const MAX_OVERCOMMIT_RATIO: f64 = 8.0;
 
+/// Upper rail for the shared-base discount in megabytes.
+///
+/// A config rail against unit typos (bytes vs megabytes), not a measured
+/// safe point: 8 GiB already exceeds any plausible per-sandbox read-only
+/// base, and any non-zero value still needs a P1/P2 report. Without a rail
+/// a typo could push the effective request to zero, which the packing math
+/// reads as unbounded for that dimension (see [`effective_memory_request`]).
+pub const MAX_SHARED_BASE_MB: u64 = 8192;
+
 /// Gated overcommit policy for best-effort packing.
 ///
 /// Disabled by default: [`Self::default`] leaves every scheduling decision
@@ -190,6 +199,12 @@ impl OvercommitPolicy {
                 "be_shared_base_mb requires a base_sharing mechanism".into(),
             ));
         }
+        if self.be_shared_base_mb > MAX_SHARED_BASE_MB {
+            return Err(SandboxError::BadRequest(format!(
+                "be_shared_base_mb must be within [0, {MAX_SHARED_BASE_MB}], got {}",
+                self.be_shared_base_mb
+            )));
+        }
         Ok(())
     }
 
@@ -242,7 +257,12 @@ pub fn effective_capacity_for_class(
 ///
 /// Only best-effort requests under an enabled policy with a named sharing
 /// mechanism observe the discount; all other combinations request the full
-/// shape. Saturates at zero instead of underflowing.
+/// shape. Saturates at zero instead of underflowing. Note the downstream
+/// packing math reads a zero request as unbounded for that dimension
+/// ([`HostCapacity::remaining_fit_count`] treats it as "no memory
+/// needed"), so the discount must stay below any real request size: the
+/// [`MAX_SHARED_BASE_MB`] rail plus P1-measured values keep a typo from
+/// silently exempting best-effort sandboxes from memory accounting.
 #[must_use]
 pub fn effective_memory_request(
     memory_mb: u64,
@@ -349,12 +369,12 @@ impl ServiceClassControls {
 
 /// Applies a Linux scheduling policy to one process.
 ///
-/// Priority is always zero (only real-time policies take a priority; this
-/// helper refuses nothing but never sets one). `pid == 0` is rejected:
-/// pid 0 carries process-group semantics in `sched_setscheduler` and this
-/// helper only ever targets one explicit process. On non-Linux platforms
-/// this is a validated no-op so development workflows are not blocked;
-/// production hosts must be Linux.
+/// Priority is always zero: only real-time policies take a priority, and
+/// this helper only applies non-real-time class policies, never setting
+/// one. `pid == 0` is rejected: pid 0 carries process-group semantics in
+/// `sched_setscheduler` and this helper only ever targets one explicit
+/// process. On non-Linux platforms this is a validated no-op so
+/// development workflows are not blocked; production hosts must be Linux.
 pub fn apply_sched_policy_to_pid(policy: SchedPolicy, pid: u32) -> Result<()> {
     if pid == 0 {
         return Err(SandboxError::BadRequest(
@@ -407,7 +427,9 @@ pub fn probe_core_scheduling() -> CoreSchedSupport {
     #[cfg(target_os = "linux")]
     {
         // Safety: read-only GET of our own pid; out-pointer targets a
-        // live stack slot for the duration of the call.
+        // live stack slot for the duration of the call. The pointer-to-int
+        // cast assumes a 64-bit Linux host (all production SKUs are
+        // x86_64/aarch64); it would truncate on 32-bit Linux.
         let cookie: u64 = 0;
         let ret = unsafe {
             libc::prctl(
@@ -503,16 +525,26 @@ pub struct BalloonTarget {
 /// Computes the balloon inflate target, or `None` when no reclaim applies.
 ///
 /// Fails closed (returns `None`, never an error): a disabled policy, a
-/// zero limit, or a zero free hint each mean there is nothing to reclaim.
-/// The target truncates the fraction and clamps to the sandbox limit so
-/// the balloon can never exceed the guest it lives in.
+/// zero limit, a zero free hint, or an out-of-range fraction each mean
+/// there is nothing safe to reclaim. The fraction range is enforced here
+/// rather than trusting callers to run [`BalloonPolicy::validate`] first,
+/// so an unvalidated policy (e.g. an infinite fraction, which would
+/// otherwise saturate to a full-guest balloon) yields no target. The
+/// target truncates the fraction and clamps to the sandbox limit so the
+/// balloon can never exceed the guest it lives in.
 #[must_use]
 pub fn balloon_target(
     memory_limit_bytes: u64,
     guest_free_hint_bytes: u64,
     policy: &BalloonPolicy,
 ) -> Option<BalloonTarget> {
-    if !policy.enabled || memory_limit_bytes == 0 || guest_free_hint_bytes == 0 {
+    if !policy.enabled
+        || memory_limit_bytes == 0
+        || guest_free_hint_bytes == 0
+        || !policy.reclaim_fraction.is_finite()
+        || policy.reclaim_fraction <= 0.0
+        || policy.reclaim_fraction > 1.0
+    {
         return None;
     }
     let inflate = (guest_free_hint_bytes as f64 * policy.reclaim_fraction) as u64;
@@ -671,6 +703,26 @@ mod tests {
     }
 
     #[test]
+    fn policy_validation_rejects_oversized_shared_base() {
+        // Bytes-vs-megabytes typo guard: anything above the rail fails
+        // even with a named mechanism.
+        let policy = OvercommitPolicy {
+            enabled: true,
+            be_shared_base_mb: MAX_SHARED_BASE_MB + 1,
+            base_sharing: BaseSharingMode::SharedPageCache,
+            ..OvercommitPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+        let ok = OvercommitPolicy {
+            enabled: true,
+            be_shared_base_mb: MAX_SHARED_BASE_MB,
+            base_sharing: BaseSharingMode::SharedPageCache,
+            ..OvercommitPolicy::default()
+        };
+        ok.validate().unwrap();
+    }
+
+    #[test]
     fn ls_and_disabled_requests_see_strict_capacity() {
         let base = lab_host();
         let strict_shape = SandboxPackingShape::platform_default();
@@ -825,6 +877,23 @@ mod tests {
         assert_eq!(balloon_target(0, 1024, &policy), None);
         assert_eq!(balloon_target(1024, 0, &policy), None);
         assert_eq!(balloon_target(1024, 512, &BalloonPolicy::default()), None);
+    }
+
+    #[test]
+    fn balloon_target_rejects_unvalidated_fractions() {
+        // An unvalidated policy never yields a target: infinite fractions
+        // would otherwise saturate to a full-guest balloon.
+        for fraction in [f64::NAN, f64::INFINITY, -0.5, 0.0, 1.5] {
+            let policy = BalloonPolicy {
+                enabled: true,
+                reclaim_fraction: fraction,
+            };
+            assert_eq!(
+                balloon_target(4096, 2048, &policy),
+                None,
+                "fraction {fraction} must yield no target"
+            );
+        }
     }
 
     #[test]
