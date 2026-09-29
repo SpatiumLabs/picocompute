@@ -23,15 +23,20 @@ fn ensure_job_match(path_job: &str, body_job: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Status for a job outcome with member failures.
+/// Status for a job outcome.
 ///
 /// A bulk signal that only partially applied must not read as success to a
-/// caller that only checks the HTTP status: 207 signals "completed with
-/// per-member errors in the body", and each member failure reason is
-/// carried in `JobOutcome.members[].message`. `all_succeeded` is always
-/// checked by callers that need strict success.
-fn outcome_status(outcome: &JobOutcome) -> StatusCode {
-    if outcome.all_succeeded() {
+/// caller that only checks the HTTP status, so both `pause` and `resume`
+/// return `207` when any member failed.
+///
+/// A pause additionally returns `207` when every member suspended but
+/// nothing was actually reclaimed (`reclaim_applied: false` on every
+/// member): the sandboxes are correctly `Suspended`, but preemptible
+/// capacity was not freed, which is not a successful reclaim. Resume
+/// ignores the reclaim flag because restoring does not reclaim.
+fn outcome_status(outcome: &JobOutcome, is_pause: bool) -> StatusCode {
+    let reclaim_incomplete = is_pause && !outcome.members.is_empty() && !outcome.any_reclaimed();
+    if outcome.all_succeeded() && !reclaim_incomplete {
         StatusCode::OK
     } else {
         StatusCode::MULTI_STATUS
@@ -45,7 +50,7 @@ pub(crate) async fn pause_job(
 ) -> Result<(StatusCode, Json<JobOutcome>), AppError> {
     ensure_job_match(&job_id, &signal.job_id)?;
     let outcome = agent.pause_job(signal).await?;
-    let status = outcome_status(&outcome);
+    let status = outcome_status(&outcome, true);
     Ok((status, Json(outcome)))
 }
 
@@ -56,7 +61,7 @@ pub(crate) async fn resume_job(
 ) -> Result<(StatusCode, Json<JobOutcome>), AppError> {
     ensure_job_match(&job_id, &signal.job_id)?;
     let outcome = agent.resume_job(signal).await?;
-    let status = outcome_status(&outcome);
+    let status = outcome_status(&outcome, false);
     Ok((status, Json(outcome)))
 }
 
@@ -66,31 +71,51 @@ mod tests {
     use pico_core::{JobMemberOutcome, ReclaimStrategy};
     use std::sync::Arc;
 
-    fn outcome(all_ok: bool) -> JobOutcome {
+    fn outcome(all_ok: bool, reclaim_applied: bool) -> JobOutcome {
         JobOutcome {
             job_id: "job_x".into(),
             members: vec![JobMemberOutcome {
                 sandbox_id: "sbx_a".into(),
                 succeeded: all_ok,
                 strategy: ReclaimStrategy::ContainerSwapReclaim,
+                reclaim_applied,
                 message: if all_ok {
                     String::new()
                 } else {
                     "suspend timed out".into()
                 },
-                snapshot_id: None,
             }],
         }
     }
 
     #[test]
-    fn all_succeeded_returns_ok() {
-        assert_eq!(outcome_status(&outcome(true)), StatusCode::OK);
+    fn all_succeeded_with_reclaim_returns_ok() {
+        assert_eq!(outcome_status(&outcome(true, true), true), StatusCode::OK);
     }
 
     #[test]
     fn partial_failure_returns_multi_status() {
-        assert_eq!(outcome_status(&outcome(false)), StatusCode::MULTI_STATUS);
+        assert_eq!(
+            outcome_status(&outcome(false, false), true),
+            StatusCode::MULTI_STATUS
+        );
+    }
+
+    #[test]
+    fn pause_without_reclaim_returns_multi_status() {
+        // Every member suspended but nothing was reclaimed: not a
+        // successful reclaim, so a status-only caller must see it.
+        let outcome = outcome(true, false);
+        assert!(outcome.all_succeeded());
+        assert!(!outcome.any_reclaimed());
+        assert_eq!(outcome_status(&outcome, true), StatusCode::MULTI_STATUS);
+    }
+
+    #[test]
+    fn resume_ignores_reclaim_flag() {
+        // Restoring does not reclaim, so a resume that never reclaims is
+        // still a success.
+        assert_eq!(outcome_status(&outcome(true, false), false), StatusCode::OK);
     }
 
     #[test]

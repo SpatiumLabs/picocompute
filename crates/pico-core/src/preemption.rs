@@ -352,15 +352,15 @@ pub struct JobMemberOutcome {
     pub succeeded: bool,
     /// Reclaim strategy applied to this member.
     pub strategy: ReclaimStrategy,
+    /// Whether host memory reclaim was actually applied after the pause.
+    ///
+    /// `true` only when the cgroup throttle plus reclaim writes succeeded.
+    /// A member can be `succeeded` with `reclaim_applied: false` when the
+    /// sandbox suspended correctly but reclaim could not run, which is the
+    /// signal that host capacity was not actually freed.
+    pub reclaim_applied: bool,
     /// Human-readable detail (empty on success).
     pub message: String,
-    /// MicroVM snapshot id for reclaim plus restore correlation.
-    ///
-    /// Present only for microVM pause members where a reclaim handle was
-    /// planned. Absent for containers, unknown runtimes, and failures
-    /// before planning.
-    #[serde(default)]
-    pub snapshot_id: Option<String>,
 }
 
 /// Aggregate outcome of a job pause or resume.
@@ -395,6 +395,36 @@ impl JobOutcome {
         self.members
             .iter()
             .filter(|m| !m.succeeded)
+            .map(|m| m.sandbox_id.as_str())
+            .collect()
+    }
+
+    /// True when at least one member had host memory actually reclaimed.
+    #[must_use]
+    pub fn any_reclaimed(&self) -> bool {
+        self.members.iter().any(|m| m.reclaim_applied)
+    }
+
+    /// Ids of members whose reclaim actually freed host memory.
+    #[must_use]
+    pub fn reclaimed_ids(&self) -> Vec<&str> {
+        self.members
+            .iter()
+            .filter(|m| m.reclaim_applied)
+            .map(|m| m.sandbox_id.as_str())
+            .collect()
+    }
+
+    /// Ids of members that suspended but did not free host memory.
+    ///
+    /// These are the members that need operator attention: the sandbox is
+    /// safely `Suspended` with execution state preserved, but preemptible
+    /// capacity was not actually reclaimed.
+    #[must_use]
+    pub fn succeeded_without_reclaim(&self) -> Vec<&str> {
+        self.members
+            .iter()
+            .filter(|m| m.succeeded && !m.reclaim_applied)
             .map(|m| m.sandbox_id.as_str())
             .collect()
     }
@@ -631,21 +661,47 @@ mod tests {
                     sandbox_id: "sbx_a".into(),
                     succeeded: true,
                     strategy: ReclaimStrategy::ContainerSwapReclaim,
+                    reclaim_applied: true,
                     message: String::new(),
-                    snapshot_id: None,
                 },
                 JobMemberOutcome {
                     sandbox_id: "sbx_b".into(),
                     succeeded: false,
                     strategy: ReclaimStrategy::MicroVmSnapshotTerminate,
+                    reclaim_applied: false,
                     message: "suspend timed out".into(),
-                    snapshot_id: None,
                 },
             ],
         };
         assert!(!outcome.all_succeeded());
         assert_eq!(outcome.succeeded_ids(), vec!["sbx_a"]);
         assert_eq!(outcome.failed_ids(), vec!["sbx_b"]);
+    }
+
+    #[test]
+    fn reclaimed_ids_report_actual_memory_freed() {
+        let outcome = JobOutcome {
+            job_id: "job_x".into(),
+            members: vec![
+                JobMemberOutcome {
+                    sandbox_id: "sbx_a".into(),
+                    succeeded: true,
+                    strategy: ReclaimStrategy::ContainerSwapReclaim,
+                    reclaim_applied: true,
+                    message: String::new(),
+                },
+                JobMemberOutcome {
+                    sandbox_id: "sbx_b".into(),
+                    succeeded: true,
+                    strategy: ReclaimStrategy::MicroVmSnapshotTerminate,
+                    reclaim_applied: false,
+                    message: String::new(),
+                },
+            ],
+        };
+        assert!(outcome.all_succeeded());
+        assert_eq!(outcome.reclaimed_ids(), vec!["sbx_a"]);
+        assert_eq!(outcome.succeeded_without_reclaim(), vec!["sbx_b"]);
     }
 
     #[test]

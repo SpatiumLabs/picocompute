@@ -611,6 +611,14 @@ async fn job_pause_and_resume_roundtrip() {
             SandboxState::Suspended
         );
     }
+    // Reclaim writes are best-effort. The test host has no writable cgroup
+    // mount, so `reclaim_applied` is false here, which is exactly the case
+    // the flag exists to surface: suspended but capacity not freed.
+    assert!(
+        !outcome.any_reclaimed(),
+        "no writable cgroup mount in tests, so reclaim must report false"
+    );
+    assert_eq!(outcome.succeeded_without_reclaim().len(), 2);
 
     let resume = JobResumeSignal {
         job_id: "job_test".into(),
@@ -629,6 +637,93 @@ async fn job_pause_and_resume_roundtrip() {
     assert_eq!(
         harness.agent.get_status(&first.id).await.unwrap(),
         SandboxState::Running
+    );
+}
+
+#[tokio::test]
+async fn job_resume_rejects_backend_swap_after_pause() {
+    let harness = TestHarness::new().await;
+    let info = harness
+        .agent
+        .create_sandbox(spec("sbx_job_swap"))
+        .await
+        .unwrap();
+    let pause = job_pause_signal("job_swap", vec![info.id.clone()], None);
+    let outcome = harness.agent.pause_job(pause).await.unwrap();
+    assert!(outcome.all_succeeded(), "job pause failed: {outcome:?}");
+
+    // Simulate a runtime swap between pause and resume: the reclaim record
+    // names the capture backend, so a different target must be rejected as
+    // a cross-backend restore instead of resuming.
+    let entry = harness.agent.lookup_sandbox(&info.id).await.unwrap();
+    *entry.reclaim.lock() = Some(ReclaimRecord {
+        strategy: pico_core::ReclaimStrategy::MicroVmSnapshotTerminate,
+        capture_backend: RuntimeType::Qemu,
+        applied: true,
+    });
+
+    let resume = JobResumeSignal {
+        job_id: "job_swap".into(),
+        sandbox_ids: vec![info.id.clone()],
+        fencing_token: FencingToken {
+            epoch: 9,
+            sequence: 400,
+        },
+        policy_epoch: 9,
+        deadline_secs: 60,
+        reason: "capacity-restored".into(),
+        tenant_id: None,
+    };
+    let outcome = harness.agent.resume_job(resume).await.unwrap();
+    assert!(!outcome.all_succeeded());
+    let member = &outcome.members[0];
+    assert!(
+        member.message.contains("cross-backend"),
+        "expected cross-backend rejection, got {}",
+        member.message
+    );
+    assert_eq!(
+        harness.agent.get_status(&info.id).await.unwrap(),
+        SandboxState::Suspended,
+        "a rejected resume must not transition the sandbox"
+    );
+}
+
+#[tokio::test]
+async fn job_resume_clears_reclaim_record() {
+    let harness = TestHarness::new().await;
+    let info = harness
+        .agent
+        .create_sandbox(spec("sbx_job_clear"))
+        .await
+        .unwrap();
+    harness
+        .agent
+        .pause_job(job_pause_signal("job_clear", vec![info.id.clone()], None))
+        .await
+        .unwrap();
+    let entry = harness.agent.lookup_sandbox(&info.id).await.unwrap();
+    assert!(
+        entry.reclaim.lock().is_some(),
+        "pause must record the capture backend"
+    );
+
+    let resume = JobResumeSignal {
+        job_id: "job_clear".into(),
+        sandbox_ids: vec![info.id.clone()],
+        fencing_token: FencingToken {
+            epoch: 9,
+            sequence: 500,
+        },
+        policy_epoch: 9,
+        deadline_secs: 60,
+        reason: "capacity-restored".into(),
+        tenant_id: None,
+    };
+    harness.agent.resume_job(resume).await.unwrap();
+    assert!(
+        entry.reclaim.lock().is_none(),
+        "resume must clear the reclaim record so a later resume does not compare against a stale backend"
     );
 }
 
@@ -757,7 +852,7 @@ async fn job_pause_reports_unknown_strategy_for_missing_sandbox() {
     assert!(!outcome.all_succeeded());
     let member = &outcome.members[0];
     assert_eq!(member.strategy, pico_core::ReclaimStrategy::Unknown);
-    assert!(member.snapshot_id.is_none());
+    assert!(!member.reclaim_applied);
 }
 
 #[tokio::test]

@@ -384,8 +384,11 @@ sends one envelope per job; the host fans out to one fenced `Suspend` or
 `Resume` per member sandbox with shared fencing, policy-epoch, and
 deadline handling. Jobs are single-tenant: a mixed-tenant member set or a
 tenant mismatch fails the whole signal before any side effect. Bulk
-outcomes return `207` when any member fails, so a status-only caller
-cannot mistake a partial application for success. See
+outcomes return `207` when any member fails, and a pause also returns
+`207` when every member suspended without reclaiming host memory, so a
+status-only caller cannot mistake a partial or non-reclaiming pause for
+success. Resume rejects a runtime that differs from the backend which
+recorded the paused state. See
 [worker-container topology](docs/design/worker-container-topology.md).
 
 ### 5.3 Lifecycle state

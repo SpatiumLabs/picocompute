@@ -45,15 +45,20 @@ when capacity returns.
    absolute deadline, and operation identity.
 3. Suspend follows the standard contract: operation fence, exec drain,
    cooperative quiesce, workspace freeze, `memory` profile capture.
-4. Reclaim runs per backend after suspend succeeds:
+4. Reclaim runs after suspend succeeds, and the outcome reports whether it
+   actually freed host memory:
    - containers: `memory.high` throttle plus `memory.reclaim` written to
      the sandbox cgroup, with the frozen cgroup preserving execution
      state and `MADV_WILLNEED` prefetch on resume.
-   - microVMs: a `memory`-profile reclaim handle is planned and validated
-     (same backend, no cross-backend restore), the snapshot id is
-     reported in the outcome, and the paused VMM gets the same cgroup
-     pressure relief. Terminate plus on-demand restore is driven by the
-     snapshot path for the recorded snapshot id.
+   - microVMs: the same cgroup writes apply to the paused VMM, which also
+     lives in the sandbox cgroup. Terminate plus on-demand restore is
+     driven by the snapshot path.
+   - `JobMemberOutcome.reclaim_applied` is `true` only when the writes
+     succeeded. A member can be `succeeded: true` with
+     `reclaim_applied: false`, which means the sandbox is safely
+     `Suspended` but preemptible capacity was not freed. That is the
+     signal operators need, and `JobOutcome.succeeded_without_reclaim`
+     lists those members.
 5. Per-sandbox audit records each `Running` to `Suspended` transition with
    the job envelope (`job.pause`, `job.reclaim_container` or
    `job.reclaim_microvm`) for correlation.
@@ -62,8 +67,12 @@ when capacity returns.
 
 1. Control plane admits `JobResumeSignal` with a newer fencing token and
    the current policy epoch (refresh, not restore).
-2. Host fans out to one fenced `Resume` per member. Each member passes the
-   full restore-validation gate list: tenant, readiness, lineage, key,
+2. Host fans out to one fenced `Resume` per member. Before any resume side
+   effect, the member's resume contract is validated: the `memory` profile
+   is required, and the target runtime must match the backend that recorded
+   the paused state. A runtime swap between pause and resume is rejected as
+   a cross-backend restore. Each member then passes the full
+   restore-validation gate list: tenant, readiness, lineage, key,
    integrity, image, backend, kernel, guest-agent, protocol, CPU, device,
    memory, policy, exclusion, fresh epoch, fresh network, fresh
    credentials, `ResumeNotify`, health.
@@ -108,8 +117,10 @@ when capacity returns.
 - `POST /v1/jobs/{job_id}/resume` with `JobResumeSignal` returns `JobOutcome`.
 - Both routes require bearer auth and pass the existing suspend/resume
   policy gates.
-- Response status is `200` when every member succeeded and `207` when any
-  member failed, so a status-only caller cannot mistake a partial
-  application for success. `deadline_secs: 0` means the default budget.
+- Response status is `200` when every member succeeded and reclaim was
+  actually applied, and `207` when any member failed or when a pause
+  suspended every member without reclaiming anything. A status-only caller
+  therefore cannot mistake a partial application or a non-reclaiming pause
+  for success. `deadline_secs: 0` means the default budget.
 - Both envelopes accept an optional `tenant_id` used for the single-tenant
   scope check.

@@ -229,14 +229,24 @@ mod imp {
         /// Writes `memory.high` throttle first, then `memory.reclaim` to push
         /// cold pages to swap while the frozen cgroup preserves execution
         /// state. Uses the plan's `file_writes` order so throttle precedes
-        /// reclaim. No-op when cgroups are not accessible (non-Linux or
-        /// missing mount); callers keep the sandbox suspended and log a
-        /// warning when a write fails.
-        pub fn apply_reclaim(&self, plan: super::ContainerReclaimPlan) -> Result<()> {
+        /// reclaim.
+        ///
+        /// Returns the number of control files actually written. Zero means
+        /// the cgroup hierarchy is not mounted (non-Linux host, or a Linux
+        /// host without the sandbox cgroup tree), so nothing was reclaimed.
+        /// Callers must not report host memory as freed on a zero count:
+        /// `write_control` succeeds silently when the mount is absent, so an
+        /// `Ok` alone would claim a reclaim that never happened.
+        pub fn apply_reclaim(&self, plan: super::ContainerReclaimPlan) -> Result<usize> {
+            if !self.cgroups_accessible() {
+                return Ok(0);
+            }
+            let mut written = 0;
             for (file, value) in plan.file_writes() {
                 self.write_control(file, &value)?;
+                written += 1;
             }
-            Ok(())
+            Ok(written)
         }
 
         pub fn cleanup(&self) -> Result<()> {
@@ -383,8 +393,11 @@ mod imp {
         }
 
         /// Applies a container reclaim plan after suspend (non-Linux no-op).
-        pub fn apply_reclaim(&self, _plan: super::ContainerReclaimPlan) -> Result<()> {
-            Ok(())
+        ///
+        /// Always reports zero files written: there is no cgroup hierarchy
+        /// to reclaim through, so callers must not claim host memory freed.
+        pub fn apply_reclaim(&self, _plan: super::ContainerReclaimPlan) -> Result<usize> {
+            Ok(0)
         }
 
         pub fn cleanup(&self) -> Result<()> {
@@ -894,13 +907,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_reclaim_is_noop_without_cgroup_mount() {
-        // The test environment has no writable cgroup mount, so the write
-        // path is exercised as a safe no-op rather than panicking or
-        // erroring out. The plan math is asserted separately.
+    fn apply_reclaim_reports_zero_without_cgroup_mount() {
+        // Without a mounted cgroup hierarchy nothing is written, and the
+        // returned count must be zero so callers do not report host memory
+        // as freed. `write_control` would otherwise succeed silently and a
+        // bare `Ok` would be indistinguishable from a real reclaim.
         let mgr = CgroupManager::new("sbx_reclaim").unwrap();
         let plan = container_reclaim_plan(2_097_152).unwrap();
-        let _ = mgr.apply_reclaim(plan);
+        let written = mgr.apply_reclaim(plan).unwrap();
+        assert_eq!(
+            written, 0,
+            "no cgroup mount means zero writes, not a silent success"
+        );
+    }
+
+    #[test]
+    fn container_reclaim_plan_writes_two_control_files() {
+        let plan = container_reclaim_plan(2_097_152).unwrap();
+        assert_eq!(plan.file_writes().len(), 2);
     }
 
     #[test]

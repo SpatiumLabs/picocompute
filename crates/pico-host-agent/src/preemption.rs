@@ -51,9 +51,10 @@ impl MemberCommand {
 
 /// One member's fan-out result before aggregation.
 ///
-/// The snapshot id is present only for microVM pause members where a
-/// reclaim handle was planned.
-pub type MemberResult = (String, ReclaimStrategy, Option<String>, Result<(), String>);
+/// `reclaim_applied` reports whether host memory was actually reclaimed,
+/// which is tracked separately from `succeeded` because a sandbox can
+/// suspend correctly while reclaim fails.
+pub type MemberResult = (String, ReclaimStrategy, bool, Result<(), String>);
 
 /// Builds the aggregate outcome for a job fan-out.
 ///
@@ -62,7 +63,7 @@ pub type MemberResult = (String, ReclaimStrategy, Option<String>, Result<(), Str
 pub fn build_job_outcome(job_id: &str, results: Vec<MemberResult>) -> JobOutcome {
     let members = results
         .into_iter()
-        .map(|(sandbox_id, strategy, snapshot_id, result)| {
+        .map(|(sandbox_id, strategy, reclaim_applied, result)| {
             let (succeeded, message) = match result {
                 Ok(()) => (true, String::new()),
                 Err(message) => (false, message),
@@ -71,8 +72,8 @@ pub fn build_job_outcome(job_id: &str, results: Vec<MemberResult>) -> JobOutcome
                 sandbox_id,
                 succeeded,
                 strategy,
+                reclaim_applied,
                 message,
-                snapshot_id,
             }
         })
         .collect();
@@ -95,6 +96,19 @@ pub fn validate_reclaim_contract(
     require_memory_profile_for_reclaim(profile)?;
     require_same_backend_for_restore(capture, target)?;
     Ok(())
+}
+
+/// Validates the resume side of the suspend contract.
+///
+/// Same checks as [`validate_reclaim_contract`], named for the resume call
+/// site so the intent reads correctly where `capture` is the backend that
+/// recorded the suspended state and `target` is the attached runtime.
+pub fn validate_resume_contract(
+    capture_backend: pico_core::RuntimeType,
+    target_backend: pico_core::RuntimeType,
+    profile: SnapshotProfile,
+) -> Result<(), pico_core::SandboxError> {
+    validate_reclaim_contract(capture_backend, target_backend, profile)
 }
 
 /// Returns the reclaim strategy for a runtime, for audit and metrics.
@@ -175,13 +189,13 @@ mod tests {
                 (
                     "sbx_aaa111".into(),
                     ReclaimStrategy::ContainerSwapReclaim,
-                    None,
+                    true,
                     Ok(()),
                 ),
                 (
                     "sbx_bbb222".into(),
                     ReclaimStrategy::MicroVmSnapshotTerminate,
-                    Some("snp_test123".into()),
+                    false,
                     Err("suspend timed out".into()),
                 ),
             ],
@@ -190,6 +204,37 @@ mod tests {
         assert_eq!(outcome.members.len(), 2);
         assert!(!outcome.all_succeeded());
         assert_eq!(outcome.succeeded_ids(), vec!["sbx_aaa111"]);
+        assert_eq!(outcome.reclaimed_ids(), vec!["sbx_aaa111"]);
+    }
+
+    #[test]
+    fn resume_contract_rejects_backend_swap_between_pause_and_resume() {
+        // A runtime swapped between job pause and job resume must be
+        // rejected as a cross-backend restore.
+        assert!(
+            validate_resume_contract(
+                RuntimeType::Firecracker,
+                RuntimeType::Qemu,
+                SnapshotProfile::Memory,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_resume_contract(
+                RuntimeType::Firecracker,
+                RuntimeType::Firecracker,
+                SnapshotProfile::Memory,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_resume_contract(
+                RuntimeType::Firecracker,
+                RuntimeType::Firecracker,
+                SnapshotProfile::Filesystem,
+            )
+            .is_err()
+        );
     }
 
     #[test]
