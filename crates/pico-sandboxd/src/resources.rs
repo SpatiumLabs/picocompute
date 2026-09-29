@@ -727,10 +727,12 @@ fn fill_config_gaps(config: &mut SandboxConfig, host: &HostResourceSpec) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use pico_core::ServiceClass;
 
-    fn test_manager(root: &std::path::Path) -> HostResourceManager {
+    fn test_manager(root: &Path) -> HostResourceManager {
         HostResourceManager::new(HostResourceConfig::new(root.to_path_buf()))
     }
 

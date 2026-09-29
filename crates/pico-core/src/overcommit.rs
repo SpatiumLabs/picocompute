@@ -35,7 +35,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::cell_scheduler::HostCapacity;
-use crate::cgroups::container_reclaim_plan;
+use crate::cgroups::{ContainerReclaimPlan, container_reclaim_plan};
 use crate::error::{Result, SandboxError};
 use crate::snapshot::SnapshotProfile;
 use crate::tenant::Tenant;
@@ -383,20 +383,23 @@ pub fn apply_sched_policy_to_pid(policy: SchedPolicy, pid: u32) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let param: libc::sched_param = unsafe { std::mem::zeroed() };
+        use std::io::{self, ErrorKind};
+        use std::mem;
+
+        let param: libc::sched_param = unsafe { mem::zeroed() };
         // Safety: pid is non-zero (checked above); param is a zeroed
         // sched_param, valid for non-real-time policies.
         let ret = unsafe { libc::sched_setscheduler(pid as libc::pid_t, policy.to_libc(), &param) };
         if ret != 0 {
-            let os = std::io::Error::last_os_error();
-            if os.kind() == std::io::ErrorKind::PermissionDenied {
+            let os = io::Error::last_os_error();
+            if os.kind() == ErrorKind::PermissionDenied {
                 // Restricted environments (e.g. CI containers without
                 // CAP_SYS_NICE) deny the call even on self. Surface the
                 // typed OS error with context so callers and tests can
                 // tell a restricted environment from a real control
                 // failure without string matching.
-                return Err(SandboxError::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
+                return Err(SandboxError::Io(io::Error::new(
+                    ErrorKind::PermissionDenied,
                     format!("sched_setscheduler({policy:?}) denied for pid {pid}: {os}"),
                 )));
             }
@@ -435,6 +438,9 @@ pub enum CoreSchedSupport {
 pub fn probe_core_scheduling() -> CoreSchedSupport {
     #[cfg(target_os = "linux")]
     {
+        use std::io;
+        use std::process;
+
         // Safety: read-only GET of our own pid; out-pointer targets a
         // live stack slot for the duration of the call. The pointer-to-int
         // cast assumes a 64-bit Linux host (all production SKUs are
@@ -444,7 +450,7 @@ pub fn probe_core_scheduling() -> CoreSchedSupport {
             libc::prctl(
                 libc::PR_SCHED_CORE,
                 libc::PR_SCHED_CORE_GET,
-                std::process::id() as libc::c_ulong,
+                process::id() as libc::c_ulong,
                 libc::PIDTYPE_PID as libc::c_ulong,
                 &cookie as *const u64 as libc::c_ulong,
             )
@@ -452,7 +458,7 @@ pub fn probe_core_scheduling() -> CoreSchedSupport {
         if ret == 0 {
             return CoreSchedSupport::Supported;
         }
-        let reason = match std::io::Error::last_os_error().raw_os_error() {
+        let reason = match io::Error::last_os_error().raw_os_error() {
             Some(libc::EINVAL) => "kernel lacks CONFIG_SCHED_CORE",
             Some(libc::ENODEV) => "core scheduling disabled on this host",
             Some(libc::EPERM) | Some(libc::EACCES) => "core-sched query not permitted",
@@ -577,7 +583,7 @@ pub fn balloon_target(
 pub fn idle_reclaim_plan(
     memory_limit_bytes: u64,
     profile: SnapshotProfile,
-) -> Result<Option<crate::cgroups::ContainerReclaimPlan>> {
+) -> Result<Option<ContainerReclaimPlan>> {
     if !profile.preserves_memory() {
         return Ok(None);
     }
@@ -586,6 +592,9 @@ pub fn idle_reclaim_plan(
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
+    use std::process;
+
     use super::*;
     use crate::backend_selection::WorkloadClass;
     use crate::capacity::SandboxPackingShape;
@@ -846,7 +855,7 @@ mod tests {
         // (CI containers without CAP_SYS_NICE) skip with notice instead of
         // failing: the permission-denied path is typed, all other errors
         // still fail.
-        let pid = std::process::id();
+        let pid = process::id();
         if let Err(e) = apply_sched_policy_to_pid(SchedPolicy::Other, pid) {
             if is_permission_denied(&e) {
                 eprintln!("SKIP: environment denies sched_setscheduler: {e}");
@@ -869,7 +878,7 @@ mod tests {
     }
 
     fn is_permission_denied(e: &SandboxError) -> bool {
-        matches!(e, SandboxError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied)
+        matches!(e, SandboxError::Io(io) if io.kind() == ErrorKind::PermissionDenied)
     }
 
     #[test]

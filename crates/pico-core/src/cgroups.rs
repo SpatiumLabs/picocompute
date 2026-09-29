@@ -36,7 +36,7 @@ mod imp {
 
     use crate::cgroups::{format_cpu_list, parse_memory_pressure};
     use crate::types::{CpuBandwidth, IoLimit};
-    use crate::{Result, SandboxError, validate_sandbox_id};
+    use crate::{Result, SandboxError, ServiceClassControls, validate_sandbox_id};
     use tracing::{debug, warn};
 
     const CGROUP_BASE: &str = "/sys/fs/cgroup/sandbox";
@@ -259,7 +259,7 @@ mod imp {
         /// controls stay byte-identical with the pre-class behavior.
         pub fn apply_class_controls(
             &self,
-            controls: &crate::ServiceClassControls,
+            controls: &ServiceClassControls,
             memory_limit_bytes: u64,
         ) -> Result<()> {
             if !self.cgroups_accessible() {
@@ -375,6 +375,7 @@ mod imp {
     use std::path::PathBuf;
 
     use crate::Result;
+    use crate::ServiceClassControls;
     use crate::types::{CpuBandwidth, IoLimit};
     use crate::validate_sandbox_id;
 
@@ -428,7 +429,7 @@ mod imp {
         /// Applies service-class host controls (non-Linux no-op).
         pub fn apply_class_controls(
             &self,
-            _controls: &crate::ServiceClassControls,
+            _controls: &ServiceClassControls,
             _memory_limit_bytes: u64,
         ) -> Result<()> {
             Ok(())
