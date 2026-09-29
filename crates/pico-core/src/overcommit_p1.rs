@@ -37,15 +37,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capacity::ActiveCapacityReport;
+use crate::capacity::CapacityScenario;
 use crate::capacity::DensityAxis;
 use crate::cell_scheduler::CellSchedulerResponse;
-use crate::overcommit::BalloonPolicy;
-use crate::overcommit::BaseSharingMode;
-use crate::overcommit::CoreSchedSupport;
-use crate::overcommit::OvercommitPolicy;
-use crate::overcommit::ServiceClass;
-use crate::overcommit::balloon_target;
-use crate::overcommit::idle_reclaim_plan;
+use crate::overcommit::{
+    BalloonPolicy, BaseSharingMode, CoreSchedSupport, OvercommitPolicy, ServiceClass,
+    balloon_target, idle_reclaim_plan,
+};
 use crate::snapshot::SnapshotProfile;
 
 /// External SMT inflation reference, high end, in percent.
@@ -132,23 +130,28 @@ pub struct BeBitVerdict {
     pub be_beyond_strict: usize,
     /// BE admits beyond strict missing the bit.
     pub be_missing_bit: usize,
+    /// BE admits within strict capacity wrongly carrying the bit.
+    pub be_false_positive: usize,
     /// LS admits observed.
     pub ls_total: usize,
     /// LS admits wrongly carrying the bit.
     pub ls_false_positive: usize,
-    /// True when every BE admit beyond strict carries the bit and no LS does.
+    /// True when every BE admit beyond strict carries the bit, no BE within
+    /// strict carries it, and no LS does.
     pub passes: bool,
 }
 
 /// Verifies the overcommit-bit contract across one ramp.
 ///
 /// Every BE admit that consumed budget beyond strict capacity must carry
-/// `overcommit_applied`. LS admits must never carry it, so S-NOISY evidence
-/// can separate strict admits from overcommit admits without ambiguity.
+/// `overcommit_applied`. BE admits within strict capacity and LS admits must
+/// never carry it, so S-NOISY evidence can separate strict admits from
+/// overcommit admits without ambiguity.
 #[must_use]
 pub fn verify_be_overcommit_bits(records: &[BeBitRecord]) -> BeBitVerdict {
     let mut be_beyond_strict = 0;
     let mut be_missing_bit = 0;
+    let mut be_false_positive = 0;
     let mut ls_total = 0;
     let mut ls_false_positive = 0;
     for record in records {
@@ -159,6 +162,8 @@ pub fn verify_be_overcommit_bits(records: &[BeBitRecord]) -> BeBitVerdict {
                     if !record.overcommit_applied {
                         be_missing_bit += 1;
                     }
+                } else if record.overcommit_applied {
+                    be_false_positive += 1;
                 }
             }
             ServiceClass::LatencySensitive => {
@@ -172,9 +177,10 @@ pub fn verify_be_overcommit_bits(records: &[BeBitRecord]) -> BeBitVerdict {
     BeBitVerdict {
         be_beyond_strict,
         be_missing_bit,
+        be_false_positive,
         ls_total,
         ls_false_positive,
-        passes: be_missing_bit == 0 && ls_false_positive == 0,
+        passes: be_missing_bit == 0 && be_false_positive == 0 && ls_false_positive == 0,
     }
 }
 
@@ -268,12 +274,17 @@ pub fn sweep_mode_order_ok(points: &[OvercommitSweepPoint]) -> bool {
 
 /// Computes SMT inflation in percent: `(noisy - baseline)/baseline * 100`.
 ///
-/// Returns `None` (fail closed) when either input is non-finite or the
-/// baseline is not positive: a zero or negative baseline would make the ratio
-/// meaningless, and non-finite inputs must never become a report number.
+/// Returns `None` (fail closed) when either input is non-finite, the
+/// baseline is not positive, or the noisy value is negative: a zero or
+/// negative baseline would make the ratio meaningless, negative latency is
+/// impossible, and non-finite inputs must never become a report number.
 #[must_use]
 pub fn smt_inflation_pct(baseline_p99_secs: f64, noisy_p99_secs: f64) -> Option<f64> {
-    if !baseline_p99_secs.is_finite() || !noisy_p99_secs.is_finite() || baseline_p99_secs <= 0.0 {
+    if !baseline_p99_secs.is_finite()
+        || !noisy_p99_secs.is_finite()
+        || baseline_p99_secs <= 0.0
+        || noisy_p99_secs < 0.0
+    {
         return None;
     }
     Some((noisy_p99_secs - baseline_p99_secs) / baseline_p99_secs * 100.0)
@@ -361,7 +372,7 @@ pub struct SoakVerdict {
     pub heartbeats_fresh: bool,
     /// True when no `resource_leak` finding is present.
     pub no_leak: bool,
-    /// True when all three hold.
+    /// True when all three hold on a S-SOAK-ACTIVE report.
     pub passes: bool,
 }
 
@@ -370,18 +381,20 @@ pub struct SoakVerdict {
 /// The capacity model emits `soak_left_warning_zone` when any soak step
 /// reaches saturation, `heartbeat_stale` for stale host heartbeats, and
 /// `resource_leak` for leak detection. All three must be absent at the
-/// warning-zone LS+BE mix.
+/// warning-zone LS+BE mix. A report from any other scenario fails closed:
+/// findings from the wrong scenario cannot prove the soak gate.
 #[must_use]
 pub fn check_soak_holds(report: &ActiveCapacityReport) -> SoakVerdict {
     let has = |code: &str| report.findings.iter().any(|f| f.code == code);
     let stayed = !has("soak_left_warning_zone");
     let fresh = !has("heartbeat_stale");
     let no_leak = !has("resource_leak");
+    let scenario_ok = report.scenario == CapacityScenario::SoakActive;
     SoakVerdict {
         stayed_in_warning_zone: stayed,
         heartbeats_fresh: fresh,
         no_leak,
-        passes: stayed && fresh && no_leak,
+        passes: stayed && fresh && no_leak && scenario_ok,
     }
 }
 
@@ -396,7 +409,7 @@ pub struct NoisyVerdict {
     pub inflation_band: Option<SmtInflationBand>,
     /// Core-scheduling comparison the SKU supports.
     pub core_branch: CoreSchedBranch,
-    /// True when isolation held and inflation was computable.
+    /// True when the report is S-NOISY, isolation held, and inflation was computable.
     pub passes: bool,
 }
 
@@ -406,7 +419,8 @@ pub struct NoisyVerdict {
 /// `cross_tenant_placement`): a break fails even when latency looks green.
 /// Inflation needs both p99 inputs; an uncomputable inflation fails the
 /// recording requirement (the run happened but produced no comparable
-/// number), never silently passes.
+/// number), never silently passes. A report from any other scenario fails
+/// closed: findings from the wrong scenario cannot prove the noisy gate.
 #[must_use]
 pub fn check_noisy_holds(
     report: &ActiveCapacityReport,
@@ -418,12 +432,13 @@ pub fn check_noisy_holds(
     let isolation_held = !has("isolation_broken") && !has("cross_tenant_placement");
     let inflation_pct = smt_inflation_pct(baseline_p99_secs, noisy_p99_secs);
     let inflation_band = inflation_pct.map(classify_smt_inflation);
+    let scenario_ok = report.scenario == CapacityScenario::Noisy;
     NoisyVerdict {
         isolation_held,
         inflation_pct,
         inflation_band,
         core_branch: core_sched_branch(core_support),
-        passes: isolation_held && inflation_pct.is_some(),
+        passes: scenario_ok && isolation_held && inflation_pct.is_some(),
     }
 }
 
@@ -447,7 +462,9 @@ pub struct ExecKneeComparison {
 /// the contention knee the scenario exists to find. `active_warning_max` is
 /// the S-RAMP-ACTIVE warning-max for the same backend and SKU; when the mixed
 /// exec knee equals it exactly the comparison flags `separate_from_active_cap
-/// = false` so the report cannot present a copy as a measurement.
+/// = false` so the report cannot present a copy as a measurement. An
+/// unmeasured mixed knee is never separate: there is no knee to compare, and
+/// the missing knee stays visible in the report as `none`.
 #[must_use]
 pub fn compare_exec_knees(
     strict_exec: &ActiveCapacityReport,
@@ -459,11 +476,9 @@ pub fn compare_exec_knees(
     let strict_knee = strict_exec.knee;
     let mixed_knee = mixed_exec.knee;
     let separate_from_active_cap = match (mixed_knee, active_warning_max) {
+        (None, _) => false,
+        (Some(_), None) => true,
         (Some(knee), Some(active)) => knee != active,
-        // An unmeasured knee on either side is separate by construction: there
-        // is nothing to copy. The missing knee itself stays visible in the
-        // report as `none`.
-        _ => true,
     };
     ExecKneeComparison {
         strict_knee,
@@ -722,6 +737,18 @@ mod tests {
     }
 
     #[test]
+    fn be_bits_fail_on_within_strict_false_positive() {
+        let spurious = [BeBitRecord {
+            service_class: ServiceClass::BestEffort,
+            beyond_strict: false,
+            overcommit_applied: true,
+        }];
+        let verdict = verify_be_overcommit_bits(&spurious);
+        assert!(!verdict.passes);
+        assert_eq!(verdict.be_false_positive, 1);
+    }
+
+    #[test]
     fn sweep_summary_tracks_ls_stability_and_isolation() {
         let policy = OvercommitPolicy {
             enabled: true,
@@ -815,6 +842,7 @@ mod tests {
         assert_eq!(smt_inflation_pct(f64::NAN, 0.1), None);
         assert_eq!(smt_inflation_pct(0.1, f64::INFINITY), None);
         assert_eq!(smt_inflation_pct(-0.1, 0.1), None);
+        assert_eq!(smt_inflation_pct(0.1, -0.05), None);
     }
 
     #[test]
@@ -878,6 +906,13 @@ mod tests {
     }
 
     #[test]
+    fn soak_fails_closed_on_wrong_scenario() {
+        let report = report_for(CapacityScenario::RampActive, &[8, 12, 16], None);
+        let verdict = check_soak_holds(&report);
+        assert!(!verdict.passes);
+    }
+
+    #[test]
     fn noisy_holds_with_isolation_and_computable_inflation() {
         let report = report_for(CapacityScenario::Noisy, &[8], None);
         let verdict = check_noisy_holds(
@@ -919,6 +954,13 @@ mod tests {
     }
 
     #[test]
+    fn noisy_fails_closed_on_wrong_scenario() {
+        let report = report_for(CapacityScenario::RampActive, &[8, 12, 16], None);
+        let verdict = check_noisy_holds(&report, 0.1, 0.11, &CoreSchedSupport::Supported);
+        assert!(!verdict.passes);
+    }
+
+    #[test]
     fn exec_knees_stay_on_concurrency_axis_and_separate_from_active() {
         let strict = exec_report_for(&[(1, 0.0), (4, 0.0), (8, 0.0), (32, 0.02)]);
         let mixed = exec_report_for(&[(1, 0.0), (4, 0.0), (8, 0.0), (16, 0.02)]);
@@ -935,6 +977,15 @@ mod tests {
         let mixed = exec_report_for(&[(1, 0.0), (4, 0.0), (8, 0.0), (24, 0.02)]);
         let cmp = compare_exec_knees(&strict, &mixed, Some(24));
         assert!(cmp.both_on_exec_axis);
+        assert!(!cmp.separate_from_active_cap);
+    }
+
+    #[test]
+    fn exec_knee_unmeasured_mixed_is_not_separate() {
+        let strict = exec_report_for(&[(1, 0.0), (4, 0.0), (8, 0.0), (32, 0.02)]);
+        let mut mixed = exec_report_for(&[(1, 0.0), (4, 0.0), (8, 0.0)]);
+        mixed.knee = None;
+        let cmp = compare_exec_knees(&strict, &mixed, Some(24));
         assert!(!cmp.separate_from_active_cap);
     }
 

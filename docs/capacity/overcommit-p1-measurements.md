@@ -19,7 +19,7 @@ core-scheduling branch, soak and noisy gates, exec-knee separation, and
 balloon plus idle-reclaim bytes tied to the suspend profile.
 
 **Overall verdict**: the gating harness passes on synthetic series for the
-pinned lab profile (21 new gating tests green). No launch proven operating
+pinned lab profile (25 gating tests green). No launch proven operating
 point is set, no `docs/capacity/active-sandbox-defaults.md` number changes,
 and no production-shaped host measurement exists yet: every `proposed_lpop`
 is `none`, every per-mechanism delta below is labeled P1-synthetic
@@ -45,7 +45,7 @@ Suite mapping:
 
 | Validation area | Suite | Location |
 |---|---|---|
-| P1 gating verdicts, sweep, inflation, soak/noisy/exec, reclaim | 21 overcommit_p1 tests | `crates/pico-core/src/overcommit_p1.rs` |
+| P1 gating verdicts, sweep, inflation, soak/noisy/exec, reclaim | 25 overcommit_p1 tests | `crates/pico-core/src/overcommit_p1.rs` |
 | Service class, policy gate, controls, sched, reclaim math | 27 overcommit tests (22 module plus 5 gate matched by filter, 48 with P1) | `crates/pico-core/src/overcommit.rs` |
 | Scheduler gate, overcommit bit, serde compat | 88 cell_scheduler tests | `crates/pico-core/src/cell_scheduler/` |
 | Packing model calibration, zones, backend comparison | 69 capacity tests | `crates/pico-core/src/capacity/` |
@@ -89,7 +89,8 @@ Harness (`pico_core::overcommit_p1`):
   baseline ramp to equal the LS slice of the LS+BE mixed ramp exactly.
   Either side unmeasured fails closed.
 - `verify_be_overcommit_bits` requires every BE admit beyond strict capacity
-  to carry `overcommit_applied`, and forbids the bit on LS admits.
+  to carry `overcommit_applied`, and forbids the bit on BE admits within
+  strict plus LS admits.
 - `summarize_sweep` checks LS stability and isolation across the BE sweep;
   `sweep_mode_order_ok` enforces SharedPageCache-then-PmemDax table order.
 
@@ -118,7 +119,7 @@ per admit. A mixed ramp that moves the LS warning-max earlier fails the gate.
 Harness:
 
 - `smt_inflation_pct` computes `(noisy - baseline)/baseline * 100`, fail
-  closed on non-finite or non-positive baseline.
+  closed on non-finite inputs, non-positive baseline, or negative noisy.
 - `classify_smt_inflation` places the result against the 17.3%/45.2%
   reference band (descriptive, not a pass threshold).
 - `core_sched_branch` maps `probe_core_scheduling` onto
@@ -197,8 +198,8 @@ memory yield no plan instead of a vacuous one.
 ### 2.5 Exec concurrency (S-RAMP-EXEC)
 
 Harness: `compare_exec_knees` requires both exec reports on the
-exec-concurrency axis and flags a mixed exec knee that copies the
-active-count cap.
+exec-concurrency axis, flags a mixed exec knee that copies the
+active-count cap, and treats an unmeasured mixed knee as not separate.
 
 P1-synthetic delta (pinned by
 `exec_knees_stay_on_concurrency_axis_and_separate_from_active`):
@@ -319,9 +320,9 @@ invariants after host runs; until then they stay blocked on evidence:
 
 ```bash
 cargo test -p pico-core --all-features --lib overcommit_p1
-# 21 passed
+# 25 passed
 cargo test -p pico-core --all-features --lib overcommit
-# 48 passed (21 P1 gating plus 27 P0 overcommit matched by the filter)
+# 52 passed (25 P1 gating plus 27 P0 overcommit matched by the filter)
 cargo test -p pico-core --all-features --lib cell_scheduler
 # 88 passed
 cargo test -p pico-core --all-features --lib capacity
