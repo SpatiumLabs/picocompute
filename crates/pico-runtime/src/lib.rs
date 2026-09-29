@@ -8,11 +8,15 @@ pub mod gvisor;
 pub mod isolation;
 pub mod mock;
 pub mod qemu;
+pub mod reclaim;
 pub mod remote_firecracker;
 pub mod snapshot_optimizer;
 pub mod validation;
 
 pub use base::RuntimeHardening;
+pub use reclaim::{
+    ContainerReclaimHandle, MicroVmReclaimHandle, ReclaimError, estimate_reclaimed_bytes,
+};
 
 use pico_core::runtime::BackendCapabilities;
 

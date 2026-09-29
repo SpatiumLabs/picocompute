@@ -29,6 +29,7 @@ mod observation;
 mod operator;
 pub mod placement_engine;
 pub mod policy;
+pub mod preemption;
 mod quota;
 pub mod restore_capacity;
 pub mod runtime;
@@ -93,6 +94,7 @@ pub use placement_engine::{
     place_sampled_with_breakdown, place_with_breakdown,
 };
 pub use policy::*;
+pub use preemption::*;
 pub use quota::*;
 pub use runtime::*;
 pub use sandbox_facade::*;

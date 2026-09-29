@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pico_core::{
-    ExecRequest, FencingToken, OperationId, RuntimeType, SandboxSpec, SandboxState, TaskEvent,
-    TaskRequest, TaskState,
+    ExecRequest, FencingToken, JobPauseSignal, JobResumeSignal, OperationId, RuntimeType,
+    SandboxSpec, SandboxState, TaskEvent, TaskRequest, TaskState,
 };
 use pico_runtime::mock::{MockBackend, MockBackendConfig, MockFailure};
 use pico_sandboxd::config::SandboxdConfig;
@@ -574,6 +574,316 @@ async fn suspend_and_resume_roundtrip() {
     assert_eq!(
         harness.agent.get_status(&info.id).await.unwrap(),
         SandboxState::Running
+    );
+}
+
+#[tokio::test]
+async fn job_pause_and_resume_roundtrip() {
+    let harness = TestHarness::new().await;
+    let first = harness
+        .agent
+        .create_sandbox(spec("sbx_job_a"))
+        .await
+        .unwrap();
+    let second = harness
+        .agent
+        .create_sandbox(spec("sbx_job_b"))
+        .await
+        .unwrap();
+
+    let pause = JobPauseSignal {
+        job_id: "job_test".into(),
+        sandbox_ids: vec![first.id.clone(), second.id.clone()],
+        fencing_token: FencingToken {
+            epoch: 9,
+            sequence: 100,
+        },
+        policy_epoch: 9,
+        deadline_secs: 120,
+        reason: "preemptible-reclaim".into(),
+        tenant_id: None,
+    };
+    let outcome = harness.agent.pause_job(pause).await.unwrap();
+    assert!(outcome.all_succeeded(), "job pause failed: {outcome:?}");
+    for id in [&first.id, &second.id] {
+        assert_eq!(
+            harness.agent.get_status(id).await.unwrap(),
+            SandboxState::Suspended
+        );
+    }
+    // Reclaim writes are best-effort. The test host has no writable cgroup
+    // mount, so `reclaim_applied` is false here, which is exactly the case
+    // the flag exists to surface: suspended but capacity not freed.
+    assert!(
+        !outcome.any_reclaimed(),
+        "no writable cgroup mount in tests, so reclaim must report false"
+    );
+    assert_eq!(outcome.succeeded_without_reclaim().len(), 2);
+
+    let resume = JobResumeSignal {
+        job_id: "job_test".into(),
+        sandbox_ids: vec![first.id.clone(), second.id.clone()],
+        fencing_token: FencingToken {
+            epoch: 9,
+            sequence: 200,
+        },
+        policy_epoch: 9,
+        deadline_secs: 120,
+        reason: "capacity-restored".into(),
+        tenant_id: None,
+    };
+    let outcome = harness.agent.resume_job(resume).await.unwrap();
+    assert!(outcome.all_succeeded(), "job resume failed: {outcome:?}");
+    assert_eq!(
+        harness.agent.get_status(&first.id).await.unwrap(),
+        SandboxState::Running
+    );
+}
+
+#[tokio::test]
+async fn job_resume_rejects_backend_swap_after_pause() {
+    let harness = TestHarness::new().await;
+    let info = harness
+        .agent
+        .create_sandbox(spec("sbx_job_swap"))
+        .await
+        .unwrap();
+    let pause = job_pause_signal("job_swap", vec![info.id.clone()], None);
+    let outcome = harness.agent.pause_job(pause).await.unwrap();
+    assert!(outcome.all_succeeded(), "job pause failed: {outcome:?}");
+
+    // Simulate a runtime swap between pause and resume: the reclaim record
+    // names the capture backend, so a different target must be rejected as
+    // a cross-backend restore instead of resuming.
+    let entry = harness.agent.lookup_sandbox(&info.id).await.unwrap();
+    *entry.reclaim.lock() = Some(ReclaimRecord {
+        strategy: pico_core::ReclaimStrategy::MicroVmSnapshotTerminate,
+        capture_backend: RuntimeType::Qemu,
+        applied: true,
+    });
+
+    let resume = JobResumeSignal {
+        job_id: "job_swap".into(),
+        sandbox_ids: vec![info.id.clone()],
+        fencing_token: FencingToken {
+            epoch: 9,
+            sequence: 400,
+        },
+        policy_epoch: 9,
+        deadline_secs: 60,
+        reason: "capacity-restored".into(),
+        tenant_id: None,
+    };
+    let outcome = harness.agent.resume_job(resume).await.unwrap();
+    assert!(!outcome.all_succeeded());
+    let member = &outcome.members[0];
+    assert!(
+        member.message.contains("cross-backend"),
+        "expected cross-backend rejection, got {}",
+        member.message
+    );
+    assert_eq!(
+        harness.agent.get_status(&info.id).await.unwrap(),
+        SandboxState::Suspended,
+        "a rejected resume must not transition the sandbox"
+    );
+}
+
+#[tokio::test]
+async fn job_resume_clears_reclaim_record() {
+    let harness = TestHarness::new().await;
+    let info = harness
+        .agent
+        .create_sandbox(spec("sbx_job_clear"))
+        .await
+        .unwrap();
+    harness
+        .agent
+        .pause_job(job_pause_signal("job_clear", vec![info.id.clone()], None))
+        .await
+        .unwrap();
+    let entry = harness.agent.lookup_sandbox(&info.id).await.unwrap();
+    assert!(
+        entry.reclaim.lock().is_some(),
+        "pause must record the capture backend"
+    );
+
+    let resume = JobResumeSignal {
+        job_id: "job_clear".into(),
+        sandbox_ids: vec![info.id.clone()],
+        fencing_token: FencingToken {
+            epoch: 9,
+            sequence: 500,
+        },
+        policy_epoch: 9,
+        deadline_secs: 60,
+        reason: "capacity-restored".into(),
+        tenant_id: None,
+    };
+    harness.agent.resume_job(resume).await.unwrap();
+    assert!(
+        entry.reclaim.lock().is_none(),
+        "resume must clear the reclaim record so a later resume does not compare against a stale backend"
+    );
+}
+
+/// Prepares a sandbox bound to `tenant` so job tenant scoping is testable.
+///
+/// Uses prepare, not create: a credential request needs a guest session at
+/// boot, which the mock backend does not provide. Tenant scoping is checked
+/// before any state gate, so prepared entries are enough.
+async fn prepare_sandbox_for_tenant(harness: &TestHarness, id: &str, tenant: &str) -> String {
+    let mut tenant_spec = spec(id);
+    tenant_spec.credential_request = Some(pico_core::CredentialRequestSpec {
+        tenant_id: pico_core::TenantId::from_string(tenant),
+        lease_id: pico_core::LeaseId::from_string("lse_test"),
+        policy_decision_id: None,
+        credential_types: vec![],
+        lease: None,
+    });
+    harness.agent.prepare_sandbox(tenant_spec).await.unwrap().id
+}
+
+fn job_pause_signal(
+    job_id: &str,
+    sandbox_ids: Vec<String>,
+    tenant: Option<&str>,
+) -> JobPauseSignal {
+    JobPauseSignal {
+        job_id: job_id.into(),
+        sandbox_ids,
+        fencing_token: FencingToken {
+            epoch: 9,
+            sequence: 300,
+        },
+        policy_epoch: 9,
+        deadline_secs: 60,
+        reason: "preemptible-reclaim".into(),
+        tenant_id: tenant.map(Into::into),
+    }
+}
+
+#[tokio::test]
+async fn job_pause_rejects_mixed_tenant_members() {
+    let harness = TestHarness::new().await;
+    let a = prepare_sandbox_for_tenant(&harness, "sbx_tenant_a", "tnt_alpha").await;
+    let b = prepare_sandbox_for_tenant(&harness, "sbx_tenant_b", "tnt_beta").await;
+    let err = harness
+        .agent
+        .pause_job(job_pause_signal(
+            "job_mixed",
+            vec![a.clone(), b.clone()],
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SandboxError::BadRequest(_)), "got {err:?}");
+    // Neither tenant's sandbox may be transitioned by a mixed-tenant signal.
+    for id in [&a, &b] {
+        assert_eq!(
+            harness.agent.get_status(id).await.unwrap(),
+            SandboxState::Preparing
+        );
+    }
+}
+
+#[tokio::test]
+async fn job_pause_rejects_signal_tenant_mismatch() {
+    let harness = TestHarness::new().await;
+    let a = prepare_sandbox_for_tenant(&harness, "sbx_tenant_c", "tnt_gamma").await;
+    let err = harness
+        .agent
+        .pause_job(job_pause_signal(
+            "job_mismatch",
+            vec![a.clone()],
+            Some("tnt_other"),
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SandboxError::BadRequest(_)), "got {err:?}");
+    assert_eq!(
+        harness.agent.get_status(&a).await.unwrap(),
+        SandboxState::Preparing
+    );
+}
+
+#[tokio::test]
+async fn job_pause_accepts_matching_single_tenant() {
+    let harness = TestHarness::new().await;
+    let a = prepare_sandbox_for_tenant(&harness, "sbx_tenant_d", "tnt_delta").await;
+    // Scope check passes, so the job proceeds to the per-member state gate.
+    // The prepared sandbox is not `Running`, so the member fails on state,
+    // not on tenant: assert the message does not mention tenant.
+    let outcome = harness
+        .agent
+        .pause_job(job_pause_signal(
+            "job_scoped",
+            vec![a.clone()],
+            Some("tnt_delta"),
+        ))
+        .await
+        .unwrap();
+    assert!(!outcome.all_succeeded());
+    let member = &outcome.members[0];
+    assert!(
+        !member.message.contains("tenant"),
+        "unexpected tenant rejection: {}",
+        member.message
+    );
+    assert!(member.message.contains("cannot suspend"));
+}
+
+#[tokio::test]
+async fn job_pause_reports_unknown_strategy_for_missing_sandbox() {
+    let harness = TestHarness::new().await;
+    let pause = JobPauseSignal {
+        job_id: "job_missing".into(),
+        sandbox_ids: vec!["sbx_absent".into()],
+        fencing_token: FencingToken {
+            epoch: 1,
+            sequence: 5,
+        },
+        policy_epoch: 1,
+        deadline_secs: 60,
+        reason: "preemptible-reclaim".into(),
+        tenant_id: None,
+    };
+    let outcome = harness.agent.pause_job(pause).await.unwrap();
+    assert!(!outcome.all_succeeded());
+    let member = &outcome.members[0];
+    assert_eq!(member.strategy, pico_core::ReclaimStrategy::Unknown);
+    assert!(!member.reclaim_applied);
+}
+
+#[tokio::test]
+async fn job_pause_rejects_stale_fencing_token_per_member() {
+    let harness = TestHarness::new().await;
+    let info = harness
+        .agent
+        .create_sandbox(spec("sbx_job_stale"))
+        .await
+        .unwrap();
+    // A token that is not newer than the sandbox's boot token is reported
+    // per member, not as an envelope error, and must not transition state.
+    let pause = JobPauseSignal {
+        job_id: "job_stale2".into(),
+        sandbox_ids: vec![info.id.clone()],
+        fencing_token: FencingToken {
+            epoch: 1,
+            sequence: 0,
+        },
+        policy_epoch: 1,
+        deadline_secs: 60,
+        reason: "preemptible-reclaim".into(),
+        tenant_id: None,
+    };
+    let outcome = harness.agent.pause_job(pause).await.unwrap();
+    assert!(!outcome.all_succeeded());
+    assert!(outcome.members[0].message.contains("stale"));
+    assert_eq!(
+        harness.agent.get_status(&info.id).await.unwrap(),
+        SandboxState::Running,
+        "a stale-token member must not transition"
     );
 }
 

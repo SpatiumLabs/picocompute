@@ -16,10 +16,10 @@ use parking_lot::Mutex;
 use pico_core::{
     AccessLease, Admission, AdmitRequest, AuditEventBuilder, AuditEventDetails, AuditEventKind,
     AuditEventSink, ExecRequest, ExecResponse, FileInfo, FileReadResponse, FileWriteRequest, Hlc,
-    LeaseAction, LeaseAuthority, LeaseScope, PolicyAction, PolicyEngine, PortForwardEndpoint,
-    PortForwardRequest, PortForwardResponse, PrincipalId, QuotaEngine, Result, SandboxError,
-    SandboxId, SandboxInfo, SandboxService, SandboxSpec, SshInfo, TaskEvent, TaskInfo, TaskRequest,
-    TenantId, new_ulid,
+    JobOutcome, JobPauseSignal, JobResumeSignal, LeaseAction, LeaseAuthority, LeaseScope,
+    PolicyAction, PolicyEngine, PortForwardEndpoint, PortForwardRequest, PortForwardResponse,
+    PrincipalId, QuotaEngine, Result, SandboxError, SandboxId, SandboxInfo, SandboxService,
+    SandboxSpec, SshInfo, TaskEvent, TaskInfo, TaskRequest, TenantId, new_ulid,
 };
 use tokio::sync::broadcast;
 
@@ -362,6 +362,18 @@ impl SandboxService for PolicyEnforcingAgent {
     async fn resume(&self, id: &str) -> Result<()> {
         self.check_policy(PolicyAction::Resume)?;
         self.inner.resume(id).await
+    }
+
+    async fn pause_job(&self, signal: JobPauseSignal) -> Result<JobOutcome> {
+        signal.validate()?;
+        self.check_policy(PolicyAction::Suspend)?;
+        self.inner.pause_job(signal).await
+    }
+
+    async fn resume_job(&self, signal: JobResumeSignal) -> Result<JobOutcome> {
+        signal.validate()?;
+        self.check_policy(PolicyAction::Resume)?;
+        self.inner.resume_job(signal).await
     }
 
     async fn keepalive(&self, id: &str) -> Result<()> {

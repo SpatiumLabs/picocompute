@@ -102,6 +102,7 @@ The control plane owns admission, policy, scheduling, and lifecycle state. The h
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) - system design and repository layout
+- [Worker-container topology](docs/design/worker-container-topology.md) - preemptible pool with job pause/resume and backend reclaim
 - [API reference](docs/api/v2/openapi.yaml) with [examples](docs/api/v2/EXAMPLES.md)
 - [Runbooks](docs/runbooks/README.md) - operational procedures
 - [Threat model](docs/security/threat-model.md) and [production readiness](docs/security/production-readiness.md)

@@ -35,6 +35,8 @@ pub fn build_router(state: AppState, token: String) -> Router {
             post(handlers::sandbox::suspend),
         )
         .route("/v1/sandboxes/{id}/resume", post(handlers::sandbox::resume))
+        .route("/v1/jobs/{job_id}/pause", post(handlers::jobs::pause_job))
+        .route("/v1/jobs/{job_id}/resume", post(handlers::jobs::resume_job))
         .route(
             "/v1/sandboxes/{id}/keepalive",
             post(handlers::sandbox::keepalive),

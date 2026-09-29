@@ -374,8 +374,22 @@ Expected operations:
 - `UpdatePolicy`
 - `Suspend`
 - `Resume`
+- `PauseJob`
+- `ResumeJob`
 - `Fork`
 - `Destroy`
+
+`PauseJob` and `ResumeJob` are job-scoped bulk signals. The control plane
+sends one envelope per job; the host fans out to one fenced `Suspend` or
+`Resume` per member sandbox with shared fencing, policy-epoch, and
+deadline handling. Jobs are single-tenant: a mixed-tenant member set or a
+tenant mismatch fails the whole signal before any side effect. Bulk
+outcomes return `207` when any member fails, and a pause also returns
+`207` when every member suspended without reclaiming host memory, so a
+status-only caller cannot mistake a partial or non-reclaiming pause for
+success. Resume rejects a runtime that differs from the backend which
+recorded the paused state. See
+[worker-container topology](docs/design/worker-container-topology.md).
 
 ### 5.3 Lifecycle state
 
@@ -1364,6 +1378,19 @@ Expected behavior:
 - authenticate every page before use
 - preserve the same readiness, exclusion, lineage, and compatibility contract
 - use eager restore only when it preserves the requested `memory` semantics
+
+### 11.9 Job preemption with backend-specific reclaim
+
+A job-scoped pause/resume signal reclaims preemptible capacity without
+weakening the suspend contract. The host fans one job envelope out to one
+fenced `Suspend` or `Resume` per member sandbox. Containers reclaim
+through cgroup plus swap pressure with `MADV_WILLNEED` prefetch on resume;
+microVMs reclaim through snapshot plus terminate plus on-demand restore on
+the same backend family. Resume always refreshes policy epoch, network,
+credentials, session, and `ResumeNotify`, and passes the full
+restore-validation gate list. The rollout owner runs outside the
+preemptible pool. See
+[worker-container topology](docs/design/worker-container-topology.md).
 
 ---
 

@@ -224,6 +224,31 @@ mod imp {
             Ok(())
         }
 
+        /// Applies a container reclaim plan after suspend.
+        ///
+        /// Writes `memory.high` throttle first, then `memory.reclaim` to push
+        /// cold pages to swap while the frozen cgroup preserves execution
+        /// state. Uses the plan's `file_writes` order so throttle precedes
+        /// reclaim.
+        ///
+        /// Returns the number of control files actually written. Zero means
+        /// the cgroup hierarchy is not mounted (non-Linux host, or a Linux
+        /// host without the sandbox cgroup tree), so nothing was reclaimed.
+        /// Callers must not report host memory as freed on a zero count:
+        /// `write_control` succeeds silently when the mount is absent, so an
+        /// `Ok` alone would claim a reclaim that never happened.
+        pub fn apply_reclaim(&self, plan: super::ContainerReclaimPlan) -> Result<usize> {
+            if !self.cgroups_accessible() {
+                return Ok(0);
+            }
+            let mut written = 0;
+            for (file, value) in plan.file_writes() {
+                self.write_control(file, &value)?;
+                written += 1;
+            }
+            Ok(written)
+        }
+
         pub fn cleanup(&self) -> Result<()> {
             let path = self.sandbox_path();
             if !path.exists() {
@@ -365,6 +390,14 @@ mod imp {
 
         pub fn setup_cpuset(&self, _cpus: &[u32]) -> Result<()> {
             Ok(())
+        }
+
+        /// Applies a container reclaim plan after suspend (non-Linux no-op).
+        ///
+        /// Always reports zero files written: there is no cgroup hierarchy
+        /// to reclaim through, so callers must not claim host memory freed.
+        pub fn apply_reclaim(&self, _plan: super::ContainerReclaimPlan) -> Result<usize> {
+            Ok(0)
         }
 
         pub fn cleanup(&self) -> Result<()> {
@@ -522,6 +555,69 @@ pub(crate) fn format_cpu_list(cpus: &[u32]) -> String {
     }
 
     parts.join(",")
+}
+
+/// Prefetch advice applied on container resume.
+///
+/// Hot pages reclaimed to swap are prefetched with `MADV_WILLNEED` so the
+/// next request faults them back before execution resumes. The constant
+/// documents the contract; the actual `madvise` call lives in the
+/// privileged helper that owns the reclaimed mapping.
+pub const CONTAINER_PREFETCH_ADVICE: &str = "MADV_WILLNEED";
+
+/// Container reclaim plan: cgroup throttle plus swap reclaim.
+///
+/// The plan is pure data so unit tests can assert the throttle math
+/// without touching `/sys/fs/cgroup`. The privileged helper applies it
+/// best-effort after the sandbox is suspended: lower `memory.high` to
+/// throttle, write `memory.reclaim` to push cold pages to swap, and keep
+/// the frozen cgroup so execution state is preserved while host memory
+/// is freed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerReclaimPlan {
+    /// Target for `memory.high` during reclaim (bytes).
+    pub memory_high_bytes: u64,
+    /// Bytes requested through `memory.reclaim` (bytes).
+    pub reclaim_bytes: u64,
+}
+
+impl ContainerReclaimPlan {
+    /// Control file writes that implement this plan.
+    ///
+    /// Returns `(file, value)` pairs in apply order: throttle first, then
+    /// reclaim. Callers write each file best-effort and keep the sandbox
+    /// suspended when a write fails.
+    #[must_use]
+    pub fn file_writes(self) -> Vec<(&'static str, String)> {
+        vec![
+            ("memory.high", self.memory_high_bytes.to_string()),
+            ("memory.reclaim", self.reclaim_bytes.to_string()),
+        ]
+    }
+}
+
+/// Computes the container reclaim plan for a sandbox.
+///
+/// The throttle is half the hard limit so the kernel reclaims aggressively
+/// without tripping the OOM killer; the reclaim request equals the full
+/// hard limit so cold pages move to swap while the frozen cgroup preserves
+/// execution state. Zero or tiny inputs fail closed.
+pub fn container_reclaim_plan(memory_limit_bytes: u64) -> crate::Result<ContainerReclaimPlan> {
+    if memory_limit_bytes == 0 {
+        return Err(crate::SandboxError::BadRequest(
+            "container reclaim requires a non-zero memory limit".into(),
+        ));
+    }
+    let memory_high_bytes = memory_limit_bytes / 2;
+    if memory_high_bytes == 0 {
+        return Err(crate::SandboxError::BadRequest(
+            "container reclaim memory limit is too small to throttle".into(),
+        ));
+    }
+    Ok(ContainerReclaimPlan {
+        memory_high_bytes,
+        reclaim_bytes: memory_limit_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -798,5 +894,47 @@ mod tests {
     fn cgroup_counter_delta_treats_reset_as_new_epoch() {
         // Cgroup recreated: kernel counters restart at zero.
         assert_eq!(cgroup_counter_delta(2, Some(100)), 2);
+    }
+
+    #[test]
+    fn container_reclaim_plan_halves_throttle() {
+        let plan = container_reclaim_plan(1_073_741_824).unwrap();
+        assert_eq!(plan.memory_high_bytes, 536_870_912);
+        assert_eq!(plan.reclaim_bytes, 1_073_741_824);
+        let writes = plan.file_writes();
+        assert_eq!(writes[0].0, "memory.high");
+        assert_eq!(writes[1].0, "memory.reclaim");
+    }
+
+    #[test]
+    fn apply_reclaim_reports_zero_without_cgroup_mount() {
+        // Without a mounted cgroup hierarchy nothing is written, and the
+        // returned count must be zero so callers do not report host memory
+        // as freed. `write_control` would otherwise succeed silently and a
+        // bare `Ok` would be indistinguishable from a real reclaim.
+        let mgr = CgroupManager::new("sbx_reclaim").unwrap();
+        let plan = container_reclaim_plan(2_097_152).unwrap();
+        let written = mgr.apply_reclaim(plan).unwrap();
+        assert_eq!(
+            written, 0,
+            "no cgroup mount means zero writes, not a silent success"
+        );
+    }
+
+    #[test]
+    fn container_reclaim_plan_writes_two_control_files() {
+        let plan = container_reclaim_plan(2_097_152).unwrap();
+        assert_eq!(plan.file_writes().len(), 2);
+    }
+
+    #[test]
+    fn container_reclaim_plan_rejects_zero_limit() {
+        assert!(container_reclaim_plan(0).is_err());
+        assert!(container_reclaim_plan(1).is_err());
+    }
+
+    #[test]
+    fn container_prefetch_advice_is_willneed() {
+        assert_eq!(CONTAINER_PREFETCH_ADVICE, "MADV_WILLNEED");
     }
 }
