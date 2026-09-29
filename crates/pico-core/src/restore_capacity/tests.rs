@@ -5,6 +5,7 @@ use crate::cell_scheduler::{
     HostPressure,
 };
 use crate::identity::HostId;
+use crate::overcommit::ServiceClass;
 use crate::runtime::RuntimeType;
 use crate::scheduler::SnapshotTimingHint;
 
@@ -86,6 +87,7 @@ fn restore_request() -> CellSchedulerRequest {
         image: "alpine-3.18".into(),
         snapshot_id: Some("snp_warm".into()),
         is_restore: true,
+        service_class: ServiceClass::LatencySensitive,
     }
 }
 

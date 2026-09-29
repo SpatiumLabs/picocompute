@@ -4,6 +4,7 @@ use crate::cell_scheduler::{
     HostPressure,
 };
 use crate::identity::HostId;
+use crate::overcommit::ServiceClass;
 use crate::scheduler::{CellCapacity, SnapshotTimingHint};
 
 fn default_host_capacity() -> HostCapacity {
@@ -60,6 +61,7 @@ fn request() -> CellSchedulerRequest {
         image: "alpine-3.18".into(),
         snapshot_id: None,
         is_restore: false,
+        service_class: ServiceClass::LatencySensitive,
     }
 }
 

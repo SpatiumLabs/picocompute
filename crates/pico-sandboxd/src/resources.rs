@@ -43,7 +43,7 @@ use parking_lot::Mutex;
 use pico_core::cgroups::{CgroupManager, DEFAULT_MAX_PIDS, default_soft_limit_bytes};
 use pico_core::cpu_isolation::{CpuAllocator, CpuIsolationPolicy, CpuSet, CpuTopology};
 use pico_core::workspace::WorkspaceManager;
-use pico_core::{CORE_METRICS, CleanupReport, ResourceReceipt, SandboxConfig};
+use pico_core::{CORE_METRICS, CleanupReport, ResourceReceipt, SandboxConfig, controls_for_class};
 use pico_telemetry::metrics::Labels;
 use serde::{Deserialize, Serialize};
 
@@ -326,6 +326,21 @@ impl HostResourceManager {
         ) {
             return Err(HostResourceError {
                 message: format!("cgroup setup failed for {sandbox_id}: {err}"),
+                rollback: self.teardown(workspaces, &sandbox_id),
+                created,
+            });
+        }
+        // Best-effort sandboxes run deprioritized: overwrite the setup
+        // weight/throttle with the class controls. Latency-sensitive keeps
+        // the setup values untouched (identical to pre-class behavior).
+        if config.service_class.is_best_effort()
+            && let Err(err) = cgroup.apply_class_controls(
+                &controls_for_class(config.service_class),
+                config.memory_limit_bytes,
+            )
+        {
+            return Err(HostResourceError {
+                message: format!("cgroup class controls failed for {sandbox_id}: {err}"),
                 rollback: self.teardown(workspaces, &sandbox_id),
                 created,
             });

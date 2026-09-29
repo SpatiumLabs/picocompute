@@ -249,6 +249,31 @@ mod imp {
             Ok(written)
         }
 
+        /// Applies service-class host controls to an existing cgroup.
+        ///
+        /// Writes `cpu.weight` and `memory.high` from
+        /// [`crate::ServiceClassControls`] (see
+        /// [`crate::overcommit::controls_for_class`]). Callers apply this
+        /// after [`Self::setup`] for best-effort sandboxes; the
+        /// latency-sensitive path keeps the `setup` values untouched so its
+        /// controls stay byte-identical with the pre-class behavior.
+        pub fn apply_class_controls(
+            &self,
+            controls: &crate::ServiceClassControls,
+            memory_limit_bytes: u64,
+        ) -> Result<()> {
+            if !self.cgroups_accessible() {
+                return Ok(());
+            }
+            let weight = controls.cpu_weight.clamp(1, 10000);
+            self.write_control("cpu.weight", &weight.to_string())?;
+            self.write_control(
+                "memory.high",
+                &controls.memory_high_bytes(memory_limit_bytes).to_string(),
+            )?;
+            Ok(())
+        }
+
         pub fn cleanup(&self) -> Result<()> {
             let path = self.sandbox_path();
             if !path.exists() {
@@ -398,6 +423,15 @@ mod imp {
         /// to reclaim through, so callers must not claim host memory freed.
         pub fn apply_reclaim(&self, _plan: super::ContainerReclaimPlan) -> Result<usize> {
             Ok(0)
+        }
+
+        /// Applies service-class host controls (non-Linux no-op).
+        pub fn apply_class_controls(
+            &self,
+            _controls: &crate::ServiceClassControls,
+            _memory_limit_bytes: u64,
+        ) -> Result<()> {
+            Ok(())
         }
 
         pub fn cleanup(&self) -> Result<()> {

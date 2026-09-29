@@ -25,7 +25,7 @@ use pico_core::{
     CacheLocality, CellCapacity, CellHealth, CellId, CellInfo, CellScheduler, CellSchedulerError,
     CellSchedulerRequest, HostCacheState, HostCapacity, HostHealth, HostId, HostInfo,
     HostInventory, HostPressure, RegionId, RegionalScheduler, RuntimeType, SandboxError,
-    SchedulerError, SchedulerRequest, SnapshotTimingHint, TenantId,
+    SchedulerError, SchedulerRequest, ServiceClass, SnapshotTimingHint, TenantId,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -640,6 +640,10 @@ impl PlacementGate {
             image: image.to_string(),
             snapshot_id: None,
             is_restore: false,
+            // Tenant-policy resolution lands here once the tenant
+            // registry is wired into admission; until then the API path
+            // keeps the latency-sensitive default (strict packing).
+            service_class: ServiceClass::LatencySensitive,
         };
         let cell_resp = self
             .cell

@@ -33,6 +33,9 @@ use time::OffsetDateTime;
 
 use crate::identity::HostId;
 use crate::in_flight::InFlightOverlay;
+use crate::overcommit::{
+    OvercommitPolicy, ServiceClass, effective_capacity_for_class, effective_memory_request,
+};
 use crate::placement_engine::{SelectionDetail, SelectionMode};
 use crate::runtime::RuntimeType;
 use crate::scheduler::SnapshotTimingHint;
@@ -298,6 +301,15 @@ pub struct CellSchedulerRequest {
     pub snapshot_id: Option<String>,
     /// Whether this is a restore operation (affects pressure check).
     pub is_restore: bool,
+    /// Scheduling service class for this sandbox.
+    ///
+    /// Serde-defaults to [`ServiceClass::LatencySensitive`] so payloads
+    /// written before the CAP-168 track keep strict no-overcommit packing.
+    /// Best-effort requests pack against overcommitted effective capacity
+    /// only when the scheduler's [`OvercommitPolicy`] is enabled; the
+    /// policy stays disabled unless a config explicitly enables it.
+    #[serde(default)]
+    pub service_class: ServiceClass,
 }
 
 // ---- Scoring ----
@@ -450,6 +462,18 @@ pub struct CellSchedulerResponse {
     pub selection: SelectionDetail,
     /// Whether any candidate capacity was adjusted by the in-flight overlay.
     pub overlay_adjusted: bool,
+    /// Service class of the admitted request (echoed for observability).
+    ///
+    /// Serde-defaults to [`ServiceClass::LatencySensitive`].
+    #[serde(default)]
+    pub service_class: ServiceClass,
+    /// True when a best-effort request was admitted beyond strict
+    /// no-overcommit capacity via the [`OvercommitPolicy`] gate.
+    ///
+    /// S-NOISY evidence uses this bit to separate strict admits from
+    /// overcommit admits. Serde-defaults to false.
+    #[serde(default)]
+    pub overcommit_applied: bool,
 }
 
 /// Backpressure signal from the cell scheduler.
@@ -507,6 +531,10 @@ pub enum CellSchedulerError {
     /// All eligible hosts have saturated create/restore pressure.
     #[error("all hosts have saturated create/restore pressure")]
     PressureSaturated,
+
+    /// The configured overcommit policy is invalid.
+    #[error("invalid overcommit policy: {reason}")]
+    InvalidOvercommitPolicy { reason: String },
 }
 
 impl CellSchedulerError {
@@ -751,6 +779,11 @@ pub struct CellScheduler {
     overlay: parking_lot::Mutex<InFlightOverlay>,
     /// Instance RNG for power-of-k sampling (OS-seeded; tests override).
     rng: parking_lot::Mutex<rand::rngs::SmallRng>,
+    /// Gated best-effort overcommit policy (disabled by default).
+    ///
+    /// While disabled, every request packs strict no-overcommit regardless
+    /// of [`CellSchedulerRequest::service_class`].
+    overcommit: OvercommitPolicy,
 }
 
 impl CellScheduler {
@@ -764,6 +797,7 @@ impl CellScheduler {
             selection: SelectionMode::Best,
             overlay: parking_lot::Mutex::new(InFlightOverlay::new()),
             rng: parking_lot::Mutex::new(rand::make_rng()),
+            overcommit: OvercommitPolicy::default(),
         }
     }
 
@@ -777,6 +811,7 @@ impl CellScheduler {
             selection: SelectionMode::Best,
             overlay: parking_lot::Mutex::new(InFlightOverlay::new()),
             rng: parking_lot::Mutex::new(rand::make_rng()),
+            overcommit: OvercommitPolicy::default(),
         }
     }
 
@@ -794,6 +829,22 @@ impl CellScheduler {
     pub fn with_selection(mut self, selection: SelectionMode) -> Self {
         self.selection = selection;
         self
+    }
+
+    /// Sets the gated best-effort overcommit policy.
+    ///
+    /// The default policy is disabled, which keeps strict no-overcommit
+    /// packing for every request class. The policy is validated when
+    /// scheduling starts; an invalid policy fails placement closed with
+    /// [`CellSchedulerError::InvalidOvercommitPolicy`].
+    pub fn with_overcommit_policy(mut self, policy: OvercommitPolicy) -> Self {
+        self.overcommit = policy;
+        self
+    }
+
+    /// Returns the configured overcommit policy.
+    pub fn overcommit_policy(&self) -> OvercommitPolicy {
+        self.overcommit
     }
 
     /// Seeds the sampling RNG deterministically (tests).
@@ -899,6 +950,11 @@ impl CellScheduler {
         context: Option<&crate::scheduler::ScheduleTraceContext>,
     ) -> Result<CellSchedulerResponse, CellSchedulerError> {
         let start = OffsetDateTime::now_utc();
+        if let Err(err) = self.overcommit.validate() {
+            return Err(CellSchedulerError::InvalidOvercommitPolicy {
+                reason: err.to_string(),
+            });
+        }
         let sampled_k = match self.selection {
             SelectionMode::Best => None,
             SelectionMode::PowerOfK { k } => Some(k),
@@ -1103,6 +1159,16 @@ impl CellScheduler {
             metrics,
             selection,
             overlay_adjusted,
+            service_class: request.service_class,
+            // True only when the winner could not have fit this request
+            // strict: the admit consumed overcommit budget.
+            overcommit_applied: request.service_class.is_best_effort()
+                && self.overcommit.enabled
+                && !selected_host.capacity.can_fit(
+                    request.vcpus,
+                    request.memory_mb,
+                    request.disk_mb,
+                ),
         };
 
         response.metrics.record();
@@ -1219,6 +1285,13 @@ impl CellScheduler {
     /// [`Self::classify_rejection`] derives typed errors from the returned
     /// rejection strings instead of re-implementing these checks.
     ///
+    /// Best-effort requests pack against overcommitted effective capacity
+    /// (scaled vCPU/memory totals plus the shared-base discount) only when
+    /// the overcommit policy is enabled; every other combination packs
+    /// strict. The rejection string keeps the `capacity` keyword so
+    /// [`Self::categorize_rejection`] still maps it to
+    /// `insufficient_capacity`.
+    ///
     /// Returns `Ok(())` if the host passes, or `Err(reason)` with a
     /// human-readable rejection reason.
     fn check_hard_constraints(
@@ -1230,10 +1303,16 @@ impl CellScheduler {
             return Err(format!("host is {}", host.health.as_str()));
         }
 
-        if !host
-            .capacity
-            .can_fit(request.vcpus, request.memory_mb, request.disk_mb)
-        {
+        let memory_req =
+            effective_memory_request(request.memory_mb, request.service_class, &self.overcommit);
+        let effective =
+            effective_capacity_for_class(&host.capacity, request.service_class, &self.overcommit);
+        if !effective.can_fit(request.vcpus, memory_req, request.disk_mb) {
+            if request.service_class.is_best_effort() && self.overcommit.enabled {
+                return Err(
+                    "insufficient capacity (best-effort overcommit budget exhausted)".into(),
+                );
+            }
             return Err("insufficient capacity".into());
         }
 

@@ -44,7 +44,7 @@ use pico_core::{
     PolicyDecisionId, PolicyEngine, PolicyOutcome, PrincipalId, QuotaAdmit, QuotaEngine,
     QuotaLimits, ReconcileAction, RegionId, RegionalScheduler, ResourceLimits, RevocationReason,
     RuntimeType, SandboxError, SandboxId, SandboxMetadata, SandboxState, ScheduleTraceContext,
-    SchedulerError, SchedulerRequest, SnapshotTimingHint, TenantId, TransitionError,
+    SchedulerError, SchedulerRequest, ServiceClass, SnapshotTimingHint, TenantId, TransitionError,
     apply_transition, apply_transition_with_audit, check_policy_epoch, is_lease_expired,
     is_ordered_chronologically, is_valid_idempotency_key, validate_causal_chain,
     validate_policy_epoch,
@@ -202,6 +202,7 @@ fn cell_request(sbx: &str) -> CellSchedulerRequest {
         image: "img:readiness".into(),
         snapshot_id: None,
         is_restore: false,
+        service_class: ServiceClass::LatencySensitive,
     }
 }
 
@@ -2069,6 +2070,7 @@ fn create_request(suffix: &str, op: OperationId, key: Option<String>) -> CreateR
         operation_id: op,
         idempotency_key: key,
         fencing_token: None,
+        service_class: None,
     }
 }
 
