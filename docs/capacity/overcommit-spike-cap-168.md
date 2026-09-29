@@ -126,8 +126,9 @@ Built:
   revision (follow-up in section 6).
 
 P0-model delta: the apply path round-trips `SCHED_IDLE` back to
-`SCHED_OTHER` on the calling process on Linux (pinned by
-`sched_policy_applies_to_own_process`); the probe returns a valid
+`SCHED_OTHER` on the calling process on Linux hosts that permit
+`sched_setscheduler` (restricted containers deny it with EPERM and skip
+with notice; pinned by `sched_policy_applies_to_own_process`); the probe returns a valid
 `Supported`/`Unsupported` variant without side effects (pinned by
 `core_sched_probe_returns_a_valid_variant`). No latency delta is
 claimed at P0: scheduler-policy effects need contended-CPU measurement.

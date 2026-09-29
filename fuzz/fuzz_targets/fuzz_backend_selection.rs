@@ -12,6 +12,7 @@ use pico_core::backend_selection::{
 };
 use pico_core::runtime::{BackendCapabilities, BackendCapability, BackendHealth, RuntimeType};
 use pico_core::tenant::{Tenant, TenantStatus};
+use pico_core::ServiceClass;
 use pico_core::identity::TenantId;
 use hashbrown::HashMap;
 use libfuzzer_sys::fuzz_target;
@@ -61,6 +62,7 @@ fn fuzz_one(data: &[u8]) {
             WorkloadClass::CompatibilityVm,
             WorkloadClass::KubernetesIntegrated,
         ],
+        default_service_class: ServiceClass::LatencySensitive,
         policy_epoch: Some(1),
     };
     let caps = BackendCapabilities::new(
