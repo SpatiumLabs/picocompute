@@ -1,5 +1,6 @@
 use super::*;
 use crate::identity::HostId;
+use crate::overcommit::{BaseSharingMode, OvercommitPolicy};
 
 fn make_host(id: &str, health: HostHealth) -> HostInfo {
     HostInfo {
@@ -43,6 +44,7 @@ fn make_request() -> CellSchedulerRequest {
         image: "alpine-3.18".into(),
         snapshot_id: None,
         is_restore: false,
+        service_class: ServiceClass::LatencySensitive,
     }
 }
 
@@ -1194,6 +1196,231 @@ fn simulation_all_draining_returns_specific_error() {
 }
 
 // ================================================================
+// Best-effort overcommit gate tests (CAP-168 track)
+// ================================================================
+
+/// Host with zero strict default-shape slots left.
+fn make_full_host(id: &str) -> HostInfo {
+    let mut host = make_host(id, HostHealth::Healthy);
+    host.capacity.allocated_vcpus = 64;
+    host.capacity.allocated_memory_mb = 65536;
+    host
+}
+
+/// Host with exactly one strict default-shape slot left (2 vCPU, 512 MiB).
+fn make_single_slot_host(id: &str) -> HostInfo {
+    let mut host = make_host(id, HostHealth::Healthy);
+    host.capacity.allocated_vcpus = 62;
+    host.capacity.allocated_memory_mb = 65024;
+    host
+}
+
+fn be_request() -> CellSchedulerRequest {
+    let mut request = make_request();
+    request.service_class = ServiceClass::BestEffort;
+    request
+}
+
+fn enabled_policy() -> OvercommitPolicy {
+    OvercommitPolicy {
+        enabled: true,
+        be_cpu_overcommit: 2.0,
+        be_memory_overcommit: 2.0,
+        be_shared_base_mb: 0,
+        base_sharing: BaseSharingMode::None,
+    }
+}
+
+#[test]
+fn be_request_packs_strict_while_policy_disabled() {
+    // Default posture: the gate is off, so a best-effort request on a
+    // full host is rejected exactly like a latency-sensitive one.
+    let scheduler = CellScheduler::new();
+    assert!(!scheduler.overcommit_policy().enabled);
+    let hosts = vec![make_full_host("hst_1")];
+
+    let be_result = scheduler.schedule(&be_request(), &hosts);
+    assert!(matches!(
+        be_result,
+        Err(CellSchedulerError::InsufficientCapacity { .. })
+    ));
+
+    let ls_result = scheduler.schedule(&make_request(), &hosts);
+    assert!(matches!(
+        ls_result,
+        Err(CellSchedulerError::InsufficientCapacity { .. })
+    ));
+}
+
+#[test]
+fn be_request_admits_beyond_strict_when_policy_enabled() {
+    // Full host: the default shape fits no strict slot, but 2x
+    // overcommit opens 64 vCPU of best-effort budget.
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let hosts = vec![make_full_host("hst_1")];
+
+    let response = scheduler
+        .schedule(&be_request(), &hosts)
+        .expect("BE must pack against overcommitted capacity");
+    assert!(response.placed);
+    assert_eq!(response.service_class, ServiceClass::BestEffort);
+    assert!(
+        response.overcommit_applied,
+        "admit beyond strict capacity must set the overcommit bit"
+    );
+}
+
+#[test]
+fn ls_request_never_consumes_overcommit_budget() {
+    // The default shape on a full host stays rejected for
+    // latency-sensitive requests even with the policy enabled.
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let hosts = vec![make_full_host("hst_1")];
+
+    let result = scheduler.schedule(&make_request(), &hosts);
+    assert!(matches!(
+        result,
+        Err(CellSchedulerError::InsufficientCapacity { .. })
+    ));
+}
+
+#[test]
+fn strict_be_admit_leaves_overcommit_bit_clear() {
+    // A best-effort request that fits strict is a normal admit: the bit
+    // separates strict admits from overcommit admits for S-NOISY.
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let hosts = vec![make_single_slot_host("hst_1")];
+
+    let response = scheduler
+        .schedule(&be_request(), &hosts)
+        .expect("BE must fit the remaining strict slot");
+    assert!(response.placed);
+    assert!(!response.overcommit_applied);
+}
+
+#[test]
+fn be_rejection_names_overcommit_budget_while_staying_typed() {
+    // The message names the exhausted budget for operators, while the
+    // `capacity` keyword keeps the insufficient-capacity classification.
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let host = make_full_host("hst_1");
+    let mut be = be_request();
+    be.vcpus = 200;
+    let result = scheduler.schedule(&be, &[host]);
+    assert!(matches!(
+        result,
+        Err(CellSchedulerError::InsufficientCapacity { .. })
+    ));
+}
+
+#[test]
+fn be_rejection_message_is_exact_when_budget_binds() {
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let host = make_full_host("hst_1");
+    let mut be = be_request();
+    be.vcpus = 200;
+    let err = scheduler
+        .check_hard_constraints(&host, &be)
+        .expect_err("over-budget BE must fail the constraint");
+    assert_eq!(
+        err,
+        "insufficient capacity (best-effort overcommit budget exhausted)"
+    );
+}
+
+#[test]
+fn be_rejection_stays_plain_when_disk_binds() {
+    // Disk is never overcommitted: a disk-bound failure must not blame
+    // the overcommit budget even for best-effort under an enabled policy.
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let mut host = make_host("hst_1", HostHealth::Healthy);
+    host.capacity.used_disk_mb = host.capacity.total_disk_mb;
+    let err = scheduler
+        .check_hard_constraints(&host, &be_request())
+        .expect_err("disk-full host must fail the constraint");
+    assert_eq!(err, "insufficient capacity");
+}
+
+#[test]
+fn be_rejection_stays_plain_when_slots_bind() {
+    // Process slots are never overcommitted either.
+    let scheduler = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let mut host = make_host("hst_1", HostHealth::Healthy);
+    host.capacity.used_process_slots = host.capacity.max_process_slots;
+    let err = scheduler
+        .check_hard_constraints(&host, &be_request())
+        .expect_err("slot-full host must fail the constraint");
+    assert_eq!(err, "insufficient capacity");
+}
+
+#[test]
+fn invalid_overcommit_policy_fails_placement_closed() {
+    let bad = OvercommitPolicy {
+        enabled: true,
+        be_cpu_overcommit: 0.5,
+        ..OvercommitPolicy::default()
+    };
+    let scheduler = CellScheduler::new().with_overcommit_policy(bad);
+    let hosts = vec![make_host("hst_1", HostHealth::Healthy)];
+    let result = scheduler.schedule(&make_request(), &hosts);
+    let err = result.expect_err("invalid policy must fail closed");
+    assert!(matches!(
+        err,
+        CellSchedulerError::InvalidOvercommitPolicy { .. }
+    ));
+    assert!(!err.is_throttled(), "config errors are not retryable");
+}
+
+#[test]
+fn request_without_service_class_deserializes_to_ls() {
+    // Payloads written before the CAP-168 track keep strict packing.
+    let json = serde_json::json!({
+        "sandbox_id": "sbx_old",
+        "vcpus": 2,
+        "memory_mb": 512,
+        "disk_mb": 1024,
+        "runtime": "firecracker",
+        "image": "alpine-3.18",
+        "snapshot_id": null,
+        "is_restore": false,
+    });
+    let request: CellSchedulerRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(request.service_class, ServiceClass::LatencySensitive);
+}
+
+#[test]
+fn response_without_overcommit_fields_deserializes_to_strict() {
+    let json = serde_json::json!({
+        "placed": true,
+        "host_id": "hst_1",
+        "reason": {"type": "best_score"},
+        "score_breakdown": null,
+        "candidate_scores": [],
+        "rejections": [],
+        "backpressure": {
+            "host_admission_rate": 1.0,
+            "avg_headroom": 0.8,
+            "should_throttle": false,
+            "total_hosts": 1,
+            "eligible_hosts": 1,
+        },
+        "metrics": {
+            "placement_latency_us": 1,
+            "selected_host_score": 1.0,
+            "hosts_evaluated": 1,
+            "hosts_passed_constraints": 1,
+            "rejection_counts": [],
+            "avg_capacity_pressure": 0.0,
+        },
+        "selection": {"sampled": false, "sample_size": 1, "eligible": 1},
+        "overlay_adjusted": false,
+    });
+    let response: CellSchedulerResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(response.service_class, ServiceClass::LatencySensitive);
+    assert!(!response.overcommit_applied);
+}
+
+// ================================================================
 // Serialization tests
 // ================================================================
 
@@ -1227,6 +1454,8 @@ fn cell_scheduler_response_serializes() {
             eligible: 5,
         },
         overlay_adjusted: false,
+        service_class: ServiceClass::LatencySensitive,
+        overcommit_applied: false,
     };
 
     let json = serde_json::to_string(&response).unwrap();

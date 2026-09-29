@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::backend_selection::WorkloadClass;
 use crate::identity::TenantId;
+use crate::overcommit::ServiceClass;
 use crate::runtime::RuntimeType;
 
 /// Tenant lifecycle status.
@@ -37,6 +38,14 @@ pub struct Tenant {
     pub allowed_runtimes: Vec<RuntimeType>,
     /// Workload classes authorized for this tenant.
     pub allowed_workload_classes: Vec<WorkloadClass>,
+    /// Default scheduling service class for this tenant's sandboxes.
+    ///
+    /// `LatencySensitive` (default) keeps strict no-overcommit packing.
+    /// `BestEffort` opts the tenant into the gated overcommit track:
+    /// best-effort requests may pack against overcommitted effective
+    /// capacity and run deprioritized under pressure. See
+    /// [`crate::overcommit`].
+    pub default_service_class: ServiceClass,
     /// Monotonic policy configuration epoch.
     pub policy_epoch: Option<u64>,
 }
@@ -89,6 +98,7 @@ mod tests {
             status: TenantStatus::Active,
             allowed_runtimes: vec![RuntimeType::Firecracker],
             allowed_workload_classes: vec![],
+            default_service_class: ServiceClass::LatencySensitive,
             policy_epoch: None,
         };
         reg.register(tenant);
@@ -116,6 +126,7 @@ mod tests {
             status: TenantStatus::Suspended,
             allowed_runtimes: vec![],
             allowed_workload_classes: vec![],
+            default_service_class: ServiceClass::LatencySensitive,
             policy_epoch: None,
         };
         reg.register(tenant);

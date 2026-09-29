@@ -1864,6 +1864,13 @@ limit; P2 authorizes preview only; beta and production need P3.
 Sensitivity analysis, confidence, and unknowns live in
 [cost-model](docs/capacity/cost-model.md).
 
+The measured-overcommit track adds LS/BE service classes on top of this
+model: tenant policy resolves a class that the cell scheduler packs
+against a gated overcommit policy (disabled by default; LS always
+strict) and the host applies as cgroup weight/throttle plus scheduler
+policy. Spike evaluation, P0-model deltas, and the P1 gating plan live
+in [overcommit-spike](docs/capacity/overcommit-spike-cap-168.md).
+
 ### 14.4 Rollout checklist
 
 Production rollout requires evidence for:

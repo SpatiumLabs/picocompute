@@ -10,6 +10,7 @@ use crate::cell_scheduler::{
 use crate::event_bus::InMemoryAuditSink;
 use crate::host_quarantine::{AlertCondition, AlertStateManager, HostAlertEvaluation};
 use crate::identity::{AuditEventDetails, AuditEventKind, CellId, Hlc, HostId, RegionId, TenantId};
+use crate::overcommit::ServiceClass;
 use crate::runtime::RuntimeType;
 use crate::scheduler::{
     CacheLocality, CellCapacity, CellHealth, CellInfo, RegionalScheduler, SchedulerRequest,
@@ -66,6 +67,7 @@ fn host_request() -> CellSchedulerRequest {
         image: "alpine-3.18".into(),
         snapshot_id: None,
         is_restore: false,
+        service_class: ServiceClass::LatencySensitive,
     }
 }
 

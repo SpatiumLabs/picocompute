@@ -27,6 +27,7 @@ pub mod metrics;
 pub mod mount;
 mod observation;
 mod operator;
+pub mod overcommit;
 pub mod placement_engine;
 pub mod policy;
 pub mod preemption;
@@ -87,6 +88,14 @@ pub use operator::{
     UNDRAIN_NOT_SUPPORTED, parse_condition, validate_acknowledge, validate_drain,
     validate_fenced_cleanup, validate_ledger_inspect, validate_readmit, validate_resolve,
     validate_ticket,
+};
+pub use overcommit::{
+    BE_CPU_WEIGHT, BE_MEMORY_HIGH_FRACTION, BalloonDriver, BalloonPolicy, BalloonTarget,
+    BaseSharingMode, CoreSchedSupport, LS_CPU_WEIGHT, LS_MEMORY_HIGH_FRACTION,
+    MAX_OVERCOMMIT_RATIO, MAX_SHARED_BASE_MB, OvercommitPolicy, SchedPolicy, ServiceClass,
+    ServiceClassControls, apply_sched_policy_to_pid, balloon_target, controls_for_class,
+    effective_capacity_for_class, effective_memory_request, idle_reclaim_plan,
+    probe_core_scheduling, resolve_service_class,
 };
 pub use placement_engine::{
     ConstraintResult, PlacementBackpressure, PlacementOutcome, PlacementOutcomeWithBreakdown,

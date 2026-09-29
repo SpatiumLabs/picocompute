@@ -43,7 +43,7 @@ use parking_lot::Mutex;
 use pico_core::cgroups::{CgroupManager, DEFAULT_MAX_PIDS, default_soft_limit_bytes};
 use pico_core::cpu_isolation::{CpuAllocator, CpuIsolationPolicy, CpuSet, CpuTopology};
 use pico_core::workspace::WorkspaceManager;
-use pico_core::{CORE_METRICS, CleanupReport, ResourceReceipt, SandboxConfig};
+use pico_core::{CORE_METRICS, CleanupReport, ResourceReceipt, SandboxConfig, controls_for_class};
 use pico_telemetry::metrics::Labels;
 use serde::{Deserialize, Serialize};
 
@@ -326,6 +326,21 @@ impl HostResourceManager {
         ) {
             return Err(HostResourceError {
                 message: format!("cgroup setup failed for {sandbox_id}: {err}"),
+                rollback: self.teardown(workspaces, &sandbox_id),
+                created,
+            });
+        }
+        // Best-effort sandboxes run deprioritized: overwrite the setup
+        // weight/throttle with the class controls. Latency-sensitive keeps
+        // the setup values untouched (identical to pre-class behavior).
+        if config.service_class.is_best_effort()
+            && let Err(err) = cgroup.apply_class_controls(
+                &controls_for_class(config.service_class),
+                config.memory_limit_bytes,
+            )
+        {
+            return Err(HostResourceError {
+                message: format!("cgroup class controls failed for {sandbox_id}: {err}"),
                 rollback: self.teardown(workspaces, &sandbox_id),
                 created,
             });
@@ -707,5 +722,81 @@ fn fill_config_gaps(config: &mut SandboxConfig, host: &HostResourceSpec) {
     }
     if config.max_pids.is_none() {
         config.max_pids = Some(DEFAULT_MAX_PIDS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use pico_core::ServiceClass;
+
+    fn test_manager(root: &Path) -> HostResourceManager {
+        HostResourceManager::new(HostResourceConfig::new(root.to_path_buf()))
+    }
+
+    fn config_with_class(id: &str, class: ServiceClass) -> SandboxConfig {
+        SandboxConfig {
+            id: id.into(),
+            service_class: class,
+            ..SandboxConfig::default()
+        }
+    }
+
+    #[test]
+    fn materialize_applies_be_class_controls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(dir.path());
+        let workspaces =
+            WorkspaceManager::new(dir.path().join("workspaces")).expect("workspace root");
+        let mut config = config_with_class("sbx_be_class01", ServiceClass::BestEffort);
+        let host = HostResourceSpec::default();
+
+        let receipts = manager
+            .materialize(&workspaces, &mut config, &host)
+            .unwrap_or_else(|e| panic!("best-effort materialize must succeed: {}", e.message));
+        assert!(
+            receipts
+                .iter()
+                .any(|r| r.name == cgroup_receipt_name("sbx_be_class01")),
+            "cgroup receipt must be recorded"
+        );
+
+        let report = manager.teardown(&workspaces, "sbx_be_class01");
+        assert!(
+            report.remaining.is_empty(),
+            "teardown must release everything: {:?}",
+            report.remaining
+        );
+    }
+
+    #[test]
+    fn materialize_keeps_ls_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(dir.path());
+        let workspaces =
+            WorkspaceManager::new(dir.path().join("workspaces")).expect("workspace root");
+        let mut config = config_with_class("sbx_ls_class01", ServiceClass::LatencySensitive);
+        let host = HostResourceSpec::default();
+
+        let receipts = manager
+            .materialize(&workspaces, &mut config, &host)
+            .unwrap_or_else(|e| {
+                panic!("latency-sensitive materialize must succeed: {}", e.message)
+            });
+        assert!(
+            receipts
+                .iter()
+                .any(|r| r.name == cgroup_receipt_name("sbx_ls_class01")),
+            "cgroup receipt must be recorded"
+        );
+
+        let report = manager.teardown(&workspaces, "sbx_ls_class01");
+        assert!(
+            report.remaining.is_empty(),
+            "teardown must release everything: {:?}",
+            report.remaining
+        );
     }
 }

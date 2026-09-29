@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use pico_core::identity::HostId;
 use pico_core::{
     CellScheduler, CellSchedulerError, CellSchedulerRequest, HostCacheState, HostCapacity,
-    HostHealth, HostInfo, HostPressure, RuntimeType, SelectionMode, SnapshotTimingHint,
+    HostHealth, HostInfo, HostPressure, RuntimeType, SelectionMode, ServiceClass,
+    SnapshotTimingHint,
 };
 
 fn burst_host(id: &str) -> HostInfo {
@@ -57,6 +58,7 @@ fn burst_request(sandbox_id: &str) -> CellSchedulerRequest {
         image: "burst-image".into(),
         snapshot_id: None,
         is_restore: false,
+        service_class: ServiceClass::LatencySensitive,
     }
 }
 

@@ -23,6 +23,7 @@ use crate::identity::{
 use crate::metadata::{
     PlacementInfo, ResourceLimits, SandboxMetadata, SandboxState, TransitionError,
 };
+use crate::overcommit::ServiceClass;
 use crate::policy::{PolicyAction, PolicyEngine, PolicyOutcome};
 use crate::quota::QuotaEngine;
 use crate::runtime::RuntimeType;
@@ -75,6 +76,15 @@ pub struct CreateRequest {
     pub idempotency_key: Option<String>,
     /// Fencing token for the Pending to Scheduled commit.
     pub fencing_token: Option<FencingToken>,
+    /// Scheduling service class for this sandbox.
+    ///
+    /// `None` (the default) packs latency-sensitive: strict no-overcommit.
+    /// The API boundary resolves this from tenant policy via
+    /// [`crate::overcommit::resolve_service_class`] once the tenant
+    /// registry is wired into admission; the orchestrator threads the
+    /// resolved value into cell placement unchanged.
+    #[serde(default)]
+    pub service_class: Option<ServiceClass>,
 }
 
 /// Persisted placement result for a successful create.
@@ -576,6 +586,7 @@ impl CreateOrchestrator {
             image: req.image.clone(),
             snapshot_id: req.snapshot_id.clone(),
             is_restore: false,
+            service_class: req.service_class.unwrap_or_default(),
         };
         let cell_resp =
             match cell_scheduler.schedule_with_context(&cell_req, &hosts, Some(&context)) {
@@ -762,6 +773,7 @@ mod tests {
             operation_id: OperationId::generate(),
             idempotency_key: None,
             fencing_token: None,
+            service_class: None,
         }
     }
 

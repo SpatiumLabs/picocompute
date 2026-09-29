@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use crate::SandboxState;
 use crate::identity::{LeaseId, PolicyDecisionId, PrincipalId, TenantId};
+use crate::overcommit::ServiceClass;
 use crate::runtime::RuntimeType;
 
 /// Per-device I/O limit for cgroup v2 `io.max`.
@@ -68,6 +69,13 @@ pub struct SandboxConfig {
     /// Per-sandbox maximum packets per second (None = unlimited).
     #[serde(default)]
     pub max_pps: Option<u32>,
+    /// Scheduling service class for host-control treatment.
+    ///
+    /// Serde-defaults to [`ServiceClass::LatencySensitive`]. Best-effort
+    /// sandboxes get deprioritized cgroup controls (see
+    /// [`crate::overcommit::controls_for_class`]).
+    #[serde(default)]
+    pub service_class: ServiceClass,
 }
 
 const DEFAULT_CPU_SHARES: u32 = 100;
@@ -89,6 +97,7 @@ impl Default for SandboxConfig {
             bandwidth_limit_bps: None,
             max_connections: None,
             max_pps: None,
+            service_class: ServiceClass::LatencySensitive,
         }
     }
 }

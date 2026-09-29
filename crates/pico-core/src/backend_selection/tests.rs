@@ -1,5 +1,6 @@
 use super::*;
 use crate::identity::TenantId;
+use crate::overcommit::ServiceClass;
 use crate::runtime::BackendCapabilities;
 use crate::tenant::{Tenant, TenantStatus};
 
@@ -10,6 +11,7 @@ fn make_tenant(allowed_runtimes: Vec<RuntimeType>, allowed_classes: Vec<Workload
         status: TenantStatus::Active,
         allowed_runtimes,
         allowed_workload_classes: allowed_classes,
+        default_service_class: ServiceClass::LatencySensitive,
         policy_epoch: Some(1),
     }
 }

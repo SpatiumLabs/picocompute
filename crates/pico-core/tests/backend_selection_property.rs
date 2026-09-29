@@ -15,6 +15,7 @@ use pico_core::backend_selection::{
     IsolationFloor, ProtocolCompatibility, SelectionInputs, SnapshotCompatibility, WorkloadClass,
 };
 use pico_core::identity::TenantId;
+use pico_core::overcommit::ServiceClass;
 use pico_core::runtime::{BackendCapabilities, BackendCapability, BackendHealth, RuntimeType};
 use pico_core::tenant::{Tenant, TenantStatus};
 use proptest::prelude::*;
@@ -52,6 +53,7 @@ fn test_tenant() -> Tenant {
             WorkloadClass::CompatibilityVm,
             WorkloadClass::KubernetesIntegrated,
         ],
+        default_service_class: ServiceClass::LatencySensitive,
         policy_epoch: Some(1),
     }
 }
