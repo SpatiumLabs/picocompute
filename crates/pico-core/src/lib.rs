@@ -28,6 +28,7 @@ pub mod mount;
 mod observation;
 mod operator;
 pub mod overcommit;
+pub mod overcommit_p1;
 pub mod placement_engine;
 pub mod policy;
 pub mod preemption;
@@ -96,6 +97,15 @@ pub use overcommit::{
     ServiceClassControls, apply_sched_policy_to_pid, balloon_target, controls_for_class,
     effective_capacity_for_class, effective_memory_request, idle_reclaim_plan,
     probe_core_scheduling, resolve_service_class,
+};
+pub use overcommit_p1::{
+    BeBitRecord, BeBitVerdict, CoreSchedBranch, DSEC_SMT_INFLATION_HIGH_PCT,
+    DSEC_SMT_INFLATION_LOW_PCT, ExecKneeComparison, LsBaselineVerdict, NoisyVerdict,
+    OvercommitSweepPoint, P1Mechanism, ReclaimComparison, SmtInflationBand, SoakVerdict,
+    SweepSummary, bit_record_from_response, check_noisy_holds, check_soak_holds,
+    classify_smt_inflation, compare_exec_knees, compare_ls_warning_max, core_sched_branch,
+    graduation_for_mechanism, measure_reclaim_freed_bytes, smt_inflation_pct, summarize_sweep,
+    sweep_mode_order_ok, verify_be_overcommit_bits,
 };
 pub use placement_engine::{
     ConstraintResult, PlacementBackpressure, PlacementOutcome, PlacementOutcomeWithBreakdown,
