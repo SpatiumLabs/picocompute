@@ -22,11 +22,11 @@ use std::sync::Arc;
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use pico_core::{
-    CacheLocality, CellCapacity, CellHealth, CellId, CellInfo, CellScheduler, CellSchedulerError,
-    CellSchedulerRequest, HostCacheState, HostCapacity, HostHealth, HostId, HostInfo,
-    HostInventory, HostPressure, RegionId, RegionalScheduler, RuntimeType, SandboxError,
-    SchedulerError, SchedulerRequest, ServiceClass, SnapshotTimingHint, TenantId, TenantRegistry,
-    resolve_service_class,
+    AuditEventSink, CacheLocality, CellCapacity, CellHealth, CellId, CellInfo, CellScheduler,
+    CellSchedulerError, CellSchedulerRequest, Hlc, HostCacheState, HostCapacity, HostHealth,
+    HostId, HostInfo, HostInventory, HostPressure, RegionId, RegionalScheduler, RuntimeType,
+    SandboxError, SchedulerError, SchedulerRequest, ServiceClass, SnapshotTimingHint, TenantId,
+    TenantRegistry, resolve_service_class as resolve_class_with_tenant,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -527,12 +527,27 @@ impl PlacementGate {
     ///
     /// When set, admission resolves the request class through
     /// `resolve_service_class` against the tenant default. When unset
-    /// (the default), admission keeps the LS default (strict packing),
-    /// preserving the pre-wiring path. Gated default-off: no registry
-    /// means no behavior change.
+    /// (the default), explicit best-effort fails closed and anything else
+    /// keeps the LS default (strict packing), preserving the pre-wiring
+    /// path. Gated default-off: no registry never admits best-effort.
     #[must_use]
     pub fn with_tenant_registry(mut self, registry: Arc<TenantRegistry>) -> Self {
         self.tenant_registry = Some(registry);
+        self
+    }
+
+    /// Attaches an audit sink for placement outcome events.
+    ///
+    /// Both stages forward `service_class` and `overcommit_applied` (cell
+    /// only carries the bit; regional always reports LS with no bit).
+    /// Without a sink (the default) admits still place and record
+    /// metrics, but emit no audit events.
+    #[must_use]
+    pub fn with_audit_sink(mut self, sink: Arc<dyn AuditEventSink>, hlc: Arc<Hlc>) -> Self {
+        self.regional = self
+            .regional
+            .with_audit_sink(Arc::clone(&sink), Arc::clone(&hlc));
+        self.cell = self.cell.with_audit_sink(sink, hlc);
         self
     }
 
@@ -593,8 +608,10 @@ impl PlacementGate {
     /// `InsufficientCapacity` and `PressureSaturated` without backend
     /// fallback. Draining and unsupported runtimes reject without a
     /// `Retry-After` hint; capacity and pressure throttle with one.
-    /// The service class defaults to the tenant policy (LS when no
-    /// registry is wired); see [`Self::admit_with_service_class`].
+    /// Without an explicit class the service class defaults to the tenant
+    /// policy (LS when no registry is wired); an explicit best-effort
+    /// without a registered opt-in rejects. See
+    /// [`Self::admit_with_service_class`].
     pub fn admit(
         &self,
         sandbox_id: &str,
@@ -611,33 +628,36 @@ impl PlacementGate {
 
     /// Resolves the effective service class for one admission.
     ///
-    /// Without a tenant registry the API path keeps the LS default (strict
-    /// packing). With a registry, `None` inherits the tenant default and an
-    /// explicit best-effort without tenant opt-in fails closed as
-    /// [`PlacementError::Rejected`], never silently demoted.
+    /// `None` and explicit LS resolve LS. An explicit best-effort
+    /// without a registered tenant opt-in fails closed as
+    /// [`PlacementError::Rejected`], including when no registry is wired
+    /// or the tenant is unknown: without proof of opt-in there is
+    /// nothing to authorize the weaker priority.
     pub fn resolve_service_class(
         &self,
         tenant_id: &TenantId,
         explicit: Option<ServiceClass>,
     ) -> Result<ServiceClass, PlacementError> {
+        let rejected = || PlacementError::Rejected {
+            reason:
+                "best-effort service class requires a registered tenant with best-effort opt-in"
+                    .into(),
+        };
         match &self.tenant_registry {
-            None => Ok(ServiceClass::LatencySensitive),
+            None => match explicit {
+                Some(ServiceClass::BestEffort) => Err(rejected()),
+                _ => Ok(ServiceClass::LatencySensitive),
+            },
             Some(registry) => match registry.get(tenant_id) {
-                Some(tenant) => resolve_service_class(explicit, &tenant).map_err(|err| {
+                Some(tenant) => resolve_class_with_tenant(explicit, &tenant).map_err(|err| {
                     PlacementError::Rejected {
                         reason: err.to_string(),
                     }
                 }),
-                None => {
-                    // Unknown tenant keeps strict packing; an explicit
-                    // best-effort without a registered opt-in fails closed.
-                    match explicit {
-                        Some(ServiceClass::BestEffort) => Err(PlacementError::Rejected {
-                            reason: "best-effort service class requires a registered tenant with best-effort opt-in".into(),
-                        }),
-                        _ => Ok(ServiceClass::LatencySensitive),
-                    }
-                }
+                None => match explicit {
+                    Some(ServiceClass::BestEffort) => Err(rejected()),
+                    _ => Ok(ServiceClass::LatencySensitive),
+                },
             },
         }
     }
@@ -666,6 +686,9 @@ impl PlacementGate {
         // request means the production default, not "try anything and fall
         // back silently under pressure".
         let resolved_runtime = runtime.unwrap_or(self.default_runtime);
+        // Resolve the class before touching scheduler state so a rejected
+        // explicit best-effort records no overlay load.
+        let service_class = self.resolve_service_class(tenant_id, explicit_service_class)?;
         let now = OffsetDateTime::now_utc();
         self.registry.expire_stale(now);
         let cells = self.registry.cells_snapshot();
@@ -709,8 +732,6 @@ impl PlacementGate {
                 retry_after_secs: self.retry_after_secs,
             });
         }
-
-        let service_class = self.resolve_service_class(tenant_id, explicit_service_class)?;
 
         let cell_req = CellSchedulerRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -1215,6 +1236,95 @@ mod tests {
     }
 
     #[test]
+    fn gate_rejects_be_without_registry() {
+        // Without a registry there is no proof of tenant opt-in, so an
+        // explicit best-effort fails closed instead of silently running LS.
+        let registry = Arc::new(PlacementRegistry::new());
+        let now = OffsetDateTime::now_utc();
+        registry.upsert_cell(test_cell("cel_1"));
+        registry.report_host(&test_report("hst_1", "cel_1"), now);
+        let gate = PlacementGate::new(Arc::clone(&registry));
+        let err = gate
+            .admit_with_service_class(
+                "sbx_be",
+                &TenantId::from_string("tnt_1"),
+                2,
+                512,
+                Some(RuntimeType::Firecracker),
+                "img:1",
+                Some(ServiceClass::BestEffort),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, PlacementError::Rejected { .. }),
+            "BE without registry must reject, got {err}"
+        );
+        // No overlay may be recorded for the rejected request: a retry
+        // with a valid class must still place.
+        gate.admit(
+            "sbx_ls",
+            &TenantId::from_string("tnt_1"),
+            2,
+            512,
+            Some(RuntimeType::Firecracker),
+            "img:1",
+        )
+        .expect("LS retry after rejected BE must place");
+    }
+
+    #[test]
+    fn gate_audit_emits_class_and_bit() {
+        use pico_core::{AuditEventDetails, AuditEventKind, Hlc, InMemoryAuditSink};
+        let registry = Arc::new(PlacementRegistry::new());
+        let now = OffsetDateTime::now_utc();
+        registry.upsert_cell(test_cell("cel_1"));
+        registry.report_host(&test_report("hst_1", "cel_1"), now);
+        let tenants = tenant_registry_with(ServiceClass::BestEffort, "tnt_be");
+        let sink = Arc::new(InMemoryAuditSink::new());
+        let hlc = Arc::new(Hlc::new());
+        let gate = PlacementGate::new(Arc::clone(&registry))
+            .with_tenant_registry(tenants)
+            .with_audit_sink(
+                Arc::clone(&sink) as Arc<dyn pico_core::AuditEventSink>,
+                Arc::clone(&hlc),
+            );
+        let decision = gate
+            .admit(
+                "sbx_be",
+                &TenantId::from_string("tnt_be"),
+                2,
+                512,
+                Some(RuntimeType::Firecracker),
+                "img:1",
+            )
+            .expect("BE tenant must place");
+        assert_eq!(decision.service_class, ServiceClass::BestEffort);
+        // Both stages emit: regional stays LS with no bit, cell carries
+        // the request class (strict fit here, so no bit).
+        let outcomes = sink.events_by_kind(AuditEventKind::PlacementOutcome);
+        assert_eq!(outcomes.len(), 2);
+        let mut saw_ls = false;
+        let mut saw_be = false;
+        for event in &outcomes {
+            match &event.details {
+                Some(AuditEventDetails::PlacementOutcome {
+                    service_class,
+                    overcommit_applied,
+                    ..
+                }) => {
+                    assert!(!overcommit_applied);
+                    match service_class {
+                        ServiceClass::LatencySensitive => saw_ls = true,
+                        ServiceClass::BestEffort => saw_be = true,
+                    }
+                }
+                d => panic!("expected placement outcome, got {d:?}"),
+            }
+        }
+        assert!(saw_ls && saw_be);
+    }
+
+    #[test]
     fn gate_saturation_still_sheds_typed_throttle_for_be() {
         use pico_core::{CellScheduler, OvercommitPolicy};
         let registry = Arc::new(PlacementRegistry::new());
@@ -1222,12 +1332,15 @@ mod tests {
         registry.upsert_cell(test_cell("cel_1"));
         registry.report_host(&test_report("hst_1", "cel_1"), now);
         // Disabled policy (default): BE packs strict, so an oversized BE
-        // request sheds the same typed throttle as LS.
-        let gate = PlacementGate::new(Arc::clone(&registry));
+        // request sheds the same typed throttle as LS. The BE tenant
+        // registry proves opt-in so resolution succeeds and the request
+        // reaches capacity shedding.
+        let tenants = tenant_registry_with(ServiceClass::BestEffort, "tnt_be");
+        let gate = PlacementGate::new(Arc::clone(&registry)).with_tenant_registry(tenants);
         let err = gate
             .admit_with_service_class(
                 "sbx_big",
-                &TenantId::from_string("tnt_1"),
+                &TenantId::from_string("tnt_be"),
                 10_000,
                 10_000_000,
                 Some(RuntimeType::Firecracker),

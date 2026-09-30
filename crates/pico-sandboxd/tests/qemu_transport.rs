@@ -26,7 +26,7 @@ use pico_sandboxd_proto::v1::{
     BootRequest, CommandMeta, DestroyRequest, ExecRequest as ProtoExecRequest, FileReadRequest,
     FileWriteRequest, GetSandboxRequest, OutcomeStatus, PrepareRequest,
     RuntimeType as ProtoRuntime, SandboxConfig as ProtoSandboxConfig, SandboxState as ProtoState,
-    exec_event,
+    ServiceClass as ProtoServiceClass, exec_event,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -271,7 +271,7 @@ async fn qemu_unix_guest_boots_without_tcp_transport_flag() {
                 network_isolated: true,
                 ssh_port: None,
                 cpu_set: Vec::new(),
-                service_class: 1,
+                service_class: ProtoServiceClass::LatencySensitive as i32,
             }),
             runtime_type: ProtoRuntime::Qemu as i32,
             host: None,
