@@ -640,6 +640,7 @@ impl CreateOrchestrator {
             preferred_region: req.preferred_region.clone(),
             avoid_failure_domains: req.avoid_failure_domains.clone(),
             sandbox_id: req.sandbox_id.as_str().to_string(),
+            service_class,
         };
         let regional_resp = match regional.schedule_with_context(&sched_req, cells, Some(&context))
         {

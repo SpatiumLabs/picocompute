@@ -75,6 +75,108 @@ pub struct CellCapacity {
     pub max_sandboxes: u64,
     /// Number of sandboxes currently running.
     pub current_sandboxes: u64,
+    /// Optional cell-level best-effort pool.
+    ///
+    /// `None` (default) keeps the regional path host-level only, exactly as
+    /// in step 1: every class packs against the strict cell totals.
+    /// `Some` reserves a bounded BE budget inside the cell; LS requests
+    /// ignore it, BE requests must fit both the strict cell totals and the
+    /// pool. Serde-defaults to `None` so payloads written before the
+    /// cell-pool follow-up keep strict behavior.
+    #[serde(default)]
+    pub be_pool: Option<BeCellPool>,
+}
+
+/// Cell-level best-effort pool inside [`CellCapacity`].
+///
+/// Bounds how many BE sandboxes a cell admits beyond strict packing without
+/// letting BE crowd out LS. All counters are BE-only: LS allocation never
+/// touches them, and BE allocation must fit both the cell totals and this
+/// pool. A zero `max_be_sandboxes` admits no BE; reserved totals of zero
+/// mean the pool contributes no vCPU/memory budget beyond the strict cell
+/// fit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BeCellPool {
+    /// Maximum BE sandboxes this pool admits.
+    pub max_be_sandboxes: u64,
+    /// BE sandboxes currently running in this pool.
+    pub current_be_sandboxes: u64,
+    /// Reserved vCPUs for BE (budget inside the cell totals).
+    pub reserved_vcpus: u64,
+    /// BE vCPUs currently allocated from the reservation.
+    pub allocated_be_vcpus: u64,
+    /// Reserved memory in MB for BE.
+    pub reserved_memory_mb: u64,
+    /// BE memory in MB currently allocated.
+    pub allocated_be_memory_mb: u64,
+}
+
+impl BeCellPool {
+    /// Validates that allocated counters stay within their reservations.
+    ///
+    /// Pool counters arrive on cell reports (external input), so a corrupt
+    /// report with allocated over reserved must fail closed instead of
+    /// silently exhausting the pool. Zero reservations are valid (the pool
+    /// then admits nothing); only over-allocation fails.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.allocated_be_vcpus > self.reserved_vcpus {
+            return Err(crate::error::SandboxError::BadRequest(format!(
+                "be pool allocated_be_vcpus {} exceeds reserved_vcpus {}",
+                self.allocated_be_vcpus, self.reserved_vcpus
+            )));
+        }
+        if self.allocated_be_memory_mb > self.reserved_memory_mb {
+            return Err(crate::error::SandboxError::BadRequest(format!(
+                "be pool allocated_be_memory_mb {} exceeds reserved_memory_mb {}",
+                self.allocated_be_memory_mb, self.reserved_memory_mb
+            )));
+        }
+        if self.current_be_sandboxes > self.max_be_sandboxes {
+            return Err(crate::error::SandboxError::BadRequest(format!(
+                "be pool current_be_sandboxes {} exceeds max_be_sandboxes {}",
+                self.current_be_sandboxes, self.max_be_sandboxes
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether this pool can admit one more BE sandbox of this shape.
+    pub fn can_fit_be(&self, vcpus: u32, memory_mb: u64) -> bool {
+        self.remaining_be_fit_count(vcpus, memory_mb) > 0
+    }
+
+    /// How many additional BE sandboxes of this shape fit in the pool.
+    ///
+    /// Packing is the minimum of remaining reserved vCPU, reserved memory,
+    /// and BE slots. A zero request in a dimension is unbounded for that
+    /// dimension, mirroring [`CellCapacity::remaining_fit_count`].
+    pub fn remaining_be_fit_count(&self, vcpus: u32, memory_mb: u64) -> u64 {
+        let vcpu = self
+            .reserved_vcpus
+            .saturating_sub(self.allocated_be_vcpus)
+            .checked_div(u64::from(vcpus))
+            .unwrap_or(u64::MAX);
+        let memory = self
+            .reserved_memory_mb
+            .saturating_sub(self.allocated_be_memory_mb)
+            .checked_div(memory_mb)
+            .unwrap_or(u64::MAX);
+        let slots = self
+            .max_be_sandboxes
+            .saturating_sub(self.current_be_sandboxes);
+        vcpu.min(memory).min(slots)
+    }
+
+    /// Fraction of BE slots still available (0.0 to 1.0).
+    pub fn be_slot_headroom(&self) -> f64 {
+        if self.max_be_sandboxes == 0 {
+            return 0.0;
+        }
+        let available = self
+            .max_be_sandboxes
+            .saturating_sub(self.current_be_sandboxes);
+        available as f64 / self.max_be_sandboxes as f64
+    }
 }
 
 impl CellCapacity {
@@ -130,6 +232,48 @@ impl CellCapacity {
             .unwrap_or(u64::MAX);
         let slots = self.max_sandboxes.saturating_sub(self.current_sandboxes);
         vcpu.min(memory).min(slots)
+    }
+
+    /// Whether one more sandbox of this class fits in the cell.
+    ///
+    /// LS requests (and BE requests on cells without a pool) use strict
+    /// [`Self::can_fit`]. BE requests on cells with a pool must fit both
+    /// the strict cell totals and the BE pool, so BE cannot crowd out LS
+    /// beyond its reservation.
+    pub fn can_fit_class(
+        &self,
+        vcpus: u32,
+        memory_mb: u64,
+        class: crate::overcommit::ServiceClass,
+    ) -> bool {
+        if !class.is_best_effort() {
+            return self.can_fit(vcpus, memory_mb);
+        }
+        let Some(pool) = self.be_pool else {
+            return self.can_fit(vcpus, memory_mb);
+        };
+        self.can_fit(vcpus, memory_mb) && pool.can_fit_be(vcpus, memory_mb)
+    }
+
+    /// How many more sandboxes of this class fit in the cell.
+    ///
+    /// LS returns strict [`Self::remaining_fit_count`]. BE without a pool
+    /// returns the same strict count; BE with a pool returns the minimum of
+    /// the strict count and the pool count.
+    pub fn remaining_fit_count_for_class(
+        &self,
+        vcpus: u32,
+        memory_mb: u64,
+        class: crate::overcommit::ServiceClass,
+    ) -> u64 {
+        let strict = self.remaining_fit_count(vcpus, memory_mb);
+        if !class.is_best_effort() {
+            return strict;
+        }
+        let Some(pool) = self.be_pool else {
+            return strict;
+        };
+        strict.min(pool.remaining_be_fit_count(vcpus, memory_mb))
     }
 }
 
@@ -470,6 +614,7 @@ impl CellInfo {
     ///         allocated_memory_mb: 0,
     ///         max_sandboxes: 5,
     ///         current_sandboxes: 0,
+    ///         be_pool: None,
     ///     },
     ///     supported_runtimes: vec![RuntimeType::Firecracker],
     ///     failure_domain: "fd-1".into(),
@@ -537,6 +682,13 @@ pub struct SchedulerRequest {
     pub avoid_failure_domains: Vec<String>,
     /// Sandbox ID being scheduled (for deterministic tie-breaking).
     pub sandbox_id: String,
+    /// Scheduling service class for this sandbox.
+    ///
+    /// Serde-defaults to LS so payloads written before the cell-pool follow-up
+    /// keep strict regional behavior. BE requests are pool-gated via
+    /// [`CellCapacity::be_pool`]; cells without a pool treat BE as strict.
+    #[serde(default)]
+    pub service_class: crate::overcommit::ServiceClass,
 }
 
 // ---- Scoring ----
@@ -1146,10 +1298,10 @@ impl RegionalScheduler {
     /// Emits the placement outcome audit event when a sink is attached.
     ///
     /// Carries the winner policy and overlay state so sampled placements
-    /// stay reconstructible from audit alone. Regional placement stays
-    /// class-agnostic (overcommit is host-level per the CAP-168 track), so
-    /// regional events always carry LS with no overcommit bit; the cell
-    /// event carries the request class and bit.
+    /// stay reconstructible from audit alone. Regional placement enforces
+    /// BE pools in filtering but never applies overcommit budget itself, so
+    /// regional events carry the request class with no overcommit bit; the
+    /// cell event carries the request class and bit.
     #[expect(
         clippy::too_many_arguments,
         reason = "private audit-emission sink; every argument maps to one audit field and bundling would hide the event contract"
@@ -1181,7 +1333,7 @@ impl RegionalScheduler {
                     sample_size: selection.sample_size,
                     eligible: selection.eligible,
                     overlay_adjusted,
-                    service_class: crate::overcommit::ServiceClass::LatencySensitive,
+                    service_class: request.service_class,
                     overcommit_applied: false,
                     trace_id: context.and_then(|c| c.trace_id.clone()),
                     operation_id: context.and_then(|c| c.operation_id.clone()),
@@ -1198,6 +1350,11 @@ impl RegionalScheduler {
     /// [`Self::classify_rejection`] derives typed errors from the returned
     /// rejection strings (via `categorize_rejection`) instead of
     /// re-implementing these checks.
+    ///
+    /// Regional placement stays scoring-agnostic across classes (scoring is
+    /// untouched so LS warning-max cannot move); only the BE pool filter is
+    /// class-aware. Regional events carry the request class for audit, with
+    /// no overcommit bit (the cell event carries the bit).
     fn check_constraints(
         &self,
         cell: &CellInfo,
@@ -1207,7 +1364,34 @@ impl RegionalScheduler {
         if !cell.health.can_admit() {
             return ConstraintResult::Fail(format!("cell is {}", cell.health.as_str()));
         }
-        if !cell.capacity.can_fit(request.vcpus, request.memory_mb) {
+        // A corrupt BE pool report fails closed for BE only: the cell is
+        // rejected for best-effort with a distinct pool message (still
+        // carrying the `capacity` keyword for the throttled mapping) while
+        // LS continues to pack strict. Pool data arrives on cell reports,
+        // so per-cell rejection is safer than failing the whole schedule.
+        // This check runs before the fit check so corruption reports
+        // `invalid`, not `exhausted`.
+        if request.service_class.is_best_effort()
+            && let Some(pool) = cell.capacity.be_pool
+            && pool.validate().is_err()
+        {
+            return ConstraintResult::Fail(
+                "insufficient capacity (best-effort cell pool invalid)".into(),
+            );
+        }
+        if !cell
+            .capacity
+            .can_fit_class(request.vcpus, request.memory_mb, request.service_class)
+        {
+            // BE pool exhaustion keeps the `capacity` keyword so the
+            // classifier still maps it to throttled InsufficientCapacity,
+            // while naming the pool for operators. LS and pool-less cells
+            // keep the plain message byte-identical with step 1.
+            if request.service_class.is_best_effort() && cell.capacity.be_pool.is_some() {
+                return ConstraintResult::Fail(
+                    "insufficient capacity (best-effort cell pool exhausted)".into(),
+                );
+            }
             return ConstraintResult::Fail("insufficient capacity".into());
         }
         if let Some(ref runtime) = request.runtime
@@ -1280,6 +1464,13 @@ impl RegionalScheduler {
     }
 
     /// Scores a single cell across all weighted dimensions.
+    ///
+    /// Deliberately class-agnostic: BE pool state affects filtering only,
+    /// never scoring, so LS warning-max cannot move with pool rollout.
+    /// Follow-up work may add a BE pool-headroom signal here (preferring
+    /// pool-rich cells among survivors) once host packing evidence shows
+    /// BE herding onto nearly-exhausted pools; until then the filter plus
+    /// the in-flight overlay spread BE across cells with pool room.
     fn score_cell(&self, cell: &CellInfo, request: &SchedulerRequest) -> ScoreBreakdown {
         let mut components = Vec::with_capacity(6);
 
@@ -1492,6 +1683,7 @@ mod tests {
                 allocated_vcpus: 20,
                 total_memory_mb: 10240,
                 allocated_memory_mb: 2048,
+                be_pool: None,
                 max_sandboxes: 50,
                 current_sandboxes: 10,
             },
@@ -1516,6 +1708,7 @@ mod tests {
             snapshot_id: None,
             preferred_region: None,
             avoid_failure_domains: vec![],
+            service_class: crate::overcommit::ServiceClass::LatencySensitive,
             sandbox_id: "sbx_test".into(),
         }
     }
@@ -1928,6 +2121,7 @@ mod tests {
             total_vcpus: 100,
             allocated_vcpus: 25,
             total_memory_mb: 10240,
+            be_pool: None,
             allocated_memory_mb: 2560,
             max_sandboxes: 50,
             current_sandboxes: 10,
@@ -1943,6 +2137,7 @@ mod tests {
         let cap = CellCapacity {
             total_vcpus: 0,
             allocated_vcpus: 0,
+            be_pool: None,
             total_memory_mb: 0,
             allocated_memory_mb: 0,
             max_sandboxes: 0,
@@ -1958,6 +2153,7 @@ mod tests {
     fn cell_capacity_can_fit_checks_all_dimensions() {
         let cap = CellCapacity {
             total_vcpus: 10,
+            be_pool: None,
             allocated_vcpus: 8,
             total_memory_mb: 1024,
             allocated_memory_mb: 512,
@@ -2571,6 +2767,7 @@ mod tests {
         let mut cell = make_cell(id, "rgn_us-east-1", CellHealth::Healthy);
         cell.failure_domain = "fd-shared".into();
         cell.capacity = CellCapacity {
+            be_pool: None,
             total_vcpus: 2,
             allocated_vcpus: 0,
             total_memory_mb: 512,
@@ -2664,5 +2861,190 @@ mod tests {
             assert_eq!(response.cell_id.as_ref().unwrap().as_str(), "cel_1");
             assert!(!response.overlay_adjusted);
         }
+    }
+
+    // ================================================================
+    // Cell-level BE pools (regional follow-up)
+    // ================================================================
+
+    fn be_request() -> SchedulerRequest {
+        SchedulerRequest {
+            service_class: crate::overcommit::ServiceClass::BestEffort,
+            ..make_request()
+        }
+    }
+
+    fn cell_with_be_pool(id: &str, pool: BeCellPool) -> CellInfo {
+        let mut cell = make_cell(id, "rgn_a", CellHealth::Healthy);
+        cell.capacity.be_pool = Some(pool);
+        cell
+    }
+
+    #[test]
+    fn be_pool_none_treats_be_as_strict() {
+        // Cells without a pool admit BE exactly like LS (strict fit).
+        let scheduler = RegionalScheduler::new();
+        let cells = vec![make_cell("cel_1", "rgn_a", CellHealth::Healthy)];
+        let ls = scheduler.schedule(&make_request(), &cells).unwrap();
+        assert!(ls.scheduled);
+        let be = scheduler.schedule(&be_request(), &cells).unwrap();
+        assert!(be.scheduled);
+        assert_eq!(ls.cell_id, be.cell_id);
+    }
+
+    #[test]
+    fn be_pool_exhausted_rejects_be_but_admits_ls() {
+        // Strict cell totals still fit one shape, but the BE pool is full,
+        // so BE sheds throttled while LS still places.
+        let pool = BeCellPool {
+            max_be_sandboxes: 2,
+            current_be_sandboxes: 2,
+            reserved_vcpus: 8,
+            allocated_be_vcpus: 8,
+            reserved_memory_mb: 2048,
+            allocated_be_memory_mb: 2048,
+        };
+        let scheduler = RegionalScheduler::new();
+        let cells = vec![cell_with_be_pool("cel_pool", pool)];
+
+        let be_err = scheduler.schedule(&be_request(), &cells).unwrap_err();
+        assert!(
+            matches!(be_err, SchedulerError::InsufficientCapacity { .. }),
+            "exhausted BE pool must shed throttled, got {be_err:?}"
+        );
+        assert!(be_err.is_throttled());
+
+        let ls = scheduler
+            .schedule(&make_request(), &cells)
+            .expect("LS must ignore the BE pool");
+        assert!(ls.scheduled);
+    }
+
+    #[test]
+    fn be_pool_invalid_report_rejects_be_but_admits_ls() {
+        // Corrupt pool counters (allocated over reserved) fail closed for
+        // BE with a distinct pool message, while LS still packs strict.
+        let corrupt = BeCellPool {
+            max_be_sandboxes: 4,
+            current_be_sandboxes: 1,
+            reserved_vcpus: 2,
+            allocated_be_vcpus: 8,
+            reserved_memory_mb: 4096,
+            allocated_be_memory_mb: 1024,
+        };
+        assert!(corrupt.validate().is_err());
+        let valid = BeCellPool {
+            max_be_sandboxes: 4,
+            current_be_sandboxes: 1,
+            reserved_vcpus: 8,
+            allocated_be_vcpus: 2,
+            reserved_memory_mb: 4096,
+            allocated_be_memory_mb: 1024,
+        };
+        valid.validate().unwrap();
+
+        let scheduler = RegionalScheduler::new();
+        let cells = vec![cell_with_be_pool("cel_corrupt", corrupt)];
+        let be_err = scheduler.schedule(&be_request(), &cells).unwrap_err();
+        assert!(
+            matches!(be_err, SchedulerError::InsufficientCapacity { .. }),
+            "corrupt BE pool must shed throttled, got {be_err:?}"
+        );
+        scheduler
+            .schedule(&make_request(), &cells)
+            .expect("LS must ignore a corrupt BE pool");
+    }
+
+    #[test]
+    fn be_pool_fit_counts_take_minimum() {
+        let pool = BeCellPool {
+            max_be_sandboxes: 4,
+            current_be_sandboxes: 1,
+            reserved_vcpus: 8,
+            allocated_be_vcpus: 2,
+            reserved_memory_mb: 4096,
+            allocated_be_memory_mb: 1024,
+        };
+        // 2 vCPU / 512 MiB shape: vCPU allows 3, memory allows 6, slots
+        // allow 3, so the pool fits 3.
+        assert_eq!(pool.remaining_be_fit_count(2, 512), 3);
+        assert!(pool.can_fit_be(2, 512));
+        assert_eq!(pool.be_slot_headroom(), 0.75);
+
+        let full = BeCellPool {
+            max_be_sandboxes: 1,
+            current_be_sandboxes: 1,
+            ..BeCellPool::default()
+        };
+        assert_eq!(full.remaining_be_fit_count(2, 512), 0);
+        assert!(!full.can_fit_be(2, 512));
+    }
+
+    #[test]
+    fn cell_fit_class_respects_pool_for_be_only() {
+        let pool = BeCellPool {
+            max_be_sandboxes: 0,
+            current_be_sandboxes: 0,
+            reserved_vcpus: 0,
+            allocated_be_vcpus: 0,
+            reserved_memory_mb: 0,
+            allocated_be_memory_mb: 0,
+        };
+        let mut cell = make_cell("cel_1", "rgn_a", CellHealth::Healthy);
+        cell.capacity.be_pool = Some(pool);
+
+        // Zero-slot pool admits no BE but leaves LS strict fit intact.
+        assert!(cell.capacity.can_fit_class(
+            2,
+            512,
+            crate::overcommit::ServiceClass::LatencySensitive
+        ));
+        assert!(
+            !cell
+                .capacity
+                .can_fit_class(2, 512, crate::overcommit::ServiceClass::BestEffort)
+        );
+        assert_eq!(
+            cell.capacity.remaining_fit_count_for_class(
+                2,
+                512,
+                crate::overcommit::ServiceClass::BestEffort
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn request_without_service_class_deserializes_to_ls() {
+        let json = serde_json::json!({
+            "tenant_id": "tnt_test",
+            "vcpus": 2,
+            "memory_mb": 512,
+            "runtime": "firecracker",
+            "image": "alpine-3.18",
+            "snapshot_id": null,
+            "preferred_region": null,
+            "avoid_failure_domains": [],
+            "sandbox_id": "sbx_old"
+        });
+        let req: SchedulerRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            req.service_class,
+            crate::overcommit::ServiceClass::LatencySensitive
+        );
+    }
+
+    #[test]
+    fn cell_without_be_pool_deserializes_to_none() {
+        let json = serde_json::json!({
+            "total_vcpus": 100,
+            "allocated_vcpus": 20,
+            "total_memory_mb": 10240,
+            "allocated_memory_mb": 2048,
+            "max_sandboxes": 50,
+            "current_sandboxes": 10
+        });
+        let cap: CellCapacity = serde_json::from_value(json).unwrap();
+        assert_eq!(cap.be_pool, None);
     }
 }

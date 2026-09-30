@@ -115,6 +115,7 @@ fn cell_packing_uses_sandbox_slots_when_tighter() {
         allocated_memory_mb: 0,
         max_sandboxes: 20,
         current_sandboxes: 0,
+        be_pool: None,
     };
     let (limit, binding) = advertised_cell_limit(&cell, SandboxPackingShape::platform_default());
     assert_eq!(limit, 20);

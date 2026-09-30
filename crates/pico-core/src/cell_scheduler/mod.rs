@@ -319,7 +319,7 @@ pub struct CellSchedulerRequest {
     /// Scheduling service class for this sandbox.
     ///
     /// Serde-defaults to [`ServiceClass::LatencySensitive`] so payloads
-    /// written before the CAP-168 track keep strict no-overcommit packing.
+    /// written before the overcommit track keep strict no-overcommit packing.
     /// Best-effort requests pack against overcommitted effective capacity
     /// only when the scheduler's [`OvercommitPolicy`] is enabled; the
     /// policy stays disabled unless a config explicitly enables it.
@@ -1375,6 +1375,19 @@ impl CellScheduler {
     }
 
     /// Scores a single host across all weighted dimensions.
+    ///
+    /// Latency-sensitive requests keep the historical spread behavior
+    /// (prefer headroom, fewer sandboxes, free disk) byte-identical with the
+    /// pre-class scheduler so scoring changes never move the LS warning-max
+    /// vs the step-1 baseline. Best-effort requests under an enabled
+    /// [`OvercommitPolicy`] bin-pack on the overcommittable dimensions only:
+    /// they prefer high vCPU/memory utilization (low headroom there) and
+    /// many sandboxes, so empty hosts stay free for LS. Disk, network, and
+    /// process slots are never overcommitted (disk bytes are real; slots
+    /// bound fd/process accounting), so BE keeps the spread direction on
+    /// those axes instead of packing toward exhaustion. Cache and pressure
+    /// stay class-agnostic. Ties keep the deterministic host-ID order in
+    /// the placement engine.
     fn score_host(
         &self,
         host: &HostInfo,
@@ -1383,15 +1396,30 @@ impl CellScheduler {
     ) -> HostScoreBreakdown {
         let mut components = Vec::with_capacity(5);
 
-        let headroom = (host.capacity.vcpu_headroom()
-            + host.capacity.memory_headroom()
-            + host.capacity.network_headroom()
-            + host.capacity.process_slot_headroom())
-            / 4.0;
+        let is_be_binpack = request.service_class.is_best_effort() && self.overcommit.enabled;
+        // Overcommittable headroom (vCPU/memory): the only axes the
+        // overcommit gate scales. Fixed resources (network/slots) stay
+        // spread-oriented for every class (see below).
+        let overcommittable_headroom =
+            (host.capacity.vcpu_headroom() + host.capacity.memory_headroom()) / 2.0;
+        let fixed_headroom =
+            (host.capacity.network_headroom() + host.capacity.process_slot_headroom()) / 2.0;
+        let headroom_score = if is_be_binpack {
+            // Prefer high vCPU/memory utilization while still preferring
+            // free network/slot headroom, so BE packs without driving the
+            // fixed resources toward exhaustion sheds.
+            (1.0 - overcommittable_headroom + fixed_headroom) / 2.0
+        } else {
+            (host.capacity.vcpu_headroom()
+                + host.capacity.memory_headroom()
+                + host.capacity.network_headroom()
+                + host.capacity.process_slot_headroom())
+                / 4.0
+        };
         components.push(self.make_component(
             HostScoreDimension::CapacityHeadroom,
             self.weights.capacity_headroom,
-            headroom,
+            headroom_score,
         ));
 
         let cache_score = self.compute_cache_score(host, request);
@@ -1409,9 +1437,16 @@ impl CellScheduler {
         ));
 
         let spread_score = if max_sandboxes > 0 {
-            1.0 - (host.current_sandboxes as f64 / max_sandboxes as f64)
+            let density = host.current_sandboxes as f64 / max_sandboxes as f64;
+            if is_be_binpack {
+                density
+            } else {
+                1.0 - density
+            }
         } else {
-            1.0
+            // No sandboxes anywhere: LS keeps the neutral 1.0, BE binpack
+            // sees zero density to pack.
+            if is_be_binpack { 0.0 } else { 1.0 }
         };
         components.push(self.make_component(
             HostScoreDimension::SandboxSpread,
@@ -1419,7 +1454,10 @@ impl CellScheduler {
             spread_score,
         ));
 
-        let disk_score = host.capacity.disk_headroom();
+        let disk_headroom = host.capacity.disk_headroom();
+        // Disk bytes are real and never overcommitted: both classes prefer
+        // free disk so BE bin-packing cannot manufacture disk-bound sheds.
+        let disk_score = disk_headroom;
         components.push(self.make_component(
             HostScoreDimension::DiskAvailability,
             self.weights.disk_availability,

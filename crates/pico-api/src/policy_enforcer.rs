@@ -933,6 +933,7 @@ forbid(
                 allocated_memory_mb: 0,
                 max_sandboxes: 100,
                 current_sandboxes: 0,
+                be_pool: None,
             },
             supported_runtimes: vec![RuntimeType::Firecracker],
             failure_domain: "fd-cel_1".into(),

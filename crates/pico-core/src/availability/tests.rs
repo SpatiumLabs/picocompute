@@ -83,6 +83,7 @@ fn make_cell(id: &str, health: CellHealth) -> CellInfo {
             allocated_memory_mb: 2048,
             max_sandboxes: 50,
             current_sandboxes: 10,
+            be_pool: None,
         },
         supported_runtimes: vec![RuntimeType::Firecracker],
         failure_domain: format!("fd-{id}"),
@@ -106,6 +107,7 @@ fn cell_request() -> SchedulerRequest {
         preferred_region: None,
         avoid_failure_domains: vec![],
         sandbox_id: "sbx_avail".into(),
+        service_class: ServiceClass::LatencySensitive,
     }
 }
 

@@ -162,6 +162,7 @@ fn seed_stub_registry(gate: &Arc<PlacementGate>) {
             allocated_memory_mb: 0,
             max_sandboxes: 200,
             current_sandboxes: 0,
+            be_pool: None,
         },
         supported_runtimes: vec![RuntimeType::Firecracker, RuntimeType::Qemu],
         failure_domain: "fd-cel_default".into(),

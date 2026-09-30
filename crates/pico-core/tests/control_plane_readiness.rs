@@ -134,6 +134,7 @@ fn healthy_cell(id: &str, region: &str, failure_domain: &str) -> CellInfo {
             allocated_memory_mb: 0,
             max_sandboxes: 100,
             current_sandboxes: 0,
+            be_pool: None,
         },
         supported_runtimes: vec![RuntimeType::Firecracker],
         failure_domain: failure_domain.into(),
@@ -157,6 +158,7 @@ fn sched_request(sbx: &str) -> SchedulerRequest {
         preferred_region: None,
         avoid_failure_domains: vec![],
         sandbox_id: sbx.into(),
+        service_class: ServiceClass::LatencySensitive,
     }
 }
 
@@ -1634,6 +1636,7 @@ fn two_stage_placement_regional_then_cell() {
     let regional_resp = regional
         .schedule(
             &SchedulerRequest {
+                service_class: ServiceClass::LatencySensitive,
                 sandbox_id: sbx_key.clone(),
                 ..sched_request("ignored")
             },
@@ -1646,6 +1649,7 @@ fn two_stage_placement_regional_then_cell() {
     let cell_resp = cell
         .schedule(
             &CellSchedulerRequest {
+                service_class: ServiceClass::LatencySensitive,
                 sandbox_id: sbx_key.clone(),
                 ..cell_request("ignored")
             },
@@ -1761,6 +1765,7 @@ fn full_control_plane_chain_is_ordered_and_correlated() {
     regional
         .schedule(
             &SchedulerRequest {
+                service_class: ServiceClass::LatencySensitive,
                 sandbox_id: sbx_key.clone(),
                 ..sched_request("ignored")
             },
@@ -1769,6 +1774,7 @@ fn full_control_plane_chain_is_ordered_and_correlated() {
         .expect("regional placement must succeed");
     cell.schedule(
         &CellSchedulerRequest {
+            service_class: ServiceClass::LatencySensitive,
             sandbox_id: sbx_key.clone(),
             ..cell_request("ignored")
         },
@@ -1871,6 +1877,7 @@ fn placement_and_lifecycle_share_sandbox_identity() {
         .with_audit_sink(Arc::clone(&sink_dyn), Arc::clone(&hlc))
         .schedule(
             &SchedulerRequest {
+                service_class: ServiceClass::LatencySensitive,
                 sandbox_id: sbx_key.clone(),
                 ..sched_request("ignored")
             },
@@ -1881,6 +1888,7 @@ fn placement_and_lifecycle_share_sandbox_identity() {
         .with_audit_sink(sink_dyn, Arc::clone(&hlc))
         .schedule(
             &CellSchedulerRequest {
+                service_class: ServiceClass::LatencySensitive,
                 sandbox_id: sbx_key.clone(),
                 ..cell_request("ignored")
             },

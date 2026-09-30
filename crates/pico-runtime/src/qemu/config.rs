@@ -95,6 +95,8 @@ pub struct QemuConfig {
     pub qmp_enabled: bool,
     pub qmp_addr: SocketAddr,
     pub hardening: crate::RuntimeHardening,
+    /// Gated core-sched cookie tagging for BE VMM pids (default disabled).
+    pub core_sched_policy: pico_core::CoreSchedPolicy,
 }
 
 impl QemuConfig {
@@ -126,6 +128,7 @@ impl QemuConfig {
             qmp_enabled: qmp_enabled(mode),
             qmp_addr: qmp_addr(),
             hardening,
+            core_sched_policy: pico_core::CoreSchedPolicy::default(),
         }
     }
 
@@ -532,6 +535,7 @@ mod tests {
             qmp_enabled: true,
             qmp_addr: "127.0.0.1:0".parse().unwrap(),
             hardening: crate::RuntimeHardening::default(),
+            core_sched_policy: pico_core::CoreSchedPolicy::default(),
         }
     }
 
