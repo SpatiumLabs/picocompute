@@ -1,6 +1,6 @@
 //! Latency-sensitive / best-effort service classes and the gated overcommit track.
 //!
-//! Step 1 of the CAP-168 measured-overcommit track. Host packing stays
+//! Step 1 of the measured-overcommit track. Host packing stays
 //! no-overcommit by default: [`OvercommitPolicy`] is disabled unless a
 //! config explicitly enables it, and every scheduling, cgroup, and reclaim
 //! seam below is a no-op for latency-sensitive sandboxes and for any
@@ -476,9 +476,11 @@ pub enum CoreSchedSupport {
 
 /// Probes core-scheduling support without side effects.
 ///
-/// Reads (never creates) the caller's own core-sched cookie via
+/// Reads (never creates) the calling thread-group's core-sched cookie via
 /// `prctl(PR_SCHED_CORE, PR_SCHED_CORE_GET)`. A kernel without
-/// `CONFIG_SCHED_CORE` rejects the option with `EINVAL`.
+/// `CONFIG_SCHED_CORE` rejects the option with `EINVAL`. Only the return
+/// code matters here (the cookie value is discarded), so the probe stays a
+/// pure support check.
 #[must_use]
 pub fn probe_core_scheduling() -> CoreSchedSupport {
     #[cfg(target_os = "linux")]
@@ -486,17 +488,19 @@ pub fn probe_core_scheduling() -> CoreSchedSupport {
         use std::io;
         use std::process;
 
-        // Safety: read-only GET of our own pid; out-pointer targets a
-        // live stack slot for the duration of the call. The pointer-to-int
-        // cast assumes a 64-bit Linux host (all production SKUs are
-        // x86_64/aarch64); it would truncate on 32-bit Linux.
+        // Safety: read-only GET on our own thread group; out-pointer
+        // targets a live stack slot for the duration of the call. The
+        // pointer-to-int cast assumes a 64-bit Linux host (all production
+        // SKUs are x86_64/aarch64); it would truncate on 32-bit Linux.
+        // THREAD_GROUP scope matches the tgid from process::id: every
+        // thread in this group shares the read.
         let cookie: u64 = 0;
         let ret = unsafe {
             libc::prctl(
                 libc::PR_SCHED_CORE,
                 libc::PR_SCHED_CORE_GET,
                 process::id() as libc::c_ulong,
-                libc::PIDTYPE_PID as libc::c_ulong,
+                libc::PR_SCHED_CORE_SCOPE_THREAD_GROUP as libc::c_ulong,
                 &cookie as *const u64 as libc::c_ulong,
             )
         };
@@ -562,26 +566,38 @@ pub enum CoreSchedTagOutcome {
     },
 }
 
-/// Creates a fresh core-sched cookie for the calling thread.
+/// Creates a fresh core-sched cookie for one target pid.
 ///
-/// On Linux, wraps `prctl(PR_SCHED_CORE, PR_SCHED_CORE_CREATE)` for the
-/// caller (pid 0 targets the caller under `PIDTYPE_PID`). Returns the new
-/// cookie read back via GET. On non-Linux, fails closed with a typed error
-/// so callers take the SMT-exclusion-only branch.
-pub fn create_core_sched_cookie() -> Result<u64> {
+/// Wraps `prctl(PR_SCHED_CORE, PR_SCHED_CORE_CREATE)` addressed at `pid`
+/// with `THREAD_GROUP` scope, so every thread of the target VMM process
+/// (including vCPU threads) shares the new cookie. The caller is never
+/// mutated: unlike sharing the caller's own cookie, the supervisor keeps
+/// its scheduling domain and the VMM gets an isolated one. Returns the new
+/// cookie read back via GET for audit. `pid == 0` is rejected (it carries
+/// process-group semantics). Pushing a cookie to another process needs
+/// ptrace read access, so a restricted supervisor surfaces typed
+/// permission-denied and callers can warn-and-continue. On non-Linux,
+/// fails closed with a typed error so callers take the
+/// SMT-exclusion-only branch.
+pub fn create_core_sched_cookie_for_pid(pid: u32) -> Result<u64> {
+    if pid == 0 {
+        return Err(SandboxError::BadRequest(
+            "core-sched tagging requires an explicit pid".into(),
+        ));
+    }
     #[cfg(target_os = "linux")]
     {
         use std::io::{self, ErrorKind};
-        use std::process;
 
-        // Safety: CREATE for our own pid only; all pointer args are zero
-        // because CREATE takes no out-pointer.
+        // Safety: CREATE addressed at one explicit pid with THREAD_GROUP
+        // scope; all pointer args are zero because CREATE takes no
+        // out-pointer.
         let ret = unsafe {
             libc::prctl(
                 libc::PR_SCHED_CORE,
                 libc::PR_SCHED_CORE_CREATE,
-                0 as libc::c_ulong,
-                libc::PIDTYPE_PID as libc::c_ulong,
+                pid as libc::c_ulong,
+                libc::PR_SCHED_CORE_SCOPE_THREAD_GROUP as libc::c_ulong,
                 0 as libc::c_ulong,
             )
         };
@@ -593,22 +609,25 @@ pub fn create_core_sched_cookie() -> Result<u64> {
             {
                 return Err(SandboxError::Io(io::Error::new(
                     ErrorKind::PermissionDenied,
-                    format!("core-sched create denied: {os}"),
+                    format!("core-sched create denied for pid {pid}: {os}"),
                 )));
             }
             return Err(SandboxError::CgroupSetupFailed {
                 controller: "core_sched".into(),
-                reason: format!("prctl(PR_SCHED_CORE, CREATE) failed: {os}"),
+                reason: format!("prctl(PR_SCHED_CORE, CREATE) failed for pid {pid}: {os}"),
             });
         }
-        // Read back the fresh cookie for audit.
+        // Read back the target's fresh cookie for audit.
         let cookie: u64 = 0;
         let ret = unsafe {
             libc::prctl(
                 libc::PR_SCHED_CORE,
                 libc::PR_SCHED_CORE_GET,
-                process::id() as libc::c_ulong,
-                libc::PIDTYPE_PID as libc::c_ulong,
+                pid as libc::c_ulong,
+                libc::PR_SCHED_CORE_SCOPE_THREAD_GROUP as libc::c_ulong,
+                // Pointer-to-int cast assumes a 64-bit Linux host (all
+                // production SKUs are x86_64/aarch64); it would truncate
+                // on 32-bit Linux.
                 &cookie as *const u64 as libc::c_ulong,
             )
         };
@@ -616,7 +635,9 @@ pub fn create_core_sched_cookie() -> Result<u64> {
             let os = io::Error::last_os_error();
             return Err(SandboxError::CgroupSetupFailed {
                 controller: "core_sched".into(),
-                reason: format!("prctl(PR_SCHED_CORE, GET) after CREATE failed: {os}"),
+                reason: format!(
+                    "prctl(PR_SCHED_CORE, GET) after CREATE failed for pid {pid}: {os}"
+                ),
             });
         }
         Ok(cookie)
@@ -631,9 +652,12 @@ pub fn create_core_sched_cookie() -> Result<u64> {
 
 /// Shares the caller's core-sched cookie with one target pid.
 ///
-/// Wraps `prctl(PR_SCHED_CORE, PR_SCHED_CORE_SHARE_TO, pid, PIDTYPE_PID,
-/// cookie)`. `pid == 0` is rejected: pid 0 carries process-group semantics
-/// and this helper only ever targets one explicit VMM process.
+/// Wraps `prctl(PR_SCHED_CORE, PR_SCHED_CORE_SHARE_TO, pid,
+/// THREAD_GROUP, cookie)` with `THREAD_GROUP` scope so the whole target
+/// process joins the caller's scheduling group. `pid == 0` is rejected: pid
+/// 0 carries process-group semantics and this helper only ever targets one
+/// explicit VMM process. The integer-to-pointer widths assume a 64-bit
+/// Linux host (all production SKUs are x86_64/aarch64).
 pub fn share_core_sched_cookie_to_pid(cookie: u64, pid: u32) -> Result<()> {
     if pid == 0 {
         return Err(SandboxError::BadRequest(
@@ -644,14 +668,17 @@ pub fn share_core_sched_cookie_to_pid(cookie: u64, pid: u32) -> Result<()> {
     {
         use std::io::{self, ErrorKind};
 
-        // Safety: SHARE_TO targets one explicit pid; cookie is a plain
-        // integer, no pointers cross the boundary.
+        // Safety: SHARE_TO targets one explicit pid with THREAD_GROUP
+        // scope; cookie is a plain integer, no pointers cross the boundary.
+        // The u64-to-c_ulong cast assumes a 64-bit Linux host (all
+        // production SKUs are x86_64/aarch64); it would truncate on 32-bit
+        // Linux.
         let ret = unsafe {
             libc::prctl(
                 libc::PR_SCHED_CORE,
                 libc::PR_SCHED_CORE_SHARE_TO,
                 pid as libc::c_ulong,
-                libc::PIDTYPE_PID as libc::c_ulong,
+                libc::PR_SCHED_CORE_SCOPE_THREAD_GROUP as libc::c_ulong,
                 cookie as libc::c_ulong,
             )
         };
@@ -687,9 +714,11 @@ pub fn share_core_sched_cookie_to_pid(cookie: u64, pid: u32) -> Result<()> {
 /// - Policy disabled: returns `SkippedDisabled` without a syscall, so the
 ///   LS path and the default BE path stay on SMT-exclusion-only.
 /// - Probe `Unsupported`: returns `SkippedUnsupported` without a syscall.
-/// - Otherwise creates a fresh cookie and shares it to `pid`. Permission
-///   denial surfaces as a typed `Io` error so VMM spawn can warn and
-///   continue on restricted hosts but fail closed on real misconfiguration.
+/// - Otherwise creates a fresh cookie directly for `pid` (the caller is
+///   never retagged, so the supervisor keeps its own scheduling domain).
+///   Permission denial surfaces as a typed `Io` error so VMM spawn can warn
+///   and continue on restricted hosts but fail closed on real
+///   misconfiguration.
 ///
 /// `pid == 0` always fails closed for both classes.
 pub fn apply_core_sched_tagging_to_pid(
@@ -702,7 +731,7 @@ pub fn apply_core_sched_tagging_to_pid(
             "core-sched tagging requires an explicit pid".into(),
         ));
     }
-    if !policy.enabled {
+    if policy.is_noop() {
         return Ok(CoreSchedTagOutcome::SkippedDisabled);
     }
     match support {
@@ -710,8 +739,7 @@ pub fn apply_core_sched_tagging_to_pid(
             Ok(CoreSchedTagOutcome::SkippedUnsupported { reason })
         }
         CoreSchedSupport::Supported => {
-            let cookie = create_core_sched_cookie()?;
-            share_core_sched_cookie_to_pid(cookie, pid)?;
+            let cookie = create_core_sched_cookie_for_pid(pid)?;
             Ok(CoreSchedTagOutcome::Tagged { cookie })
         }
     }
@@ -922,16 +950,20 @@ impl DamonIdleReport {
 
 /// Turns a DAMON idle sample into a balloon free-page hint.
 ///
-/// Fails closed (returns `None`): a disabled DAMON policy, a zero idle
-/// sample, or a zero total each mean there is nothing safe to report.
-/// The hint truncates to the idle bytes (never inflates beyond what DAMON
-/// observed) so an oversized sample cannot push the balloon past the guest.
+/// Fails closed (returns `None`): a disabled or invalid DAMON policy, a
+/// zero idle sample, a zero total, or a sample younger than
+/// `min_idle_age_ms` each mean there is nothing safe to report yet. The
+/// hint clamps idle to the scanned total: a corrupt sample claiming more
+/// idle than scanned yields the total instead of an unbounded hint.
 #[must_use]
 pub fn free_hint_from_damon(report: &DamonIdleReport, policy: &DamonPolicy) -> Option<u64> {
-    if !policy.enabled {
+    if policy.is_noop() || policy.validate().is_err() {
         return None;
     }
     if report.idle_bytes == 0 || report.total_bytes == 0 {
+        return None;
+    }
+    if report.sample_age_ms < policy.min_idle_age_ms {
         return None;
     }
     // Clamp idle to total: a corrupt sample claiming more idle than scanned
@@ -1173,7 +1205,7 @@ mod tests {
 
     #[test]
     fn be_enabled_effective_fit_doubles_vcpu_packing() {
-        // P0 model input for the CAP-168 spike report: with 2x CPU/memory
+        // P0 model input for the spike report: with 2x CPU/memory
         // overcommit plus a 128 MiB shared-base discount, the default shape
         // packs 64 best-effort sandboxes on the lab SKU (vCPU-bound), while
         // strict packing stays at 32.
@@ -1456,10 +1488,18 @@ mod tests {
     }
 
     #[test]
+    fn core_sched_cookie_create_for_pid_rejects_zero() {
+        assert!(create_core_sched_cookie_for_pid(0).is_err());
+    }
+
+    #[test]
     fn core_sched_cookie_create_fails_closed_off_linux() {
-        // On Linux this either tags or returns a typed denial/misconfig;
-        // on non-Linux it must fail closed as BadRequest, never panic.
-        match create_core_sched_cookie() {
+        // Off Linux (or for a dead pid on Linux) creation must fail with a
+        // typed error, never panic. On a live Linux host with support it
+        // may succeed; either way the result is typed.
+        let pid = process::id();
+        assert!(pid != 0);
+        match create_core_sched_cookie_for_pid(pid) {
             Ok(_cookie) => {
                 #[cfg(not(target_os = "linux"))]
                 panic!("non-Linux must not create a cookie");
@@ -1477,6 +1517,8 @@ mod tests {
                 );
             }
         }
+        // A dead pid can never gain a cookie: fail closed, never panic.
+        assert!(create_core_sched_cookie_for_pid(u32::MAX).is_err());
     }
 
     #[test]
@@ -1527,25 +1569,43 @@ mod tests {
         );
         assert_eq!(free_hint_from_damon(&report, &disabled), None);
 
-        // Zero idle or zero total yields no hint.
+        // Zero idle or zero total yields no hint (ages satisfy the gate
+        // here so the zero-byte arms are what fail).
         let empty = DamonIdleReport {
             idle_bytes: 0,
             total_bytes: 512,
-            sample_age_ms: 0,
+            sample_age_ms: 30_000,
         };
         assert_eq!(free_hint_from_damon(&empty, &enabled), None);
         let no_scan = DamonIdleReport {
             idle_bytes: 128,
             total_bytes: 0,
-            sample_age_ms: 0,
+            sample_age_ms: 30_000,
         };
         assert_eq!(free_hint_from_damon(&no_scan, &enabled), None);
+
+        // Sample younger than min_idle_age_ms yields no hint yet.
+        let young = DamonIdleReport {
+            idle_bytes: 128,
+            total_bytes: 512,
+            sample_age_ms: 1_000,
+        };
+        assert_eq!(free_hint_from_damon(&young, &enabled), None);
+
+        // Invalid-but-enabled policy yields no hint (validation enforced
+        // on the read path, not just at config time).
+        let bad_policy = DamonPolicy {
+            enabled: true,
+            sample_interval_ms: 0,
+            ..DamonPolicy::default()
+        };
+        assert_eq!(free_hint_from_damon(&report, &bad_policy), None);
 
         // Corrupt sample claiming more idle than scanned clamps to total.
         let corrupt = DamonIdleReport {
             idle_bytes: 1024,
             total_bytes: 512,
-            sample_age_ms: 0,
+            sample_age_ms: 30_000,
         };
         assert_eq!(free_hint_from_damon(&corrupt, &enabled), Some(512));
     }

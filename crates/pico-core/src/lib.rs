@@ -97,7 +97,7 @@ pub use overcommit::{
     MAX_DAMON_SAMPLE_INTERVAL_MS, MAX_OVERCOMMIT_RATIO, MAX_SHARED_BASE_MB, OvercommitPolicy,
     SchedPolicy, ServiceClass, ServiceClassControls, apply_core_sched_tagging_to_pid,
     apply_sched_policy_to_pid, apply_service_class_sched_policy, balloon_target,
-    balloon_target_from_damon, controls_for_class, create_core_sched_cookie,
+    balloon_target_from_damon, controls_for_class, create_core_sched_cookie_for_pid,
     effective_capacity_for_class, effective_memory_request, free_hint_from_damon,
     idle_reclaim_plan, is_sched_permission_denied, parse_damon_idle_bytes, probe_core_scheduling,
     read_damon_idle_bytes, resolve_service_class, sched_policy_for_class,

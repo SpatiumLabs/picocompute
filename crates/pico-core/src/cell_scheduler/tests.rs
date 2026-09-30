@@ -1198,7 +1198,7 @@ fn simulation_all_draining_returns_specific_error() {
 }
 
 // ================================================================
-// Best-effort overcommit gate tests (CAP-168 track)
+// Best-effort overcommit gate tests (overcommit track)
 // ================================================================
 
 /// Host with zero strict default-shape slots left.
@@ -1469,7 +1469,7 @@ fn invalid_overcommit_policy_fails_placement_closed() {
 
 #[test]
 fn request_without_service_class_deserializes_to_ls() {
-    // Payloads written before the CAP-168 track keep strict packing.
+    // Payloads written before the overcommit track keep strict packing.
     let json = serde_json::json!({
         "sandbox_id": "sbx_old",
         "vcpus": 2,
@@ -1822,34 +1822,24 @@ fn disabled_overlay_restores_herding_baseline() {
 }
 
 // ================================================================
-// Class-aware scoring tests (CAP-172 BE bin-packing)
+// Class-aware scoring tests (BE bin-packing follow-up)
 // ================================================================
 
-/// Two hosts identical except utilization: `hst_full` is nearly full,
-/// `hst_empty` is nearly empty. Cache, pressure, and runtimes match so
-/// only headroom/spread/disk decide.
+/// Two hosts identical except vCPU/memory utilization and sandbox count.
+/// Disk, network, slots, cache, pressure, and runtimes match so only the
+/// overcommittable bin-pack axes (plus spread) decide: disk and fixed
+/// resources stay spread-oriented for every class and must not tip the
+/// decision.
 fn make_binpack_hosts() -> (HostInfo, HostInfo) {
     let mut full = make_host("hst_full", HostHealth::Healthy);
     full.capacity.allocated_vcpus = 60;
     full.capacity.allocated_memory_mb = 60_000;
-    full.capacity.used_disk_mb = 450_000;
-    full.capacity.allocated_network_mbps = 9_000;
-    full.capacity.used_process_slots = 90;
     full.current_sandboxes = 80;
     full.cache.cached_images = vec!["img".into()];
-    full.pressure = HostPressure {
-        in_flight_creates: 1,
-        in_flight_restores: 0,
-        max_concurrent_creates: 10,
-        max_concurrent_restores: 5,
-    };
 
     let mut empty = make_host("hst_empty", HostHealth::Healthy);
     empty.capacity.allocated_vcpus = 4;
     empty.capacity.allocated_memory_mb = 2048;
-    empty.capacity.used_disk_mb = 10_000;
-    empty.capacity.allocated_network_mbps = 500;
-    empty.capacity.used_process_slots = 5;
     empty.current_sandboxes = 2;
     empty.cache.cached_images = vec!["img".into()];
     empty.pressure = full.pressure;

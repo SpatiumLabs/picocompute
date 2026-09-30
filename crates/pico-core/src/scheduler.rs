@@ -82,7 +82,7 @@ pub struct CellCapacity {
     /// `Some` reserves a bounded BE budget inside the cell; LS requests
     /// ignore it, BE requests must fit both the strict cell totals and the
     /// pool. Serde-defaults to `None` so payloads written before the
-    /// CAP-172 track keep strict behavior.
+    /// cell-pool follow-up keep strict behavior.
     #[serde(default)]
     pub be_pool: Option<BeCellPool>,
 }
@@ -112,6 +112,34 @@ pub struct BeCellPool {
 }
 
 impl BeCellPool {
+    /// Validates that allocated counters stay within their reservations.
+    ///
+    /// Pool counters arrive on cell reports (external input), so a corrupt
+    /// report with allocated over reserved must fail closed instead of
+    /// silently exhausting the pool. Zero reservations are valid (the pool
+    /// then admits nothing); only over-allocation fails.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.allocated_be_vcpus > self.reserved_vcpus {
+            return Err(crate::error::SandboxError::BadRequest(format!(
+                "be pool allocated_be_vcpus {} exceeds reserved_vcpus {}",
+                self.allocated_be_vcpus, self.reserved_vcpus
+            )));
+        }
+        if self.allocated_be_memory_mb > self.reserved_memory_mb {
+            return Err(crate::error::SandboxError::BadRequest(format!(
+                "be pool allocated_be_memory_mb {} exceeds reserved_memory_mb {}",
+                self.allocated_be_memory_mb, self.reserved_memory_mb
+            )));
+        }
+        if self.current_be_sandboxes > self.max_be_sandboxes {
+            return Err(crate::error::SandboxError::BadRequest(format!(
+                "be pool current_be_sandboxes {} exceeds max_be_sandboxes {}",
+                self.current_be_sandboxes, self.max_be_sandboxes
+            )));
+        }
+        Ok(())
+    }
+
     /// Whether this pool can admit one more BE sandbox of this shape.
     pub fn can_fit_be(&self, vcpus: u32, memory_mb: u64) -> bool {
         self.remaining_be_fit_count(vcpus, memory_mb) > 0
@@ -656,7 +684,7 @@ pub struct SchedulerRequest {
     pub sandbox_id: String,
     /// Scheduling service class for this sandbox.
     ///
-    /// Serde-defaults to LS so payloads written before the CAP-172 track
+    /// Serde-defaults to LS so payloads written before the cell-pool follow-up
     /// keep strict regional behavior. BE requests are pool-gated via
     /// [`CellCapacity::be_pool`]; cells without a pool treat BE as strict.
     #[serde(default)]
@@ -1336,6 +1364,21 @@ impl RegionalScheduler {
         if !cell.health.can_admit() {
             return ConstraintResult::Fail(format!("cell is {}", cell.health.as_str()));
         }
+        // A corrupt BE pool report fails closed for BE only: the cell is
+        // rejected for best-effort with a distinct pool message (still
+        // carrying the `capacity` keyword for the throttled mapping) while
+        // LS continues to pack strict. Pool data arrives on cell reports,
+        // so per-cell rejection is safer than failing the whole schedule.
+        // This check runs before the fit check so corruption reports
+        // `invalid`, not `exhausted`.
+        if request.service_class.is_best_effort()
+            && let Some(pool) = cell.capacity.be_pool
+            && pool.validate().is_err()
+        {
+            return ConstraintResult::Fail(
+                "insufficient capacity (best-effort cell pool invalid)".into(),
+            );
+        }
         if !cell
             .capacity
             .can_fit_class(request.vcpus, request.memory_mb, request.service_class)
@@ -1421,6 +1464,13 @@ impl RegionalScheduler {
     }
 
     /// Scores a single cell across all weighted dimensions.
+    ///
+    /// Deliberately class-agnostic: BE pool state affects filtering only,
+    /// never scoring, so LS warning-max cannot move with pool rollout.
+    /// Follow-up work may add a BE pool-headroom signal here (preferring
+    /// pool-rich cells among survivors) once host packing evidence shows
+    /// BE herding onto nearly-exhausted pools; until then the filter plus
+    /// the in-flight overlay spread BE across cells with pool room.
     fn score_cell(&self, cell: &CellInfo, request: &SchedulerRequest) -> ScoreBreakdown {
         let mut components = Vec::with_capacity(6);
 
@@ -2814,7 +2864,7 @@ mod tests {
     }
 
     // ================================================================
-    // Cell-level BE pools (CAP-172 regional)
+    // Cell-level BE pools (regional follow-up)
     // ================================================================
 
     fn be_request() -> SchedulerRequest {
@@ -2868,6 +2918,41 @@ mod tests {
             .schedule(&make_request(), &cells)
             .expect("LS must ignore the BE pool");
         assert!(ls.scheduled);
+    }
+
+    #[test]
+    fn be_pool_invalid_report_rejects_be_but_admits_ls() {
+        // Corrupt pool counters (allocated over reserved) fail closed for
+        // BE with a distinct pool message, while LS still packs strict.
+        let corrupt = BeCellPool {
+            max_be_sandboxes: 4,
+            current_be_sandboxes: 1,
+            reserved_vcpus: 2,
+            allocated_be_vcpus: 8,
+            reserved_memory_mb: 4096,
+            allocated_be_memory_mb: 1024,
+        };
+        assert!(corrupt.validate().is_err());
+        let valid = BeCellPool {
+            max_be_sandboxes: 4,
+            current_be_sandboxes: 1,
+            reserved_vcpus: 8,
+            allocated_be_vcpus: 2,
+            reserved_memory_mb: 4096,
+            allocated_be_memory_mb: 1024,
+        };
+        valid.validate().unwrap();
+
+        let scheduler = RegionalScheduler::new();
+        let cells = vec![cell_with_be_pool("cel_corrupt", corrupt)];
+        let be_err = scheduler.schedule(&be_request(), &cells).unwrap_err();
+        assert!(
+            matches!(be_err, SchedulerError::InsufficientCapacity { .. }),
+            "corrupt BE pool must shed throttled, got {be_err:?}"
+        );
+        scheduler
+            .schedule(&make_request(), &cells)
+            .expect("LS must ignore a corrupt BE pool");
     }
 
     #[test]
