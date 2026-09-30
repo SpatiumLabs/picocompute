@@ -24,7 +24,10 @@ use pico_core::runtime::{
     RuntimeBackend,
 };
 use pico_core::{ExecRequest, ExecResponse, SandboxConfig, SandboxError, SandboxState};
-use pico_core::{apply_service_class_sched_policy, is_sched_permission_denied};
+use pico_core::{
+    apply_core_sched_tagging_to_pid, apply_service_class_sched_policy, is_sched_permission_denied,
+    probe_core_scheduling,
+};
 
 use crate::base::VmBackendBase;
 use crate::qemu::config::{QemuConfig, QemuMode};
@@ -467,6 +470,51 @@ impl RuntimeBackend for QemuAdapter {
                             return Err(SandboxError::Other(format!(
                                 "sched policy failed for QEMU VMM pid {pid}: {err}"
                             )));
+                        }
+                    }
+                }
+            }
+            // Core-sched cookie tagging for BE VMM pids (gated default-off).
+            // Same S-NOISY branch contract as Firecracker: disabled or
+            // Unsupported stays SMT-exclusion-only; denied warns.
+            {
+                let sandbox_config = self.base.config.lock().await;
+                let is_be = sandbox_config
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.service_class.is_best_effort());
+                let policy = self.qemu_config.core_sched_policy;
+                drop(sandbox_config);
+                if is_be && policy.enabled {
+                    let vm_proc = self.vm_process.lock().await;
+                    if let Some(ref child) = *vm_proc
+                        && let Some(pid) = child.id()
+                    {
+                        let support = probe_core_scheduling();
+                        match apply_core_sched_tagging_to_pid(&policy, &support, pid) {
+                            Ok(pico_core::CoreSchedTagOutcome::Tagged { cookie }) => {
+                                tracing::info!(
+                                    pid = pid,
+                                    cookie = cookie,
+                                    "core-sched cookie tagged QEMU VMM"
+                                );
+                            }
+                            Ok(
+                                pico_core::CoreSchedTagOutcome::SkippedDisabled
+                                | pico_core::CoreSchedTagOutcome::SkippedUnsupported { .. },
+                            ) => {}
+                            Err(err) => {
+                                if is_sched_permission_denied(&err) {
+                                    tracing::warn!(
+                                        pid = pid,
+                                        error = %err,
+                                        "core-sched tagging denied for QEMU VMM process; continuing SMT-exclusion-only"
+                                    );
+                                } else {
+                                    return Err(SandboxError::Other(format!(
+                                        "core-sched tagging failed for QEMU VMM pid {pid}: {err}"
+                                    )));
+                                }
+                            }
                         }
                     }
                 }

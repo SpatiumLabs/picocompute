@@ -268,6 +268,7 @@ impl PlacementRegistry {
                 allocated_memory_mb: info.capacity.allocated_memory_mb,
                 max_sandboxes: info.capacity.max_process_slots.max(1),
                 current_sandboxes: info.current_sandboxes,
+                be_pool: None,
             },
             supported_runtimes: report.supported_runtimes.clone(),
             failure_domain: format!("fd-{}", report.cell_id),
@@ -709,6 +710,7 @@ impl PlacementGate {
             preferred_region: None,
             avoid_failure_domains: Vec::new(),
             sandbox_id: sandbox_id.to_string(),
+            service_class,
         };
         let regional_resp = self
             .regional
@@ -823,6 +825,7 @@ mod tests {
                 total_memory_mb: 262_144,
                 allocated_memory_mb: 0,
                 max_sandboxes: 100,
+                be_pool: None,
                 current_sandboxes: 0,
             },
             supported_runtimes: vec![RuntimeType::Firecracker],
@@ -1299,12 +1302,10 @@ mod tests {
             )
             .expect("BE tenant must place");
         assert_eq!(decision.service_class, ServiceClass::BestEffort);
-        // Both stages emit: regional stays LS with no bit, cell carries
-        // the request class (strict fit here, so no bit).
+        // Both stages emit the request class (strict fit here, so no bit):
+        // regional carries BE for pool audit, cell carries BE.
         let outcomes = sink.events_by_kind(AuditEventKind::PlacementOutcome);
         assert_eq!(outcomes.len(), 2);
-        let mut saw_ls = false;
-        let mut saw_be = false;
         for event in &outcomes {
             match &event.details {
                 Some(AuditEventDetails::PlacementOutcome {
@@ -1313,15 +1314,11 @@ mod tests {
                     ..
                 }) => {
                     assert!(!overcommit_applied);
-                    match service_class {
-                        ServiceClass::LatencySensitive => saw_ls = true,
-                        ServiceClass::BestEffort => saw_be = true,
-                    }
+                    assert_eq!(*service_class, ServiceClass::BestEffort);
                 }
                 d => panic!("expected placement outcome, got {d:?}"),
             }
         }
-        assert!(saw_ls && saw_be);
     }
 
     #[test]

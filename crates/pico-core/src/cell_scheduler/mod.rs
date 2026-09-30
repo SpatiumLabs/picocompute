@@ -1375,6 +1375,15 @@ impl CellScheduler {
     }
 
     /// Scores a single host across all weighted dimensions.
+    ///
+    /// Latency-sensitive requests keep the historical spread behavior
+    /// (prefer headroom, fewer sandboxes, free disk) byte-identical with the
+    /// pre-class scheduler so scoring changes never move the LS warning-max
+    /// vs the step-1 baseline. Best-effort requests under an enabled
+    /// [`OvercommitPolicy`] bin-pack instead: they prefer high-utilization
+    /// hosts (low headroom, many sandboxes, full disk) to leave empty hosts
+    /// for LS. Cache and pressure dimensions stay class-agnostic. Ties keep
+    /// the deterministic host-ID order in the placement engine.
     fn score_host(
         &self,
         host: &HostInfo,
@@ -1383,15 +1392,21 @@ impl CellScheduler {
     ) -> HostScoreBreakdown {
         let mut components = Vec::with_capacity(5);
 
+        let is_be_binpack = request.service_class.is_best_effort() && self.overcommit.enabled;
         let headroom = (host.capacity.vcpu_headroom()
             + host.capacity.memory_headroom()
             + host.capacity.network_headroom()
             + host.capacity.process_slot_headroom())
             / 4.0;
+        let headroom_score = if is_be_binpack {
+            1.0 - headroom
+        } else {
+            headroom
+        };
         components.push(self.make_component(
             HostScoreDimension::CapacityHeadroom,
             self.weights.capacity_headroom,
-            headroom,
+            headroom_score,
         ));
 
         let cache_score = self.compute_cache_score(host, request);
@@ -1409,9 +1424,16 @@ impl CellScheduler {
         ));
 
         let spread_score = if max_sandboxes > 0 {
-            1.0 - (host.current_sandboxes as f64 / max_sandboxes as f64)
+            let density = host.current_sandboxes as f64 / max_sandboxes as f64;
+            if is_be_binpack {
+                density
+            } else {
+                1.0 - density
+            }
         } else {
-            1.0
+            // No sandboxes anywhere: LS keeps the neutral 1.0, BE binpack
+            // sees zero density to pack.
+            if is_be_binpack { 0.0 } else { 1.0 }
         };
         components.push(self.make_component(
             HostScoreDimension::SandboxSpread,
@@ -1419,7 +1441,12 @@ impl CellScheduler {
             spread_score,
         ));
 
-        let disk_score = host.capacity.disk_headroom();
+        let disk_headroom = host.capacity.disk_headroom();
+        let disk_score = if is_be_binpack {
+            1.0 - disk_headroom
+        } else {
+            disk_headroom
+        };
         components.push(self.make_component(
             HostScoreDimension::DiskAvailability,
             self.weights.disk_availability,

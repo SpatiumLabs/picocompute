@@ -1033,6 +1033,7 @@ fn inventory_feeds_cell_info_snapshot_timing_for_regional_scheduler() {
             allocated_memory_mb: 2048,
             max_sandboxes: 50,
             current_sandboxes: 10,
+            be_pool: None,
         },
         supported_runtimes: vec![RuntimeType::Firecracker],
         failure_domain: "fd-1".into(),
@@ -1073,6 +1074,7 @@ fn inventory_feeds_cell_info_snapshot_timing_for_regional_scheduler() {
         preferred_region: None,
         avoid_failure_domains: vec![],
         sandbox_id: "sbx_test".into(),
+        service_class: ServiceClass::LatencySensitive,
     };
 
     let result = scheduler.schedule(&request, &[cell_legacy, cell]).unwrap();
@@ -1817,4 +1819,124 @@ fn disabled_overlay_restores_herding_baseline() {
         assert_eq!(response.host_id.as_ref().unwrap().as_str(), "hst_1");
         assert!(!response.overlay_adjusted);
     }
+}
+
+// ================================================================
+// Class-aware scoring tests (CAP-172 BE bin-packing)
+// ================================================================
+
+/// Two hosts identical except utilization: `hst_full` is nearly full,
+/// `hst_empty` is nearly empty. Cache, pressure, and runtimes match so
+/// only headroom/spread/disk decide.
+fn make_binpack_hosts() -> (HostInfo, HostInfo) {
+    let mut full = make_host("hst_full", HostHealth::Healthy);
+    full.capacity.allocated_vcpus = 60;
+    full.capacity.allocated_memory_mb = 60_000;
+    full.capacity.used_disk_mb = 450_000;
+    full.capacity.allocated_network_mbps = 9_000;
+    full.capacity.used_process_slots = 90;
+    full.current_sandboxes = 80;
+    full.cache.cached_images = vec!["img".into()];
+    full.pressure = HostPressure {
+        in_flight_creates: 1,
+        in_flight_restores: 0,
+        max_concurrent_creates: 10,
+        max_concurrent_restores: 5,
+    };
+
+    let mut empty = make_host("hst_empty", HostHealth::Healthy);
+    empty.capacity.allocated_vcpus = 4;
+    empty.capacity.allocated_memory_mb = 2048;
+    empty.capacity.used_disk_mb = 10_000;
+    empty.capacity.allocated_network_mbps = 500;
+    empty.capacity.used_process_slots = 5;
+    empty.current_sandboxes = 2;
+    empty.cache.cached_images = vec!["img".into()];
+    empty.pressure = full.pressure;
+
+    (full, empty)
+}
+
+fn be_binpack_request() -> CellSchedulerRequest {
+    let mut req = make_request();
+    req.service_class = ServiceClass::BestEffort;
+    req.image = "img".into();
+    req
+}
+
+#[test]
+fn ls_prefers_empty_host_while_be_binpacks_full() {
+    let (full, empty) = make_binpack_hosts();
+    let enabled = enabled_policy();
+
+    // LS spreads to the empty host regardless of the overcommit gate.
+    for policy in [OvercommitPolicy::default(), enabled] {
+        let scheduler = CellScheduler::new().with_overcommit_policy(policy);
+        let ls = scheduler
+            .schedule(&make_request_with_image(), &[full.clone(), empty.clone()])
+            .unwrap();
+        assert_eq!(
+            ls.host_id.as_ref().unwrap().as_str(),
+            "hst_empty",
+            "LS must spread even with BE bin-packing enabled"
+        );
+    }
+
+    // BE with the gate off packs like LS (empty host).
+    let off = CellScheduler::new();
+    let be_off = off
+        .schedule(&be_binpack_request(), &[full.clone(), empty.clone()])
+        .unwrap();
+    assert_eq!(be_off.host_id.as_ref().unwrap().as_str(), "hst_empty");
+
+    // BE with the gate on bin-packs toward the full host.
+    let on = CellScheduler::new().with_overcommit_policy(enabled);
+    let be_on = on.schedule(&be_binpack_request(), &[full, empty]).unwrap();
+    assert_eq!(be_on.host_id.as_ref().unwrap().as_str(), "hst_full");
+}
+
+fn make_request_with_image() -> CellSchedulerRequest {
+    let mut req = make_request();
+    req.image = "img".into();
+    req
+}
+
+#[test]
+fn ls_scores_identical_with_policy_on_or_off() {
+    // Scoring changes must not move the LS warning-max vs the step-1
+    // baseline: an LS request scores byte-identical with the policy
+    // disabled or enabled.
+    let (full, empty) = make_binpack_hosts();
+    let req = make_request_with_image();
+    let off = CellScheduler::new();
+    let on = CellScheduler::new().with_overcommit_policy(enabled_policy());
+
+    for host in [full, empty] {
+        let max = 80;
+        let off_score = off.score_host(&host, &req, max);
+        let on_score = on.score_host(&host, &req, max);
+        assert_eq!(
+            off_score, on_score,
+            "LS breakdown must not move with the BE gate"
+        );
+    }
+}
+
+#[test]
+fn be_tie_break_stays_deterministic_by_host_id() {
+    // Two identical full hosts: BE bin-packing scores tie, so the
+    // placement-engine ID order decides regardless of input order.
+    let (full, _) = make_binpack_hosts();
+    let mut a = full.clone();
+    a.host_id = HostId::from_string("hst_a");
+    let mut b = full;
+    b.host_id = HostId::from_string("hst_b");
+
+    let first = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let second = CellScheduler::new().with_overcommit_policy(enabled_policy());
+    let req = be_binpack_request();
+
+    let r1 = first.schedule(&req, &[a.clone(), b.clone()]).unwrap();
+    let r2 = second.schedule(&req, &[b, a]).unwrap();
+    assert_eq!(r1.host_id, r2.host_id);
 }

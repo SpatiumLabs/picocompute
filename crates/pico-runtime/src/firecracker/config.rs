@@ -106,6 +106,12 @@ pub struct FirecrackerConfig {
     pub vsock_guest_cid: Option<u32>,
     pub enable_rng: bool,
     pub validate_paths: bool,
+    /// Gated core-sched cookie tagging for BE VMM pids (default disabled).
+    ///
+    /// When enabled, BE boots tag the VMM pid after `SCHED_IDLE` only if
+    /// the host probe reports `Supported`; otherwise the boot stays on the
+    /// SMT-exclusion-only branch. LS boots never tag.
+    pub core_sched_policy: pico_core::CoreSchedPolicy,
 }
 
 impl FirecrackerConfig {
@@ -143,6 +149,7 @@ impl FirecrackerConfig {
                 vsock_guest_cid: Some(3),
                 enable_rng: true,
                 validate_paths: true,
+                core_sched_policy: pico_core::CoreSchedPolicy::default(),
             },
             Architecture::X8664 => Self {
                 arch,
@@ -174,6 +181,7 @@ impl FirecrackerConfig {
                 vsock_guest_cid: Some(3),
                 enable_rng: true,
                 validate_paths: true,
+                core_sched_policy: pico_core::CoreSchedPolicy::default(),
             },
         }
     }

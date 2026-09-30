@@ -519,6 +519,204 @@ pub fn probe_core_scheduling() -> CoreSchedSupport {
     }
 }
 
+/// Gated policy for core-scheduling cookie tagging of VMM threads.
+///
+/// Disabled by default. When enabled, best-effort VMM pids are tagged with
+/// a fresh core-sched cookie after `SCHED_IDLE` application, so the kernel
+/// never co-schedules them on SMT siblings with latency-sensitive work.
+/// Tagging runs only when [`probe_core_scheduling`] reports `Supported`;
+/// otherwise the S-NOISY run stays on the SMT-exclusion-only branch (see
+/// [`crate::overcommit_p1::core_sched_branch`]).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreSchedPolicy {
+    /// Master gate. False (default) disables all tagging effects.
+    pub enabled: bool,
+}
+
+impl CoreSchedPolicy {
+    /// True when tagging can have any effect.
+    #[must_use]
+    pub fn is_noop(self) -> bool {
+        !self.enabled
+    }
+}
+
+/// Outcome of a core-sched tagging attempt for one VMM pid.
+///
+/// Returned by [`apply_core_sched_tagging_to_pid`] so callers can audit
+/// which S-NOISY branch a boot took (cookie-tagged vs SMT-exclusion-only)
+/// without parsing error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreSchedTagOutcome {
+    /// Pid was tagged with a fresh cookie (S-NOISY cookie-tagged branch).
+    Tagged {
+        /// Cookie now owned by the target pid.
+        cookie: u64,
+    },
+    /// Policy disabled: SMT-exclusion-only branch, no syscall.
+    SkippedDisabled,
+    /// Host reports `Unsupported`: SMT-exclusion-only branch, no syscall.
+    SkippedUnsupported {
+        /// Probe reason, for audit.
+        reason: &'static str,
+    },
+}
+
+/// Creates a fresh core-sched cookie for the calling thread.
+///
+/// On Linux, wraps `prctl(PR_SCHED_CORE, PR_SCHED_CORE_CREATE)` for the
+/// caller (pid 0 targets the caller under `PIDTYPE_PID`). Returns the new
+/// cookie read back via GET. On non-Linux, fails closed with a typed error
+/// so callers take the SMT-exclusion-only branch.
+pub fn create_core_sched_cookie() -> Result<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{self, ErrorKind};
+        use std::process;
+
+        // Safety: CREATE for our own pid only; all pointer args are zero
+        // because CREATE takes no out-pointer.
+        let ret = unsafe {
+            libc::prctl(
+                libc::PR_SCHED_CORE,
+                libc::PR_SCHED_CORE_CREATE,
+                0 as libc::c_ulong,
+                libc::PIDTYPE_PID as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        if ret != 0 {
+            let os = io::Error::last_os_error();
+            if os.raw_os_error() == Some(libc::EPERM)
+                || os.raw_os_error() == Some(libc::EACCES)
+                || os.kind() == ErrorKind::PermissionDenied
+            {
+                return Err(SandboxError::Io(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!("core-sched create denied: {os}"),
+                )));
+            }
+            return Err(SandboxError::CgroupSetupFailed {
+                controller: "core_sched".into(),
+                reason: format!("prctl(PR_SCHED_CORE, CREATE) failed: {os}"),
+            });
+        }
+        // Read back the fresh cookie for audit.
+        let cookie: u64 = 0;
+        let ret = unsafe {
+            libc::prctl(
+                libc::PR_SCHED_CORE,
+                libc::PR_SCHED_CORE_GET,
+                process::id() as libc::c_ulong,
+                libc::PIDTYPE_PID as libc::c_ulong,
+                &cookie as *const u64 as libc::c_ulong,
+            )
+        };
+        if ret != 0 {
+            let os = io::Error::last_os_error();
+            return Err(SandboxError::CgroupSetupFailed {
+                controller: "core_sched".into(),
+                reason: format!("prctl(PR_SCHED_CORE, GET) after CREATE failed: {os}"),
+            });
+        }
+        Ok(cookie)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(SandboxError::BadRequest(
+            "core-sched cookie creation requires Linux".into(),
+        ))
+    }
+}
+
+/// Shares the caller's core-sched cookie with one target pid.
+///
+/// Wraps `prctl(PR_SCHED_CORE, PR_SCHED_CORE_SHARE_TO, pid, PIDTYPE_PID,
+/// cookie)`. `pid == 0` is rejected: pid 0 carries process-group semantics
+/// and this helper only ever targets one explicit VMM process.
+pub fn share_core_sched_cookie_to_pid(cookie: u64, pid: u32) -> Result<()> {
+    if pid == 0 {
+        return Err(SandboxError::BadRequest(
+            "core-sched tagging requires an explicit pid".into(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{self, ErrorKind};
+
+        // Safety: SHARE_TO targets one explicit pid; cookie is a plain
+        // integer, no pointers cross the boundary.
+        let ret = unsafe {
+            libc::prctl(
+                libc::PR_SCHED_CORE,
+                libc::PR_SCHED_CORE_SHARE_TO,
+                pid as libc::c_ulong,
+                libc::PIDTYPE_PID as libc::c_ulong,
+                cookie as libc::c_ulong,
+            )
+        };
+        if ret != 0 {
+            let os = io::Error::last_os_error();
+            if os.raw_os_error() == Some(libc::EPERM)
+                || os.raw_os_error() == Some(libc::EACCES)
+                || os.kind() == ErrorKind::PermissionDenied
+            {
+                return Err(SandboxError::Io(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!("core-sched share to pid {pid} denied: {os}"),
+                )));
+            }
+            return Err(SandboxError::CgroupSetupFailed {
+                controller: "core_sched".into(),
+                reason: format!("prctl(PR_SCHED_CORE, SHARE_TO) failed for pid {pid}: {os}"),
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cookie;
+        Err(SandboxError::BadRequest(
+            "core-sched cookie sharing requires Linux".into(),
+        ))
+    }
+}
+
+/// Tags one VMM pid with a fresh core-sched cookie when gated on.
+///
+/// - Policy disabled: returns `SkippedDisabled` without a syscall, so the
+///   LS path and the default BE path stay on SMT-exclusion-only.
+/// - Probe `Unsupported`: returns `SkippedUnsupported` without a syscall.
+/// - Otherwise creates a fresh cookie and shares it to `pid`. Permission
+///   denial surfaces as a typed `Io` error so VMM spawn can warn and
+///   continue on restricted hosts but fail closed on real misconfiguration.
+///
+/// `pid == 0` always fails closed for both classes.
+pub fn apply_core_sched_tagging_to_pid(
+    policy: &CoreSchedPolicy,
+    support: &CoreSchedSupport,
+    pid: u32,
+) -> Result<CoreSchedTagOutcome> {
+    if pid == 0 {
+        return Err(SandboxError::BadRequest(
+            "core-sched tagging requires an explicit pid".into(),
+        ));
+    }
+    if !policy.enabled {
+        return Ok(CoreSchedTagOutcome::SkippedDisabled);
+    }
+    match support {
+        CoreSchedSupport::Unsupported { reason } => {
+            Ok(CoreSchedTagOutcome::SkippedUnsupported { reason })
+        }
+        CoreSchedSupport::Supported => {
+            let cookie = create_core_sched_cookie()?;
+            share_core_sched_cookie_to_pid(cookie, pid)?;
+            Ok(CoreSchedTagOutcome::Tagged { cookie })
+        }
+    }
+}
+
 // ---- Balloon and idle reclaim ----
 
 /// Guest memory balloon driver.
@@ -633,6 +831,152 @@ pub fn idle_reclaim_plan(
         return Ok(None);
     }
     Ok(Some(container_reclaim_plan(memory_limit_bytes)?))
+}
+
+// ---- DAMON idle hints for balloon free-page reporting ----
+
+/// Upper rail for the DAMON sampling interval in milliseconds.
+///
+/// A config rail against typos, not a measured safe point: intervals above
+/// one minute would miss idle transitions the balloon needs.
+pub const MAX_DAMON_SAMPLE_INTERVAL_MS: u64 = 60_000;
+
+/// Upper rail for the DAMON idle age in milliseconds.
+pub const MAX_DAMON_IDLE_AGE_MS: u64 = 3_600_000;
+
+/// DAMON (Data Access MONitor) sampling policy for balloon free-page hints.
+///
+/// Disabled by default. When enabled, the host samples DAMON idle-page
+/// bytes and feeds them as the guest free-page hint to [`balloon_target`].
+/// The P0 revision pinned only the balloon math; this seam wires the idle
+/// source without actuating any balloon until a P1/P2 report graduates it.
+/// Actuation stays behind the `enabled` gate plus
+/// [`BalloonPolicy::enabled`]: both must be on for a target to emerge.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DamonPolicy {
+    /// Master gate. False (default) disables all DAMON effects.
+    pub enabled: bool,
+    /// DAMON sampling interval in milliseconds (must be non-zero).
+    pub sample_interval_ms: u64,
+    /// Minimum idle age in milliseconds for a page to count as free hint.
+    pub min_idle_age_ms: u64,
+}
+
+impl Default for DamonPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_interval_ms: 1_000,
+            min_idle_age_ms: 30_000,
+        }
+    }
+}
+
+impl DamonPolicy {
+    /// Validates interval and age ranges.
+    pub fn validate(&self) -> Result<()> {
+        if self.sample_interval_ms == 0 || self.sample_interval_ms > MAX_DAMON_SAMPLE_INTERVAL_MS {
+            return Err(SandboxError::BadRequest(format!(
+                "damon sample_interval_ms must be within [1, {MAX_DAMON_SAMPLE_INTERVAL_MS}], got {}",
+                self.sample_interval_ms
+            )));
+        }
+        if self.min_idle_age_ms > MAX_DAMON_IDLE_AGE_MS {
+            return Err(SandboxError::BadRequest(format!(
+                "damon min_idle_age_ms must be within [0, {MAX_DAMON_IDLE_AGE_MS}], got {}",
+                self.min_idle_age_ms
+            )));
+        }
+        Ok(())
+    }
+
+    /// True when no DAMON effect can be observed.
+    #[must_use]
+    pub fn is_noop(self) -> bool {
+        !self.enabled
+    }
+}
+
+/// One DAMON idle-page sample tied to a sandbox cgroup.
+///
+/// Pure data: producers read DAMON sysfs or the host agent stats path and
+/// hand the bytes here; [`free_hint_from_damon`] turns them into a balloon
+/// hint. Zero totals fail closed downstream (no target).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DamonIdleReport {
+    /// Idle bytes older than `min_idle_age_ms`.
+    pub idle_bytes: u64,
+    /// Total bytes scanned in this sample.
+    pub total_bytes: u64,
+    /// Age of the sample in milliseconds.
+    pub sample_age_ms: u64,
+}
+
+impl DamonIdleReport {
+    /// True when the report carries no idle bytes.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.idle_bytes == 0
+    }
+}
+
+/// Turns a DAMON idle sample into a balloon free-page hint.
+///
+/// Fails closed (returns `None`): a disabled DAMON policy, a zero idle
+/// sample, or a zero total each mean there is nothing safe to report.
+/// The hint truncates to the idle bytes (never inflates beyond what DAMON
+/// observed) so an oversized sample cannot push the balloon past the guest.
+#[must_use]
+pub fn free_hint_from_damon(report: &DamonIdleReport, policy: &DamonPolicy) -> Option<u64> {
+    if !policy.enabled {
+        return None;
+    }
+    if report.idle_bytes == 0 || report.total_bytes == 0 {
+        return None;
+    }
+    // Clamp idle to total: a corrupt sample claiming more idle than scanned
+    // fails closed to the scanned total instead of an unbounded hint.
+    Some(report.idle_bytes.min(report.total_bytes))
+}
+
+/// Computes a balloon target from a DAMON idle sample.
+///
+/// Composes [`free_hint_from_damon`] with [`balloon_target`]: both the
+/// DAMON policy and the balloon policy must be enabled, and the sandbox
+/// limit plus the idle sample must be non-zero. Returns `None` when no
+/// reclaim applies (disabled, empty, or unvalidated fractions), never an
+/// error, so a P1 measurement row with no reclaim stays data.
+#[must_use]
+pub fn balloon_target_from_damon(
+    memory_limit_bytes: u64,
+    report: &DamonIdleReport,
+    damon_policy: &DamonPolicy,
+    balloon_policy: &BalloonPolicy,
+) -> Option<BalloonTarget> {
+    let hint = free_hint_from_damon(report, damon_policy)?;
+    balloon_target(memory_limit_bytes, hint, balloon_policy)
+}
+
+/// Parses DAMON `stat`-style idle bytes from text.
+///
+/// Accepts a single unsigned integer (bytes) with surrounding whitespace,
+/// which covers the sysfs `idle_bytes` leaf and the host-agent stats shim.
+/// Returns `None` on empty, malformed, or overflow input so callers skip
+/// the sample instead of reporting a fabricated hint.
+#[must_use]
+pub fn parse_damon_idle_bytes(contents: &str) -> Option<u64> {
+    contents.trim().parse::<u64>().ok()
+}
+
+/// Reads a DAMON idle-byte leaf without side effects.
+///
+/// Returns `None` when the kernel lacks DAMON sysfs, the leaf is absent,
+/// or the contents do not parse: all three mean "no idle source", never a
+/// control failure. Callers feed the bytes into [`DamonIdleReport`].
+#[must_use]
+pub fn read_damon_idle_bytes(path: &std::path::Path) -> Option<u64> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    parse_damon_idle_bytes(&contents)
 }
 
 #[cfg(test)]
@@ -1053,5 +1397,207 @@ mod tests {
             reason: "fail".into(),
         };
         assert!(!is_sched_permission_denied(&setup));
+    }
+
+    #[test]
+    fn core_sched_policy_defaults_disabled() {
+        let policy = CoreSchedPolicy::default();
+        assert!(!policy.enabled);
+        assert!(policy.is_noop());
+    }
+
+    #[test]
+    fn core_sched_tagging_rejects_pid_zero() {
+        for policy in [
+            CoreSchedPolicy { enabled: false },
+            CoreSchedPolicy { enabled: true },
+        ] {
+            for support in [
+                CoreSchedSupport::Supported,
+                CoreSchedSupport::Unsupported { reason: "test" },
+            ] {
+                assert!(
+                    apply_core_sched_tagging_to_pid(&policy, &support, 0).is_err(),
+                    "pid 0 must fail closed"
+                );
+            }
+        }
+        assert!(share_core_sched_cookie_to_pid(123, 0).is_err());
+    }
+
+    #[test]
+    fn core_sched_tagging_disabled_is_noop_without_syscall() {
+        // Disabled policy never touches prctl, even when the host supports
+        // it, so the default path stays SMT-exclusion-only.
+        let policy = CoreSchedPolicy { enabled: false };
+        let outcome =
+            apply_core_sched_tagging_to_pid(&policy, &CoreSchedSupport::Supported, process::id())
+                .unwrap();
+        assert_eq!(outcome, CoreSchedTagOutcome::SkippedDisabled);
+    }
+
+    #[test]
+    fn core_sched_tagging_unsupported_stays_smt_exclusion_only() {
+        let policy = CoreSchedPolicy { enabled: true };
+        let outcome = apply_core_sched_tagging_to_pid(
+            &policy,
+            &CoreSchedSupport::Unsupported {
+                reason: "non-linux platform",
+            },
+            process::id(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            CoreSchedTagOutcome::SkippedUnsupported {
+                reason: "non-linux platform"
+            }
+        );
+    }
+
+    #[test]
+    fn core_sched_cookie_create_fails_closed_off_linux() {
+        // On Linux this either tags or returns a typed denial/misconfig;
+        // on non-Linux it must fail closed as BadRequest, never panic.
+        match create_core_sched_cookie() {
+            Ok(_cookie) => {
+                #[cfg(not(target_os = "linux"))]
+                panic!("non-Linux must not create a cookie");
+            }
+            Err(e) => {
+                #[cfg(not(target_os = "linux"))]
+                assert!(matches!(e, SandboxError::BadRequest(_)));
+                #[cfg(target_os = "linux")]
+                assert!(
+                    matches!(
+                        e,
+                        SandboxError::Io(_) | SandboxError::CgroupSetupFailed { .. }
+                    ),
+                    "Linux failure must stay typed, got {e:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn damon_policy_defaults_disabled_and_validates() {
+        let policy = DamonPolicy::default();
+        assert!(!policy.enabled);
+        assert!(policy.is_noop());
+        policy.validate().unwrap();
+
+        let bad_interval = DamonPolicy {
+            enabled: true,
+            sample_interval_ms: 0,
+            ..DamonPolicy::default()
+        };
+        assert!(bad_interval.validate().is_err());
+
+        let oversized = DamonPolicy {
+            enabled: true,
+            sample_interval_ms: MAX_DAMON_SAMPLE_INTERVAL_MS + 1,
+            ..DamonPolicy::default()
+        };
+        assert!(oversized.validate().is_err());
+
+        let bad_age = DamonPolicy {
+            enabled: true,
+            min_idle_age_ms: MAX_DAMON_IDLE_AGE_MS + 1,
+            ..DamonPolicy::default()
+        };
+        assert!(bad_age.validate().is_err());
+    }
+
+    #[test]
+    fn damon_free_hint_fails_closed() {
+        let enabled = DamonPolicy {
+            enabled: true,
+            ..DamonPolicy::default()
+        };
+        let disabled = DamonPolicy::default();
+
+        let report = DamonIdleReport {
+            idle_bytes: 128 * 1024 * 1024,
+            total_bytes: 512 * 1024 * 1024,
+            sample_age_ms: 30_000,
+        };
+        assert_eq!(
+            free_hint_from_damon(&report, &enabled),
+            Some(128 * 1024 * 1024)
+        );
+        assert_eq!(free_hint_from_damon(&report, &disabled), None);
+
+        // Zero idle or zero total yields no hint.
+        let empty = DamonIdleReport {
+            idle_bytes: 0,
+            total_bytes: 512,
+            sample_age_ms: 0,
+        };
+        assert_eq!(free_hint_from_damon(&empty, &enabled), None);
+        let no_scan = DamonIdleReport {
+            idle_bytes: 128,
+            total_bytes: 0,
+            sample_age_ms: 0,
+        };
+        assert_eq!(free_hint_from_damon(&no_scan, &enabled), None);
+
+        // Corrupt sample claiming more idle than scanned clamps to total.
+        let corrupt = DamonIdleReport {
+            idle_bytes: 1024,
+            total_bytes: 512,
+            sample_age_ms: 0,
+        };
+        assert_eq!(free_hint_from_damon(&corrupt, &enabled), Some(512));
+    }
+
+    #[test]
+    fn damon_balloon_target_requires_both_gates() {
+        let damon_on = DamonPolicy {
+            enabled: true,
+            ..DamonPolicy::default()
+        };
+        let balloon_on = BalloonPolicy {
+            enabled: true,
+            reclaim_fraction: 0.5,
+        };
+        let report = DamonIdleReport {
+            idle_bytes: 256 * 1024 * 1024,
+            total_bytes: 512 * 1024 * 1024,
+            sample_age_ms: 30_000,
+        };
+        let limit = 512 * 1024 * 1024u64;
+
+        let target = balloon_target_from_damon(limit, &report, &damon_on, &balloon_on).unwrap();
+        assert_eq!(target.inflate_bytes, 128 * 1024 * 1024);
+
+        // Either gate off yields no target.
+        assert_eq!(
+            balloon_target_from_damon(limit, &report, &DamonPolicy::default(), &balloon_on),
+            None
+        );
+        assert_eq!(
+            balloon_target_from_damon(limit, &report, &damon_on, &BalloonPolicy::default()),
+            None
+        );
+        // Zero limit yields no target even when both gates are on.
+        assert_eq!(
+            balloon_target_from_damon(0, &report, &damon_on, &balloon_on),
+            None
+        );
+    }
+
+    #[test]
+    fn damon_idle_parse_accepts_bytes_and_rejects_garbage() {
+        assert_eq!(parse_damon_idle_bytes(" 134217728\n"), Some(134217728));
+        assert_eq!(parse_damon_idle_bytes("0"), Some(0));
+        assert_eq!(parse_damon_idle_bytes(""), None);
+        assert_eq!(parse_damon_idle_bytes("idle"), None);
+        assert_eq!(parse_damon_idle_bytes("-1"), None);
+    }
+
+    #[test]
+    fn damon_read_missing_leaf_is_none() {
+        let missing = std::path::Path::new("/tmp/pico-damon-missing-idle-bytes-for-test");
+        assert_eq!(read_damon_idle_bytes(missing), None);
     }
 }

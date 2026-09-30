@@ -24,7 +24,10 @@ use pico_core::runtime::{
     DiagnosticBundle, ForkResult, GuestTransport, PreparedSandbox, ResourceReceipt, RuntimeBackend,
 };
 use pico_core::{ExecRequest, ExecResponse, SandboxConfig, SandboxError, SandboxState};
-use pico_core::{apply_service_class_sched_policy, is_sched_permission_denied};
+use pico_core::{
+    apply_core_sched_tagging_to_pid, apply_service_class_sched_policy, is_sched_permission_denied,
+    probe_core_scheduling,
+};
 
 use crate::base::VmBackendBase;
 
@@ -347,6 +350,54 @@ impl RuntimeBackend for FirecrackerAdapter {
                         return Err(SandboxError::Other(format!(
                             "sched policy failed for Firecracker VMM pid {pid}: {err}"
                         )));
+                    }
+                }
+            }
+            // Core-sched cookie tagging for BE VMM pids (gated default-off).
+            // Runs after SCHED_IDLE so the S-NOISY comparison is
+            // cookie-tagged vs SMT-exclusion-only. Disabled policy or an
+            // Unsupported probe stays on SMT-exclusion-only without a
+            // syscall; permission-denied warns and continues, other
+            // failures fail boot closed.
+            {
+                let vm_proc = self.vm_process.lock().await;
+                if let Some(ref child) = *vm_proc
+                    && let Some(pid) = child.id()
+                    && sandbox_config.service_class.is_best_effort()
+                    && fc_cfg.core_sched_policy.enabled
+                {
+                    let support = probe_core_scheduling();
+                    match apply_core_sched_tagging_to_pid(
+                        &fc_cfg.core_sched_policy,
+                        &support,
+                        pid,
+                    ) {
+                        Ok(pico_core::CoreSchedTagOutcome::Tagged { cookie }) => {
+                            tracing::info!(
+                                sandbox_id = %sandbox_config.id,
+                                pid = pid,
+                                cookie = cookie,
+                                "core-sched cookie tagged Firecracker VMM"
+                            );
+                        }
+                        Ok(
+                            pico_core::CoreSchedTagOutcome::SkippedDisabled
+                            | pico_core::CoreSchedTagOutcome::SkippedUnsupported { .. },
+                        ) => {}
+                        Err(err) => {
+                            if is_sched_permission_denied(&err) {
+                                tracing::warn!(
+                                    sandbox_id = %sandbox_config.id,
+                                    pid = pid,
+                                    error = %err,
+                                    "core-sched tagging denied for VMM process; continuing SMT-exclusion-only"
+                                );
+                            } else {
+                                return Err(SandboxError::Other(format!(
+                                    "core-sched tagging failed for Firecracker VMM pid {pid}: {err}"
+                                )));
+                            }
+                        }
                     }
                 }
             }

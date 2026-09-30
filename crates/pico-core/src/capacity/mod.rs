@@ -501,6 +501,7 @@ pub fn advertised_cell_limit(
         allocated_vcpus: 0,
         allocated_memory_mb: 0,
         current_sandboxes: 0,
+        be_pool: None,
         ..*capacity
     };
     let limit = empty.remaining_fit_count(shape.vcpus, shape.memory_mb);
