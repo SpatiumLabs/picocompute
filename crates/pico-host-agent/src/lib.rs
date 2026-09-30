@@ -957,6 +957,7 @@ impl HostAgent {
                 max_pids: Some(DEFAULT_MAX_PIDS),
                 network_isolated: true,
                 ssh_port: Some(ssh_host_port),
+                service_class: spec.service_class.unwrap_or_default(),
                 ..Default::default()
             };
             let runtime = spec.runtime.unwrap_or(self.default_runtime);

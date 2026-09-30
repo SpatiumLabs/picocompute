@@ -1299,6 +1299,100 @@ fn strict_be_admit_leaves_overcommit_bit_clear() {
 }
 
 #[test]
+fn placement_audit_carries_service_class_and_bit() {
+    use std::sync::Arc;
+
+    use crate::event_bus::{AuditEventSink, InMemoryAuditSink};
+    use crate::identity::{AuditEventDetails, AuditEventKind};
+    // BE admit beyond strict carries the bit in audit.
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let hlc = Arc::new(crate::identity::Hlc::new());
+    let sink_trait: Arc<dyn AuditEventSink> = Arc::clone(&sink) as Arc<dyn AuditEventSink>;
+    let scheduler = CellScheduler::new()
+        .with_overcommit_policy(enabled_policy())
+        .with_audit_sink(sink_trait, Arc::clone(&hlc));
+    // Fill the host so only overcommit budget fits: BE beyond strict.
+    let mut host = make_single_slot_host("hst_audit");
+    host.capacity.allocated_vcpus = host.capacity.total_vcpus;
+    host.capacity.allocated_memory_mb = host.capacity.total_memory_mb;
+    // With 2x overcommit the effective totals still fit one BE shape.
+    let response = scheduler
+        .schedule(&be_request(), &[host])
+        .expect("BE beyond strict must place under enabled policy");
+    assert!(response.overcommit_applied);
+
+    let outcomes = sink.events_by_kind(AuditEventKind::PlacementOutcome);
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0].details {
+        Some(AuditEventDetails::PlacementOutcome {
+            service_class,
+            overcommit_applied,
+            ..
+        }) => {
+            assert_eq!(*service_class, ServiceClass::BestEffort);
+            assert!(*overcommit_applied);
+        }
+        d => panic!("expected placement outcome, got {d:?}"),
+    }
+
+    // LS admit in the same setup carries LS with no bit.
+    let sink2 = Arc::new(InMemoryAuditSink::new());
+    let sink2_trait: Arc<dyn AuditEventSink> = Arc::clone(&sink2) as Arc<dyn AuditEventSink>;
+    let scheduler2 = CellScheduler::new()
+        .with_overcommit_policy(enabled_policy())
+        .with_audit_sink(sink2_trait, Arc::clone(&hlc));
+    let hosts = vec![make_single_slot_host("hst_audit_ls")];
+    let ls_resp = scheduler2
+        .schedule(&make_request(), &hosts)
+        .expect("LS must place within strict");
+    assert!(!ls_resp.overcommit_applied);
+    let outcomes = sink2.events_by_kind(AuditEventKind::PlacementOutcome);
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0].details {
+        Some(AuditEventDetails::PlacementOutcome {
+            service_class,
+            overcommit_applied,
+            ..
+        }) => {
+            assert_eq!(*service_class, ServiceClass::LatencySensitive);
+            assert!(!overcommit_applied);
+        }
+        d => panic!("expected placement outcome, got {d:?}"),
+    }
+}
+
+#[test]
+fn placement_rejection_audit_never_carries_bit() {
+    use std::sync::Arc;
+
+    use crate::event_bus::{AuditEventSink, InMemoryAuditSink};
+    use crate::identity::{AuditEventDetails, AuditEventKind};
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let hlc = Arc::new(crate::identity::Hlc::new());
+    let sink_trait: Arc<dyn AuditEventSink> = Arc::clone(&sink) as Arc<dyn AuditEventSink>;
+    let scheduler = CellScheduler::new()
+        .with_overcommit_policy(enabled_policy())
+        .with_audit_sink(sink_trait, Arc::clone(&hlc));
+    let host = make_full_host("hst_full");
+    let mut be = be_request();
+    be.vcpus = 200;
+    let _ = scheduler.schedule(&be, &[host]);
+    let outcomes = sink.events_by_kind(AuditEventKind::PlacementOutcome);
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0].details {
+        Some(AuditEventDetails::PlacementOutcome {
+            overcommit_applied,
+            service_class,
+            ..
+        }) => {
+            assert!(!overcommit_applied);
+            assert_eq!(*service_class, ServiceClass::BestEffort);
+        }
+        d => panic!("expected placement outcome, got {d:?}"),
+    }
+}
+
+#[test]
 fn be_rejection_names_overcommit_budget_while_staying_typed() {
     // The message names the exhausted budget for operators, while the
     // `capacity` keyword keeps the insufficient-capacity classification.

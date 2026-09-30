@@ -275,6 +275,7 @@ fn spec(id: &str) -> SandboxSpec {
         image_id: None,
         image_digest: None,
         credential_request: None,
+        service_class: None,
     }
 }
 

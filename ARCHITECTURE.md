@@ -1870,6 +1870,15 @@ against a gated overcommit policy (disabled by default; LS always
 strict) and the host applies as cgroup weight/throttle plus scheduler
 policy. Spike evaluation, P0-model deltas, and the P1 gating plan live
 in [overcommit-spike](docs/capacity/overcommit-spike-cap-168.md).
+The last-mile wiring connects the step-1 seams into production paths (gated,
+default-off): `CreateOrchestrator` and `PlacementGate` resolve the
+class from `TenantRegistry` via `resolve_service_class`, the class
+travels `SandboxSpec` to `SandboxConfig` over the sandboxd
+`SandboxConfig.service_class` proto field, VMM spawn applies
+`SCHED_IDLE` for BE (LS stays `SCHED_OTHER` with no syscall), and
+placement audit plus `pico-scheduling-capacity` carry
+`service_class`/`overcommit_applied`. The host-guest protocol is
+untouched.
 
 ### 14.4 Rollout checklist
 

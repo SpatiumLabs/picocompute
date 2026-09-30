@@ -821,6 +821,7 @@ mod tests {
                     network_isolated: true,
                     ssh_port: None,
                     cpu_set: Vec::new(),
+                    service_class: v1::ServiceClass::LatencySensitive as i32,
                 }),
                 runtime_type: v1::RuntimeType::Firecracker as i32,
                 host: Some(HostResourceSpec {

@@ -271,6 +271,7 @@ async fn qemu_unix_guest_boots_without_tcp_transport_flag() {
                 network_isolated: true,
                 ssh_port: None,
                 cpu_set: Vec::new(),
+                service_class: 1,
             }),
             runtime_type: ProtoRuntime::Qemu as i32,
             host: None,

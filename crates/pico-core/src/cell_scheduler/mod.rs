@@ -990,6 +990,7 @@ impl CellScheduler {
                     eligible: 0,
                 },
                 false,
+                false,
                 context,
             );
             return Err(CellSchedulerError::NoHostsAvailable);
@@ -1065,6 +1066,7 @@ impl CellScheduler {
                 outcome.backpressure.total_candidates,
                 outcome.selection,
                 overlay_adjusted,
+                false,
                 context,
             );
             return Err(err);
@@ -1083,6 +1085,7 @@ impl CellScheduler {
                 outcome.backpressure.total_candidates,
                 outcome.selection,
                 overlay_adjusted,
+                false,
                 context,
             );
             return Err(err);
@@ -1104,6 +1107,7 @@ impl CellScheduler {
                 outcome.backpressure.total_candidates,
                 outcome.selection,
                 overlay_adjusted,
+                false,
                 context,
             );
             return Err(err);
@@ -1187,6 +1191,7 @@ impl CellScheduler {
         };
 
         response.metrics.record();
+        crate::metrics::record_placement_class(response.service_class, response.overcommit_applied);
         tracing::info!(
             host_id = ?response.host_id,
             reason = ?reason,
@@ -1206,6 +1211,7 @@ impl CellScheduler {
             backpressure_cached.eligible_candidates,
             selection,
             overlay_adjusted,
+            response.overcommit_applied,
             context,
         );
 
@@ -1215,7 +1221,9 @@ impl CellScheduler {
     /// Emits the placement outcome audit event when a sink is attached.
     ///
     /// Carries the winner policy and overlay state so sampled placements
-    /// stay reconstructible from audit alone.
+    /// stay reconstructible from audit alone. The service class echoes the
+    /// request; `overcommit_applied` is true only on the success path when
+    /// the admit consumed overcommit budget (rejections never carry it).
     #[expect(
         clippy::too_many_arguments,
         reason = "private audit-emission sink; every argument maps to one audit field and bundling would hide the event contract"
@@ -1229,6 +1237,7 @@ impl CellScheduler {
         candidates_evaluated: usize,
         selection: SelectionDetail,
         overlay_adjusted: bool,
+        overcommit_applied: bool,
         context: Option<&crate::scheduler::ScheduleTraceContext>,
     ) {
         if let Some(ref sink) = self.audit_sink {
@@ -1247,6 +1256,8 @@ impl CellScheduler {
                     sample_size: selection.sample_size,
                     eligible: selection.eligible,
                     overlay_adjusted,
+                    service_class: request.service_class,
+                    overcommit_applied,
                     trace_id: context.and_then(|c| c.trace_id.clone()),
                     operation_id: context.and_then(|c| c.operation_id.clone()),
                     idempotency_key: context.and_then(|c| c.idempotency_key.clone()),

@@ -1146,7 +1146,10 @@ impl RegionalScheduler {
     /// Emits the placement outcome audit event when a sink is attached.
     ///
     /// Carries the winner policy and overlay state so sampled placements
-    /// stay reconstructible from audit alone.
+    /// stay reconstructible from audit alone. Regional placement stays
+    /// class-agnostic (overcommit is host-level per the CAP-168 track), so
+    /// regional events always carry LS with no overcommit bit; the cell
+    /// event carries the request class and bit.
     #[expect(
         clippy::too_many_arguments,
         reason = "private audit-emission sink; every argument maps to one audit field and bundling would hide the event contract"
@@ -1178,6 +1181,8 @@ impl RegionalScheduler {
                     sample_size: selection.sample_size,
                     eligible: selection.eligible,
                     overlay_adjusted,
+                    service_class: crate::overcommit::ServiceClass::LatencySensitive,
+                    overcommit_applied: false,
                     trace_id: context.and_then(|c| c.trace_id.clone()),
                     operation_id: context.and_then(|c| c.operation_id.clone()),
                     idempotency_key: context.and_then(|c| c.idempotency_key.clone()),

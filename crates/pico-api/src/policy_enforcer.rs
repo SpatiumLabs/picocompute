@@ -240,13 +240,14 @@ impl SandboxService for PolicyEnforcingAgent {
                 .clone()
                 .or_else(|| spec.image_digest.clone())
                 .unwrap_or_else(|| "default-image".into());
-            match gate.admit(
+            match gate.admit_with_service_class(
                 &sandbox_id,
                 &self.tenant_id,
                 vcpus,
                 memory_mb,
                 spec.runtime,
                 &image,
+                spec.service_class,
             ) {
                 Ok(decision) => {
                     tracing::info!(
@@ -254,6 +255,7 @@ impl SandboxService for PolicyEnforcingAgent {
                         host_id = %decision.host_id.as_str(),
                         regional_reason = %decision.regional_reason,
                         cell_reason = %decision.cell_reason,
+                        service_class = ?decision.service_class,
                         "create placement admitted"
                     );
                     // Pin the resolved backend explicitly so the downstream
@@ -262,6 +264,11 @@ impl SandboxService for PolicyEnforcingAgent {
                     if spec.runtime.is_none() {
                         spec.runtime = Some(gate.default_runtime());
                     }
+                    // Thread the resolved class to the host so sandboxd
+                    // applies the matching cgroup/sched controls. `None`
+                    // (no registry) resolves LS, preserving the pre-class
+                    // path.
+                    spec.service_class = Some(decision.service_class);
                 }
                 Err(err) => {
                     tracing::warn!(reason = %err, "create placement rejected");
@@ -661,6 +668,7 @@ mod tests {
             image_id: None,
             image_digest: None,
             credential_request: None,
+            service_class: None,
         };
 
         let result = agent.create(spec).await;
@@ -732,6 +740,7 @@ forbid(
             image_id: None,
             image_digest: None,
             credential_request: None,
+            service_class: None,
         };
 
         let result = agent.create(spec).await;
@@ -775,6 +784,7 @@ forbid(
             image_id: None,
             image_digest: None,
             credential_request: None,
+            service_class: None,
         };
 
         let result = agent.create(spec).await;
@@ -822,6 +832,7 @@ forbid(
                 credential_types: vec!["aws".into()],
                 lease: None,
             }),
+            service_class: None,
         };
 
         let result = agent.create(spec).await;
@@ -845,6 +856,7 @@ forbid(
             image_id: None,
             image_digest: None,
             credential_request: None,
+            service_class: None,
         }
     }
 

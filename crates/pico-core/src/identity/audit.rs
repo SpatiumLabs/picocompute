@@ -156,7 +156,10 @@ pub enum AuditEventKind {
 ///     outcome, reason, policy_decision_id, lease_id).
 /// v3: added SnapshotMetadataAccess kind and details for snapshot
 /// metadata read and list operations.
-pub const AUDIT_SCHEMA_VERSION: u32 = 3;
+/// v4: added service_class and overcommit_applied to PlacementOutcome
+/// details for the LS/BE overcommit track. Both default
+/// (LS, false) so events written before the wiring still parse.
+pub const AUDIT_SCHEMA_VERSION: u32 = 4;
 
 /// Typed event-specific payload for audit events.
 ///
@@ -201,6 +204,16 @@ pub enum AuditEventDetails {
         /// Whether any candidate capacity was adjusted by the in-flight overlay.
         #[serde(default)]
         overlay_adjusted: bool,
+        /// Scheduling service class of the admitted request.
+        ///
+        /// Serde-defaults to LS so placement events written before the
+        /// pre-wiring events still parse as strict admits.
+        #[serde(default)]
+        service_class: crate::overcommit::ServiceClass,
+        /// True when a best-effort request was admitted beyond strict
+        /// no-overcommit capacity via the overcommit gate.
+        #[serde(default)]
+        overcommit_applied: bool,
     },
     /// Runtime operation outcome details.
     RuntimeOutcome {

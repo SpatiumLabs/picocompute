@@ -374,6 +374,13 @@ impl RuntimeBackend for GVisorAdapter {
                 }
             })?;
 
+            // Note: the sentry pid is owned by runsc (short-lived
+            // CLI invocations here, no persistent child pid in this
+            // adapter), so SCHED_IDLE cannot be applied at spawn like the
+            // Firecracker/QEMU VMM pids. Best-effort gVisor sandboxes still
+            // get deprioritized cgroup controls via sandboxd
+            // `apply_class_controls`; sentry sched-policy discovery stays
+            // follow-up work pending a pid source.
             self.runsc_run_quiet(
                 &sandbox_id,
                 "create",

@@ -367,6 +367,51 @@ impl ServiceClassControls {
     }
 }
 
+/// Maps a service class to its Linux scheduling policy.
+///
+/// Latency-sensitive keeps `SCHED_OTHER`; best-effort runs `SCHED_IDLE`.
+/// This is the policy half of [`controls_for_class`]; the cgroup
+/// weight/throttle half applies via
+/// [`crate::cgroups::CgroupManager::apply_class_controls`].
+#[must_use]
+pub fn sched_policy_for_class(class: ServiceClass) -> SchedPolicy {
+    controls_for_class(class).sched_policy
+}
+
+/// Applies the service-class scheduling policy to one process.
+///
+/// Latency-sensitive is a no-op without a syscall: the production default
+/// is already `SCHED_OTHER`, so the LS path stays byte-identical with the
+/// pre-class behavior. Best-effort applies `SCHED_IDLE` via
+/// [`apply_sched_policy_to_pid`], which rejects pid 0 and surfaces
+/// permission-denied as a typed `Io` error so callers can tell a
+/// restricted environment (missing `CAP_SYS_NICE`, warn and continue)
+/// from a real control failure (fail closed).
+pub fn apply_service_class_sched_policy(class: ServiceClass, pid: u32) -> Result<()> {
+    if !class.is_best_effort() {
+        if pid == 0 {
+            return Err(SandboxError::BadRequest(
+                "sched policy requires an explicit pid".into(),
+            ));
+        }
+        return Ok(());
+    }
+    apply_sched_policy_to_pid(sched_policy_for_class(class), pid)
+}
+
+/// True when a sched-policy error is a restricted-environment denial.
+///
+/// Callers (VMM/sentry spawn) warn and continue on this path but fail
+/// closed on any other control error, so a real misconfiguration never
+/// demotes silently to a weaker policy.
+#[must_use]
+pub fn is_sched_permission_denied(err: &SandboxError) -> bool {
+    matches!(
+        err,
+        SandboxError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
+
 /// Applies a Linux scheduling policy to one process.
 ///
 /// Priority is always zero: only real-time policies take a priority, and
@@ -960,5 +1005,53 @@ mod tests {
             };
             assert!(policy.validate().is_err(), "fraction {fraction} must fail");
         }
+    }
+
+    #[test]
+    fn sched_policy_for_class_maps_ls_to_other_and_be_to_idle() {
+        assert_eq!(
+            sched_policy_for_class(ServiceClass::LatencySensitive),
+            SchedPolicy::Other
+        );
+        assert_eq!(
+            sched_policy_for_class(ServiceClass::BestEffort),
+            SchedPolicy::Idle
+        );
+    }
+
+    #[test]
+    fn service_class_sched_policy_rejects_pid_zero_for_both_classes() {
+        // Pid 0 carries process-group semantics; both classes fail closed.
+        for class in [ServiceClass::LatencySensitive, ServiceClass::BestEffort] {
+            assert!(
+                apply_service_class_sched_policy(class, 0).is_err(),
+                "class {class:?} must reject pid 0"
+            );
+        }
+    }
+
+    #[test]
+    fn service_class_sched_policy_ls_is_noop_without_syscall() {
+        // LS never touches sched_setscheduler (already SCHED_OTHER), so it
+        // succeeds even where the syscall would be denied; BE goes through
+        // the real path (success or typed permission-denied on restricted
+        // hosts).
+        let pid = process::id();
+        assert!(pid != 0);
+        apply_service_class_sched_policy(ServiceClass::LatencySensitive, pid)
+            .expect("LS must be a validated no-op");
+    }
+
+    #[test]
+    fn sched_permission_denied_distinguishes_restricted_env() {
+        let denied = SandboxError::Io(std::io::Error::new(ErrorKind::PermissionDenied, "denied"));
+        assert!(is_sched_permission_denied(&denied));
+        let other = SandboxError::BadRequest("bad".into());
+        assert!(!is_sched_permission_denied(&other));
+        let setup = SandboxError::CgroupSetupFailed {
+            controller: "sched".into(),
+            reason: "fail".into(),
+        };
+        assert!(!is_sched_permission_denied(&setup));
     }
 }

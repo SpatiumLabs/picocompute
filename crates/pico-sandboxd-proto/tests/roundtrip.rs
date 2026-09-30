@@ -3,8 +3,8 @@
 use pico_sandboxd_proto::status::SupervisorErrorClass;
 use pico_sandboxd_proto::v1::{
     CommandMeta, ForkRequest, HostShape, NonReadyReason, OperationKind, Outcome, OutcomeReason,
-    OutcomeStatus, PortTarget, ResourceReceipt, RestoreRequest, RuntimeType, SandboxObservation,
-    SandboxState, port_target,
+    OutcomeStatus, PortTarget, ResourceReceipt, RestoreRequest, RuntimeType, SandboxConfig,
+    SandboxObservation, SandboxState, ServiceClass, port_target,
 };
 use prost::Message;
 use tonic::Code;
@@ -212,4 +212,67 @@ fn host_shape_disk_mb_round_trips_once() {
     let bytes = fork.encode_to_vec();
     let decoded = ForkRequest::decode(bytes.as_slice()).unwrap();
     assert_eq!(decoded.host.unwrap().disk_mb, 10240);
+}
+
+fn sample_sandbox_config() -> SandboxConfig {
+    SandboxConfig {
+        id: "sbx_class".into(),
+        memory_limit_bytes: 512 * 1024 * 1024,
+        cpu_shares: 100,
+        memory_soft_limit_bytes: None,
+        max_pids: None,
+        network_isolated: true,
+        ssh_port: None,
+        cpu_set: Vec::new(),
+        service_class: ServiceClass::LatencySensitive as i32,
+    }
+}
+
+#[test]
+fn sandbox_config_service_class_round_trips() {
+    // Misuse-resistance for the new class field: both named classes survive
+    // the wire, and absent/UNSPECIFIED decodes as 0 (strict default).
+    for class in [
+        ServiceClass::LatencySensitive,
+        ServiceClass::BestEffort,
+        ServiceClass::Unspecified,
+    ] {
+        let mut original = sample_sandbox_config();
+        original.service_class = class as i32;
+        let bytes = original.encode_to_vec();
+        let decoded = SandboxConfig::decode(bytes.as_slice()).expect("decode SandboxConfig");
+        assert_eq!(decoded.service_class, class as i32);
+        assert_eq!(decoded.id, "sbx_class");
+    }
+}
+
+#[test]
+fn sandbox_config_missing_service_class_decodes_unspecified() {
+    // Proto3 absent enum decodes as 0: older clients keep strict packing
+    // without a migration.
+    let original = SandboxConfig {
+        service_class: 0,
+        ..sample_sandbox_config()
+    };
+    let bytes = original.encode_to_vec();
+    let decoded = SandboxConfig::decode(bytes.as_slice()).unwrap();
+    assert_eq!(
+        ServiceClass::try_from(decoded.service_class).unwrap(),
+        ServiceClass::Unspecified
+    );
+}
+
+#[test]
+fn sandbox_config_service_class_values_are_distinct() {
+    assert_ne!(
+        ServiceClass::LatencySensitive as i32,
+        ServiceClass::BestEffort as i32
+    );
+    assert_eq!(
+        ServiceClass::try_from(ServiceClass::BestEffort as i32).unwrap(),
+        ServiceClass::BestEffort
+    );
+    // Unknown wire values are preserved by prost for the convert layer to
+    // reject (fail closed, never silently mapped).
+    assert!(ServiceClass::try_from(999).is_err());
 }

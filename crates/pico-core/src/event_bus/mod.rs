@@ -31,6 +31,7 @@ use crate::identity::{
     TenantId,
 };
 use crate::metadata::FailureInfo;
+use crate::overcommit::ServiceClass;
 use crate::types::now_iso;
 
 /// Errors that can occur when emitting audit events.
@@ -79,6 +80,10 @@ pub struct PlacementOutcomeParams {
     pub eligible: usize,
     /// Whether any candidate capacity was adjusted by the in-flight overlay.
     pub overlay_adjusted: bool,
+    /// Scheduling service class of the admitted request (LS default).
+    pub service_class: ServiceClass,
+    /// True when a best-effort admit consumed overcommit budget.
+    pub overcommit_applied: bool,
     /// Request trace for create-path correlation. `None` for standalone
     /// scheduler calls that are not on the API create path.
     pub trace_id: Option<String>,
@@ -126,6 +131,8 @@ pub fn emit_placement_outcome(
                 sample_size: params.sample_size,
                 eligible: params.eligible,
                 overlay_adjusted: params.overlay_adjusted,
+                service_class: params.service_class,
+                overcommit_applied: params.overcommit_applied,
             })
             .build(),
     );
@@ -511,6 +518,8 @@ mod tests {
                 sample_size: 3,
                 eligible: 3,
                 overlay_adjusted: false,
+                service_class: crate::overcommit::ServiceClass::LatencySensitive,
+                overcommit_applied: false,
             })
             .build();
 

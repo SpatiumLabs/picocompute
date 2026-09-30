@@ -101,6 +101,19 @@ enum RuntimeType {
   RUNTIME_TYPE_REMOTE_FIRECRACKER = 4;
 }
 
+// Scheduling service class for host-control treatment.
+//
+// UNSPECIFIED means a client that predates class delivery: sandboxd maps
+// it to latency-sensitive (strict no-overcommit) so old clients keep
+// strict packing. New clients send LATENCY_SENSITIVE or BEST_EFFORT
+// explicitly. Unknown enum values on the wire fail closed as
+// InvalidArgument, never silently mapped.
+enum ServiceClass {
+  SERVICE_CLASS_UNSPECIFIED = 0;
+  SERVICE_CLASS_LATENCY_SENSITIVE = 1;
+  SERVICE_CLASS_BEST_EFFORT = 2;
+}
+
 // Terminal or active result of a supervised operation.
 message Outcome {
   string operation_id = 1;
@@ -140,6 +153,11 @@ message SandboxConfig {
   bool network_isolated = 6;
   optional uint32 ssh_port = 7;
   repeated uint32 cpu_set = 8;
+  // Scheduling service class for host-control treatment. Absent (or
+  // UNSPECIFIED from older clients) means latency-sensitive: strict
+  // packing with production cgroup defaults. Best-effort gets
+  // deprioritized cgroup controls plus SCHED_IDLE at VMM spawn.
+  ServiceClass service_class = 9;
 }
 
 // Host-side resource inputs coordinated by sandboxd at prepare.

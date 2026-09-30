@@ -24,6 +24,7 @@ use pico_core::runtime::{
     DiagnosticBundle, ForkResult, GuestTransport, PreparedSandbox, ResourceReceipt, RuntimeBackend,
 };
 use pico_core::{ExecRequest, ExecResponse, SandboxConfig, SandboxError, SandboxState};
+use pico_core::{apply_service_class_sched_policy, is_sched_permission_denied};
 
 use crate::base::VmBackendBase;
 
@@ -317,6 +318,21 @@ impl RuntimeBackend for FirecrackerAdapter {
                     error = %err,
                     "failed to apply CPU pinning to Firecracker VMM process"
                 );
+            }
+        }
+
+        // Apply the service-class scheduling policy to the VMM pid at
+        // spawn. LS is a no-op (already SCHED_OTHER); BE applies
+        // SCHED_IDLE. Permission-denied (restricted env without
+        // CAP_SYS_NICE) warns and continues; any other control failure
+        // fails boot closed so a BE sandbox never runs silently at the
+        // wrong priority.
+        {
+            let vm_proc = self.vm_process.lock().await;
+            if let Some(ref child) = *vm_proc
+                && let Some(pid) = child.id()
+            {
+                apply_vmm_sched_policy(&sandbox_config, pid).await?;
             }
         }
 
@@ -724,6 +740,39 @@ impl FirecrackerAdapter {
             sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+/// Applies the service-class scheduling policy to a VMM pid.
+///
+/// LS is a validated no-op (no syscall) so the production path stays
+/// unchanged. BE applies SCHED_IDLE; permission-denied warns (restricted
+/// env), any other control error fails closed via BackendError.
+async fn apply_vmm_sched_policy(sandbox_config: &SandboxConfig, pid: u32) -> BackendResult<()> {
+    if !sandbox_config.service_class.is_best_effort() {
+        return Ok(());
+    }
+    if let Err(err) = apply_service_class_sched_policy(sandbox_config.service_class, pid) {
+        if is_sched_permission_denied(&err) {
+            tracing::warn!(
+                sandbox_id = %sandbox_config.id,
+                pid = pid,
+                error = %err,
+                "sched policy denied for VMM process (restricted env without CAP_SYS_NICE); continuing at default priority"
+            );
+            return Ok(());
+        }
+        return Err(BackendError::Failed {
+            operation: BackendOperation::Boot,
+            message: format!("sched policy failed for VMM pid {pid}: {err}"),
+        });
+    }
+    tracing::info!(
+        sandbox_id = %sandbox_config.id,
+        pid = pid,
+        service_class = ?sandbox_config.service_class,
+        "applied service-class sched policy to VMM process"
+    );
+    Ok(())
 }
 
 fn enrich_with_firecracker_logs(

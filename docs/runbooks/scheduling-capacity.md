@@ -113,6 +113,15 @@ means the scheduler never assigned a host.
 `disabled_for_placement`, `insufficient_capacity`, `unsupported_runtime`,
 `pressure_saturated`.
 
+Placement `details` also carry `service_class` (`latency_sensitive` or
+`best_effort`) and `overcommit_applied` (true only when a best-effort
+admit consumed budget beyond strict capacity). The
+`pico-scheduling-capacity` panel "Best-Effort vs Overcommit Admits"
+graphs `pico_placement_be_admits_total` against
+`pico_placement_overcommit_admits_total` for S-RAMP-ACTIVE/S-NOISY
+evidence: LS warning-max must not move when BE ramps, and every BE
+admit beyond strict must carry the bit.
+
 ## Mitigation
 
 1. Cell full: stop new non-essential creates (admission shed, Control Plane
