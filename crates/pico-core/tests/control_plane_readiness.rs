@@ -1395,6 +1395,8 @@ fn regional_scheduler_places_on_healthy_cell_with_evidence() {
             sample_size,
             eligible,
             overlay_adjusted,
+            service_class,
+            overcommit_applied,
         }) => {
             assert!(cell_id.is_some());
             assert!(host_id.is_none(), "regional stage selects cells, not hosts");
@@ -1405,6 +1407,8 @@ fn regional_scheduler_places_on_healthy_cell_with_evidence() {
             assert_eq!(*sample_size, 3);
             assert_eq!(*eligible, 3);
             assert!(!overlay_adjusted);
+            assert_eq!(*service_class, pico_core::ServiceClass::LatencySensitive);
+            assert!(!overcommit_applied);
         }
         d => panic!("placement outcome details missing, got {d:?}"),
     }

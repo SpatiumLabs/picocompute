@@ -91,9 +91,33 @@ pub fn record_snapshot_eviction(tenant_id: Option<&str>, freed_bytes: u64) {
         .inc_by(freed_bytes, &labels);
 }
 
+/// Records the service-class outcome of one cell placement admit.
+///
+/// Best-effort admits increment `pico_placement_be_admits_total`; the
+/// subset that consumed overcommit budget beyond strict capacity also
+/// increments `pico_placement_overcommit_admits_total`. Latency-sensitive
+/// admits record nothing extra, so the LS path stays metric-identical
+/// with the pre-class behavior. Host-level aggregates carry no identity
+/// attribute.
+pub fn record_placement_class(
+    service_class: crate::overcommit::ServiceClass,
+    overcommit_applied: bool,
+) {
+    if !service_class.is_best_effort() {
+        return;
+    }
+    let labels = Labels::host();
+    CORE_METRICS.placement_be_admits.inc(&labels);
+    if overcommit_applied {
+        CORE_METRICS.placement_overcommit_admits.inc(&labels);
+    }
+}
+
 const PLACEMENT_LATENCY_SECONDS: &str = "pico_placement_latency_seconds";
 const PLACEMENT_HOSTS_EVALUATED: &str = "pico_placement_hosts_evaluated";
 const PLACEMENT_HOSTS_PASSED_CONSTRAINTS: &str = "pico_placement_hosts_passed_constraints";
+const PLACEMENT_BE_ADMITS_TOTAL: &str = "pico_placement_be_admits_total";
+const PLACEMENT_OVERCOMMIT_ADMITS_TOTAL: &str = "pico_placement_overcommit_admits_total";
 
 const GC_PASS_DURATION_SECONDS: &str = "pico_gc_pass_duration_seconds";
 const GC_ORPHANS_DETECTED: &str = "pico_gc_orphans_detected";
@@ -121,6 +145,10 @@ pub struct CoreMetrics {
     pub placement_latency: Histogram,
     pub hosts_evaluated: Histogram,
     pub hosts_passed: Histogram,
+    /// Best-effort admits (host-level, gated by OvercommitPolicy).
+    pub placement_be_admits: Counter,
+    /// Best-effort admits that consumed overcommit budget beyond strict.
+    pub placement_overcommit_admits: Counter,
     pub gc_pass_duration: Histogram,
     pub gc_orphans_detected: Counter,
     pub gc_resources_removed: Counter,
@@ -148,6 +176,8 @@ impl CoreMetrics {
             placement_latency: Histogram::register(PLACEMENT_LATENCY_SECONDS),
             hosts_evaluated: Histogram::register(PLACEMENT_HOSTS_EVALUATED),
             hosts_passed: Histogram::register(PLACEMENT_HOSTS_PASSED_CONSTRAINTS),
+            placement_be_admits: Counter::register(PLACEMENT_BE_ADMITS_TOTAL),
+            placement_overcommit_admits: Counter::register(PLACEMENT_OVERCOMMIT_ADMITS_TOTAL),
             gc_pass_duration: Histogram::register(GC_PASS_DURATION_SECONDS),
             gc_orphans_detected: Counter::register(GC_ORPHANS_DETECTED),
             gc_resources_removed: Counter::register(GC_RESOURCES_REMOVED),
@@ -284,6 +314,18 @@ mod tests {
         // Own key space: `tenantless-probe` is reserved for the bucket test.
         record_snapshot_eviction(None, 1024);
         record_snapshot_eviction(Some("tnt_evict"), 2048);
+    }
+
+    #[test]
+    fn record_placement_class_does_not_panic_and_skips_ls() {
+        use crate::overcommit::ServiceClass;
+        let _guard = RedactionGuard::set(false);
+        // LS records nothing extra (metric-identical with pre-class path).
+        record_placement_class(ServiceClass::LatencySensitive, false);
+        record_placement_class(ServiceClass::LatencySensitive, true);
+        // BE records be admits, with overcommit subset.
+        record_placement_class(ServiceClass::BestEffort, false);
+        record_placement_class(ServiceClass::BestEffort, true);
     }
 
     #[test]

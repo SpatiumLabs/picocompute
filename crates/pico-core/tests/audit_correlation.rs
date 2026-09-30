@@ -80,6 +80,8 @@ fn events_share_correlation_identifiers() {
                 sample_size: 3,
                 eligible: 3,
                 overlay_adjusted: false,
+                service_class: pico_core::ServiceClass::LatencySensitive,
+                overcommit_applied: false,
             })
             .build(),
     );
@@ -259,6 +261,8 @@ fn policy_decision_precedes_placement() {
                 sample_size: 4,
                 eligible: 4,
                 overlay_adjusted: false,
+                service_class: pico_core::ServiceClass::LatencySensitive,
+                overcommit_applied: false,
             })
             .build(),
     );
@@ -349,6 +353,8 @@ fn placement_outcome_precedes_lifecycle_scheduled() {
                 sample_size: 3,
                 eligible: 3,
                 overlay_adjusted: false,
+                service_class: pico_core::ServiceClass::LatencySensitive,
+                overcommit_applied: false,
             })
             .build(),
     );

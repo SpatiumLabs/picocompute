@@ -635,6 +635,7 @@ mod tests {
                 image_id: None,
                 image_digest: None,
                 credential_request: None,
+                service_class: None,
             })
             .await
             .unwrap();

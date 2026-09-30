@@ -121,6 +121,15 @@ pub struct SandboxSpec {
     pub image_digest: Option<String>,
     #[serde(default)]
     pub credential_request: Option<CredentialRequestSpec>,
+    /// Scheduling service class for this sandbox.
+    ///
+    /// `None` (the default) inherits the tenant default via
+    /// [`crate::overcommit::resolve_service_class`] at the API boundary.
+    /// Explicit `BestEffort` without tenant opt-in fails closed. The
+    /// orchestrator threads the resolved value into cell placement and
+    /// host controls unchanged.
+    #[serde(default)]
+    pub service_class: Option<ServiceClass>,
     // TODO: expose the following from the API once the policy engine
     // and quota system are ready to validate per-sandbox PID/IO/bandwidth
     // controls. The internal types (SandboxConfig, ResourceLimits) and cgroup

@@ -23,11 +23,12 @@ use crate::identity::{
 use crate::metadata::{
     PlacementInfo, ResourceLimits, SandboxMetadata, SandboxState, TransitionError,
 };
-use crate::overcommit::ServiceClass;
+use crate::overcommit::{ServiceClass, resolve_service_class};
 use crate::policy::{PolicyAction, PolicyEngine, PolicyOutcome};
 use crate::quota::QuotaEngine;
 use crate::runtime::RuntimeType;
 use crate::scheduler::{RegionalScheduler, ScheduleTraceContext, SchedulerError, SchedulerRequest};
+use crate::tenant::TenantRegistry;
 use crate::types::new_ulid;
 
 /// Returns true when an idempotency key matches the API contract.
@@ -78,11 +79,13 @@ pub struct CreateRequest {
     pub fencing_token: Option<FencingToken>,
     /// Scheduling service class for this sandbox.
     ///
-    /// `None` (the default) packs latency-sensitive: strict no-overcommit.
-    /// The API boundary resolves this from tenant policy via
-    /// [`crate::overcommit::resolve_service_class`] once the tenant
-    /// registry is wired into admission; the orchestrator threads the
-    /// resolved value into cell placement unchanged.
+    /// `None` (the default) inherits the tenant default via
+    /// [`crate::overcommit::resolve_service_class`] at the API boundary
+    /// (see [`CreateOrchestrator::with_tenant_registry`]); without a
+    /// registry `None` and explicit LS pack latency-sensitive (strict
+    /// no-overcommit) while explicit best-effort fails closed. The
+    /// orchestrator threads the resolved value into cell placement
+    /// unchanged.
     #[serde(default)]
     pub service_class: Option<ServiceClass>,
 }
@@ -102,6 +105,16 @@ pub struct CreateOutcome {
     pub cell_reason: String,
     /// True when this outcome is an idempotent replay without new side effects.
     pub replayed: bool,
+    /// Resolved scheduling service class for this sandbox.
+    ///
+    /// Serde-defaults to LS so outcomes written before the last-mile wiring
+    /// keep strict packing on replay.
+    #[serde(default)]
+    pub service_class: ServiceClass,
+    /// True when a best-effort request was admitted beyond strict
+    /// no-overcommit capacity via the overcommit gate.
+    #[serde(default)]
+    pub overcommit_applied: bool,
 }
 
 /// Typed create-path failures.
@@ -145,6 +158,10 @@ pub enum CreateError {
     /// Lifecycle commit failed.
     #[error("commit failed: {0}")]
     Transition(Box<TransitionError>),
+
+    /// Service-class resolution failed (best-effort without tenant opt-in).
+    #[error("invalid service class: {reason}")]
+    InvalidServiceClass { reason: String },
 }
 
 impl From<SchedulerError> for CreateError {
@@ -199,6 +216,9 @@ impl From<CreateError> for crate::error::SandboxError {
             CreateError::Transition(reason) => {
                 crate::error::SandboxError::InvalidStateTransition(reason.to_string())
             }
+            CreateError::InvalidServiceClass { reason } => {
+                crate::error::SandboxError::BadRequest(reason)
+            }
         }
     }
 }
@@ -222,6 +242,7 @@ struct CreateFingerprint {
     snapshot_id: Option<String>,
     preferred_region: Option<String>,
     avoid_failure_domains: Vec<String>,
+    service_class: Option<ServiceClass>,
 }
 
 impl CreateFingerprint {
@@ -242,6 +263,7 @@ impl CreateFingerprint {
                 .as_ref()
                 .map(|r| r.as_str().to_string()),
             avoid_failure_domains: avoid,
+            service_class: req.service_class,
         }
     }
 }
@@ -343,6 +365,7 @@ pub struct CreateOrchestrator {
     audit_sink: Arc<dyn AuditEventSink>,
     hlc: Arc<Hlc>,
     dedup: Arc<IdempotencyStore>,
+    tenant_registry: Option<Arc<TenantRegistry>>,
 }
 
 impl CreateOrchestrator {
@@ -360,6 +383,59 @@ impl CreateOrchestrator {
             audit_sink,
             hlc,
             dedup,
+            tenant_registry: None,
+        }
+    }
+
+    /// Wires the tenant registry for service-class resolution.
+    ///
+    /// When set, the orchestrator resolves `CreateRequest.service_class`
+    /// through [`resolve_service_class`] against the tenant default at the
+    /// API boundary. When unset, requests keep the LS default (strict
+    /// packing), preserving the pre-wiring path byte-identically.
+    /// The registry is gated default-off: `None` (the default) never
+    /// changes placement.
+    #[must_use]
+    pub fn with_tenant_registry(mut self, registry: Arc<TenantRegistry>) -> Self {
+        self.tenant_registry = Some(registry);
+        self
+    }
+
+    /// Resolves the effective service class for one create request.
+    ///
+    /// An explicit best-effort without a registered tenant opt-in fails
+    /// closed with [`CreateError::InvalidServiceClass`], including when
+    /// no registry is wired or the tenant is unknown: without proof of
+    /// opt-in there is nothing to authorize the weaker priority. `None`
+    /// and explicit LS resolve LS.
+    pub fn resolve_service_class_for_request(
+        &self,
+        req: &CreateRequest,
+    ) -> Result<ServiceClass, CreateError> {
+        let explicit = req.service_class;
+        let fail_closed = |reason: &str| CreateError::InvalidServiceClass {
+            reason: reason.into(),
+        };
+        match &self.tenant_registry {
+            Some(registry) => match registry.get(&req.tenant_id) {
+                Some(tenant) => resolve_service_class(explicit, &tenant).map_err(|err| {
+                    CreateError::InvalidServiceClass {
+                        reason: err.to_string(),
+                    }
+                }),
+                None => match explicit {
+                    Some(ServiceClass::BestEffort) => Err(fail_closed(
+                        "best-effort service class requires a registered tenant with best-effort opt-in",
+                    )),
+                    _ => Ok(ServiceClass::LatencySensitive),
+                },
+            },
+            None => match explicit {
+                Some(ServiceClass::BestEffort) => Err(fail_closed(
+                    "best-effort service class requires a registered tenant with best-effort opt-in",
+                )),
+                _ => Ok(ServiceClass::LatencySensitive),
+            },
         }
     }
 
@@ -535,6 +611,11 @@ impl CreateOrchestrator {
             return Err(CreateError::PolicyDenied { reason });
         }
 
+        // Resolve the class before quota and placement so a rejected
+        // explicit best-effort neither leaks a quota reservation nor
+        // records scheduler overlay load.
+        let service_class = self.resolve_service_class_for_request(req)?;
+
         let quota_decision = self
             .quota
             .check_create(&req.tenant_id, req.vcpus, req.memory_mb);
@@ -586,7 +667,7 @@ impl CreateOrchestrator {
             image: req.image.clone(),
             snapshot_id: req.snapshot_id.clone(),
             is_restore: false,
-            service_class: req.service_class.unwrap_or_default(),
+            service_class,
         };
         let cell_resp =
             match cell_scheduler.schedule_with_context(&cell_req, &hosts, Some(&context)) {
@@ -651,6 +732,8 @@ impl CreateOrchestrator {
             host_id = %host_id.as_str(),
             regional_reason = ?regional_resp.reason,
             cell_reason = ?cell_resp.reason,
+            service_class = ?cell_resp.service_class,
+            overcommit_applied = cell_resp.overcommit_applied,
             "create placed on two-stage path"
         );
 
@@ -661,6 +744,8 @@ impl CreateOrchestrator {
             regional_reason: format!("{:?}", regional_resp.reason),
             cell_reason: format!("{:?}", cell_resp.reason),
             replayed: false,
+            service_class: cell_resp.service_class,
+            overcommit_applied: cell_resp.overcommit_applied,
         })
     }
 
@@ -879,5 +964,156 @@ mod tests {
             sandbox_err,
             crate::error::SandboxError::Unprocessable(_)
         ));
+    }
+
+    fn orchestrator_for_class_tests() -> CreateOrchestrator {
+        use crate::event_bus::NoopAuditSink;
+        CreateOrchestrator::new(
+            Arc::new(crate::policy::PolicyEngine::new()),
+            Arc::new(crate::quota::QuotaEngine::new()),
+            Arc::new(NoopAuditSink),
+            Arc::new(crate::identity::Hlc::new()),
+            Arc::new(IdempotencyStore::new()),
+        )
+    }
+
+    fn tenant_with_class(id: &str, default: ServiceClass) -> crate::tenant::Tenant {
+        use crate::backend_selection::WorkloadClass;
+        crate::tenant::Tenant {
+            id: TenantId::from_string(id),
+            name: format!("{id}-tenant"),
+            status: crate::tenant::TenantStatus::Active,
+            allowed_runtimes: vec![RuntimeType::Firecracker],
+            allowed_workload_classes: vec![WorkloadClass::PublicUntrusted],
+            default_service_class: default,
+            policy_epoch: Some(1),
+        }
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_service_class() {
+        let a = test_request("fp-class");
+        let mut b = test_request("fp-class");
+        b.service_class = Some(ServiceClass::BestEffort);
+        assert_ne!(CreateFingerprint::of(&a), CreateFingerprint::of(&b));
+    }
+
+    #[test]
+    fn resolve_without_registry_defaults_ls() {
+        let orch = orchestrator_for_class_tests();
+        let req = test_request("no-reg");
+        assert_eq!(
+            orch.resolve_service_class_for_request(&req).unwrap(),
+            ServiceClass::LatencySensitive
+        );
+    }
+
+    #[test]
+    fn resolve_without_registry_rejects_explicit_be() {
+        // Without a registry there is no proof of tenant opt-in.
+        let orch = orchestrator_for_class_tests();
+        let mut req = test_request("no-reg-be");
+        req.service_class = Some(ServiceClass::BestEffort);
+        let err = orch.resolve_service_class_for_request(&req).unwrap_err();
+        assert!(matches!(err, CreateError::InvalidServiceClass { .. }));
+    }
+
+    #[test]
+    fn resolve_with_registry_inherits_and_enforces_opt_in() {
+        use crate::tenant::TenantRegistry;
+        let mut registry = TenantRegistry::new();
+        registry.register(tenant_with_class("tnt_create", ServiceClass::BestEffort));
+        let orch = orchestrator_for_class_tests().with_tenant_registry(Arc::new(registry));
+
+        // None inherits the BE tenant default.
+        let req = test_request("be-inherit");
+        assert_eq!(
+            orch.resolve_service_class_for_request(&req).unwrap(),
+            ServiceClass::BestEffort
+        );
+
+        // Explicit LS narrowing is always allowed.
+        let mut ls_req = test_request("be-narrow");
+        ls_req.service_class = Some(ServiceClass::LatencySensitive);
+        assert_eq!(
+            orch.resolve_service_class_for_request(&ls_req).unwrap(),
+            ServiceClass::LatencySensitive
+        );
+
+        // Unknown tenant keeps strict packing for None/LS.
+        let mut unknown = test_request("unknown-tenant");
+        unknown.tenant_id = TenantId::from_string("tnt_unknown");
+        assert_eq!(
+            orch.resolve_service_class_for_request(&unknown).unwrap(),
+            ServiceClass::LatencySensitive
+        );
+
+        // Unknown tenant with explicit BE fails closed.
+        unknown.service_class = Some(ServiceClass::BestEffort);
+        assert!(matches!(
+            orch.resolve_service_class_for_request(&unknown)
+                .unwrap_err(),
+            CreateError::InvalidServiceClass { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_rejects_be_without_tenant_opt_in() {
+        use crate::tenant::TenantRegistry;
+        let mut registry = TenantRegistry::new();
+        registry.register(tenant_with_class(
+            "tnt_create",
+            ServiceClass::LatencySensitive,
+        ));
+        let orch = orchestrator_for_class_tests().with_tenant_registry(Arc::new(registry));
+
+        let mut req = test_request("be-reject");
+        req.service_class = Some(ServiceClass::BestEffort);
+        let err = orch.resolve_service_class_for_request(&req).unwrap_err();
+        assert!(matches!(err, CreateError::InvalidServiceClass { .. }));
+        let sandbox_err: crate::error::SandboxError = err.into();
+        assert!(matches!(
+            sandbox_err,
+            crate::error::SandboxError::BadRequest(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_class_rejects_before_quota() {
+        use crate::event_bus::NoopAuditSink;
+        // An explicit best-effort without registry proof fails at the
+        // API boundary before quota is touched, so the rejection leaks
+        // neither quota nor scheduler overlay load.
+        let policy = Arc::new(crate::policy::PolicyEngine::new());
+        policy
+            .load_policies(crate::policy::DEFAULT_PERMIT_POLICY)
+            .unwrap();
+        let quota = Arc::new(crate::quota::QuotaEngine::new());
+        quota.set_limits(
+            TenantId::from_string("tnt_create"),
+            crate::quota::QuotaLimits {
+                max_sandboxes: 1,
+                max_vcpus: 2,
+                max_memory_mb: 512,
+                ..Default::default()
+            },
+        );
+        let orch = CreateOrchestrator::new(
+            policy,
+            Arc::clone(&quota),
+            Arc::new(NoopAuditSink),
+            Arc::new(crate::identity::Hlc::new()),
+            Arc::new(IdempotencyStore::new()),
+        );
+        let mut req = test_request("quota-leak");
+        req.service_class = Some(ServiceClass::BestEffort);
+        let regional = crate::scheduler::RegionalScheduler::new();
+        let cell = crate::cell_scheduler::CellScheduler::new();
+        let err = orch
+            .create(&req, &regional, &[], &cell, &|_| Vec::new())
+            .unwrap_err();
+        assert!(matches!(err, CreateError::InvalidServiceClass { .. }));
+        let decision = quota.check_create(&req.tenant_id, req.vcpus, req.memory_mb);
+        assert!(decision.allowed, "rejected class must not consume quota");
     }
 }

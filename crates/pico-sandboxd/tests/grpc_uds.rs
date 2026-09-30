@@ -133,6 +133,7 @@ async fn prepare_and_destroy_over_uds() {
                 network_isolated: true,
                 ssh_port: None,
                 cpu_set: Vec::new(),
+                service_class: pico_sandboxd_proto::v1::ServiceClass::LatencySensitive as i32,
             }),
             runtime_type: ProtoRuntime::Firecracker as i32,
             host: None,
@@ -231,6 +232,7 @@ async fn get_port_target_and_watch_over_uds() {
                 network_isolated: true,
                 ssh_port: None,
                 cpu_set: Vec::new(),
+                service_class: pico_sandboxd_proto::v1::ServiceClass::LatencySensitive as i32,
             }),
             runtime_type: ProtoRuntime::Firecracker as i32,
             host: Some(HostResourceSpec {

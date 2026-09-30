@@ -678,6 +678,19 @@ fn sandbox_config_to_proto(config: &SandboxConfig) -> v1::SandboxConfig {
         network_isolated: config.network_isolated,
         ssh_port: config.ssh_port.map(u32::from),
         cpu_set: config.cpu_set.clone().unwrap_or_default(),
+        service_class: core_service_class_to_proto(config.service_class) as i32,
+    }
+}
+
+/// Maps a core service class onto the wire enum.
+///
+/// Latency-sensitive (the strict default) maps explicitly rather than as
+/// UNSPECIFIED so the wire always names the class it enforces; older
+/// servers that predate the field ignore it and keep strict packing.
+fn core_service_class_to_proto(class: pico_core::ServiceClass) -> v1::ServiceClass {
+    match class {
+        pico_core::ServiceClass::LatencySensitive => v1::ServiceClass::LatencySensitive,
+        pico_core::ServiceClass::BestEffort => v1::ServiceClass::BestEffort,
     }
 }
 
@@ -1118,6 +1131,35 @@ mod tests {
         assert!(proto.network_isolated);
         assert_eq!(proto.ssh_port, Some(22));
         assert_eq!(proto.cpu_set, vec![0, 1]);
+    }
+
+    #[test]
+    fn sandbox_config_maps_service_class_both_ways() {
+        use pico_core::ServiceClass;
+        for (core, expected) in [
+            (
+                ServiceClass::LatencySensitive,
+                v1::ServiceClass::LatencySensitive as i32,
+            ),
+            (
+                ServiceClass::BestEffort,
+                v1::ServiceClass::BestEffort as i32,
+            ),
+        ] {
+            let proto = sandbox_config_to_proto(&SandboxConfig {
+                id: "sbx_class".into(),
+                service_class: core,
+                ..SandboxConfig::default()
+            });
+            assert_eq!(proto.service_class, expected, "class {core:?}");
+        }
+        // Default config (LS) maps explicitly, never UNSPECIFIED, so the
+        // wire always names the enforced class.
+        let default_proto = sandbox_config_to_proto(&SandboxConfig::default());
+        assert_eq!(
+            default_proto.service_class,
+            v1::ServiceClass::LatencySensitive as i32
+        );
     }
 
     #[test]

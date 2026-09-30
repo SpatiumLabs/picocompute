@@ -24,6 +24,7 @@ use pico_core::runtime::{
     RuntimeBackend,
 };
 use pico_core::{ExecRequest, ExecResponse, SandboxConfig, SandboxError, SandboxState};
+use pico_core::{apply_service_class_sched_policy, is_sched_permission_denied};
 
 use crate::base::VmBackendBase;
 use crate::qemu::config::{QemuConfig, QemuMode};
@@ -439,6 +440,34 @@ impl RuntimeBackend for QemuAdapter {
                             error = %err,
                             "failed to apply CPU pinning to QEMU VMM process"
                         );
+                    }
+                }
+            }
+            // Apply the service-class scheduling policy to the VMM pid at
+            // spawn (LS no-op, BE SCHED_IDLE). Permission-denied warns;
+            // other control failures fail boot closed.
+            {
+                let sandbox_config = self.base.config.lock().await;
+                if let Some(cfg) = sandbox_config.as_ref()
+                    && cfg.service_class.is_best_effort()
+                {
+                    let vm_proc = self.vm_process.lock().await;
+                    if let Some(ref child) = *vm_proc
+                        && let Some(pid) = child.id()
+                        && let Err(err) =
+                            apply_service_class_sched_policy(cfg.service_class, pid)
+                    {
+                        if is_sched_permission_denied(&err) {
+                            tracing::warn!(
+                                pid = pid,
+                                error = %err,
+                                "sched policy denied for QEMU VMM process; continuing at default priority"
+                            );
+                        } else {
+                            return Err(SandboxError::Other(format!(
+                                "sched policy failed for QEMU VMM pid {pid}: {err}"
+                            )));
+                        }
                     }
                 }
             }

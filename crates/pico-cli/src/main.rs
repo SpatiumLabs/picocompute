@@ -106,6 +106,7 @@ async fn main() {
                     image_id: ca.image_id,
                     image_digest: ca.image_digest,
                     credential_request: None,
+                    service_class: None,
                 };
                 client
                     .create_sandbox(&spec)
@@ -556,6 +557,7 @@ mod tests {
             image_id: Some("img_1".to_string()),
             image_digest: Some("sha256:abc".to_string()),
             credential_request: None,
+            service_class: None,
         };
         assert_eq!(spec.image_id.as_deref(), Some("img_1"));
         assert!(spec.env.unwrap().contains_key("FOO"));

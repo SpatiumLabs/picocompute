@@ -148,6 +148,8 @@ fn placement_outcome_roundtrips() {
             sample_size: 5,
             eligible: 5,
             overlay_adjusted: false,
+            service_class: pico_core::ServiceClass::LatencySensitive,
+            overcommit_applied: false,
         })
         .build();
 
@@ -173,6 +175,8 @@ fn placement_outcome_reads_events_without_selection_fields() {
             sample_size: 5,
             eligible: 5,
             overlay_adjusted: false,
+            service_class: pico_core::ServiceClass::LatencySensitive,
+            overcommit_applied: false,
         })
         .build();
 
@@ -192,6 +196,8 @@ fn placement_outcome_reads_events_without_selection_fields() {
         Some(AuditEventDetails::PlacementOutcome {
             sampled: false,
             overlay_adjusted: false,
+            service_class: pico_core::ServiceClass::LatencySensitive,
+            overcommit_applied: false,
             ..
         })
     ));

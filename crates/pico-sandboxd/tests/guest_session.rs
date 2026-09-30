@@ -14,7 +14,7 @@ use pico_sandboxd_proto::v1::sandboxd_client::SandboxdClient;
 use pico_sandboxd_proto::v1::{
     BootRequest, CommandMeta, DestroyRequest, ExecRequest, FileReadRequest, FileWriteRequest,
     GetSandboxRequest, OutcomeStatus, PrepareRequest, RuntimeType as ProtoRuntime, SandboxConfig,
-    SandboxState as ProtoState, exec_event,
+    SandboxState as ProtoState, ServiceClass as ProtoServiceClass, exec_event,
 };
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
@@ -141,6 +141,7 @@ async fn boot_running_only_with_guest_session_and_exec_stream() {
                 network_isolated: true,
                 ssh_port: None,
                 cpu_set: Vec::new(),
+                service_class: ProtoServiceClass::LatencySensitive as i32,
             }),
             runtime_type: ProtoRuntime::Firecracker as i32,
             host: None,
@@ -293,6 +294,7 @@ async fn boot_fails_closed_without_guest_session() {
                 network_isolated: true,
                 ssh_port: None,
                 cpu_set: Vec::new(),
+                service_class: ProtoServiceClass::LatencySensitive as i32,
             }),
             runtime_type: ProtoRuntime::Firecracker as i32,
             host: None,

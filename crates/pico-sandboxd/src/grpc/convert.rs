@@ -89,8 +89,29 @@ pub(crate) fn sandbox_config(config: v1::SandboxConfig) -> Result<SandboxConfig,
         network_isolated: config.network_isolated,
         ssh_port,
         cpu_set,
+        service_class: proto_service_class_to_core(config.service_class)?,
         ..SandboxConfig::default()
     })
+}
+
+/// Maps the wire service class onto core [`pico_core::ServiceClass`].
+///
+/// `UNSPECIFIED` (older clients that predate class delivery) maps to
+/// latency-sensitive so the host keeps strict packing. Unknown enum
+/// values fail closed as `InvalidArgument` instead of silently mapping
+/// to either class.
+fn proto_service_class_to_core(value: i32) -> Result<pico_core::ServiceClass, Status> {
+    use pico_core::ServiceClass as CoreClass;
+    let proto = v1::ServiceClass::try_from(value).map_err(|_| {
+        Status::invalid_argument(format!(
+            "unknown service_class {value}; expected proto ServiceClass"
+        ))
+    })?;
+    match proto {
+        v1::ServiceClass::Unspecified => Ok(CoreClass::LatencySensitive),
+        v1::ServiceClass::LatencySensitive => Ok(CoreClass::LatencySensitive),
+        v1::ServiceClass::BestEffort => Ok(CoreClass::BestEffort),
+    }
 }
 
 /// Parses a wire runtime enum into core [`CoreRuntime`].
@@ -981,6 +1002,71 @@ mod tests {
         let err = proto_runtime_to_core(ProtoRuntime::Unspecified).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         let err = runtime_type(ProtoRuntime::Unspecified as i32).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    fn sample_sandbox_config() -> v1::SandboxConfig {
+        v1::SandboxConfig {
+            id: "sbx_class".into(),
+            memory_limit_bytes: 512 * 1024 * 1024,
+            cpu_shares: 100,
+            memory_soft_limit_bytes: None,
+            max_pids: None,
+            network_isolated: true,
+            ssh_port: None,
+            cpu_set: Vec::new(),
+            service_class: v1::ServiceClass::LatencySensitive as i32,
+        }
+    }
+
+    #[test]
+    fn sandbox_config_unspecified_defaults_ls() {
+        // Older clients that predate class delivery send UNSPECIFIED (or no
+        // field, which decodes as 0): the host keeps strict packing.
+        let mut cfg = sample_sandbox_config();
+        cfg.service_class = v1::ServiceClass::Unspecified as i32;
+        let core = sandbox_config(cfg).unwrap();
+        assert_eq!(
+            core.service_class,
+            pico_core::ServiceClass::LatencySensitive
+        );
+    }
+
+    #[test]
+    fn sandbox_config_round_trips_both_classes() {
+        for (proto, expected) in [
+            (
+                v1::ServiceClass::LatencySensitive,
+                pico_core::ServiceClass::LatencySensitive,
+            ),
+            (
+                v1::ServiceClass::BestEffort,
+                pico_core::ServiceClass::BestEffort,
+            ),
+        ] {
+            let mut cfg = sample_sandbox_config();
+            cfg.service_class = proto as i32;
+            let core = sandbox_config(cfg).unwrap();
+            assert_eq!(core.service_class, expected);
+        }
+    }
+
+    #[test]
+    fn sandbox_config_rejects_unknown_service_class() {
+        // Unknown enum values fail closed, never silently mapped.
+        let mut cfg = sample_sandbox_config();
+        cfg.service_class = 999;
+        let err = sandbox_config(cfg).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("service_class"));
+    }
+
+    #[test]
+    fn sandbox_config_still_rejects_empty_id_with_class() {
+        let mut cfg = sample_sandbox_config();
+        cfg.id.clear();
+        cfg.service_class = v1::ServiceClass::BestEffort as i32;
+        let err = sandbox_config(cfg).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

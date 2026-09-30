@@ -24,6 +24,7 @@ use pico_core::runtime::{
     DiagnosticBundle, ForkResult, GuestTransport, PreparedSandbox, ResourceReceipt, RuntimeBackend,
 };
 use pico_core::{ExecRequest, ExecResponse, SandboxConfig, SandboxError, SandboxState};
+use pico_core::{apply_service_class_sched_policy, is_sched_permission_denied};
 
 use crate::base::VmBackendBase;
 
@@ -321,6 +322,34 @@ impl RuntimeBackend for FirecrackerAdapter {
         }
 
         let start_result: Result<()> = async {
+            // Apply the service-class scheduling policy to the VMM pid at
+            // spawn. LS is a no-op (already SCHED_OTHER); BE applies
+            // SCHED_IDLE. Permission-denied (restricted env without
+            // CAP_SYS_NICE) warns and continues; any other control failure
+            // fails boot closed inside this closure so the outer handler
+            // kills the spawned VMM and marks Failed instead of leaking it.
+            {
+                let vm_proc = self.vm_process.lock().await;
+                if let Some(ref child) = *vm_proc
+                    && let Some(pid) = child.id()
+                    && sandbox_config.service_class.is_best_effort()
+                    && let Err(err) =
+                        apply_service_class_sched_policy(sandbox_config.service_class, pid)
+                {
+                    if is_sched_permission_denied(&err) {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_config.id,
+                            pid = pid,
+                            error = %err,
+                            "sched policy denied for VMM process (restricted env without CAP_SYS_NICE); continuing at default priority"
+                        );
+                    } else {
+                        return Err(SandboxError::Other(format!(
+                            "sched policy failed for Firecracker VMM pid {pid}: {err}"
+                        )));
+                    }
+                }
+            }
             wait_for_socket(&socket_path, Duration::from_secs(5)).await?;
 
             let client = FirecrackerApiClient::new(&socket_path);
