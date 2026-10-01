@@ -5,13 +5,26 @@ provider "aws" {
 provider "cloudflare" {}
 
 provider "kubernetes" {
-  host                   = data.aws_eks_cluster.main.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.main.certificate_authority[0].data)
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
 
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
-    args        = ["eks", "get-token", "--cluster-name", data.aws_eks_cluster.main.name]
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
     command     = "aws"
+  }
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+      command     = "aws"
+    }
   }
 }
 
@@ -807,13 +820,13 @@ resource "aws_iam_role" "api_irsa" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
-      Principal = { Federated = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${replace(data.aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}" }
-      Action = "sts:AssumeRoleWithWebIdentity"
+      Effect    = "Allow"
+      Principal = { Federated = module.eks.oidc_provider_arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringEquals = {
-          "${replace(data.aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:aud" = "sts.amazonaws.com"
-          "${replace(data.aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:api-stg:api"
+          "${replace(module.eks.oidc_provider_url, "https://", "")}:aud" = "sts.amazonaws.com"
+          "${replace(module.eks.oidc_provider_url, "https://", "")}:sub" = "system:serviceaccount:api:api"
         }
       }
     }]
@@ -823,8 +836,8 @@ resource "aws_iam_role" "api_irsa" {
 }
 
 resource "aws_iam_role_policy" "api_irsa" {
-  name   = "${local.name_prefix}-api-irsa"
-  role   = aws_iam_role.api_irsa.id
+  name = "${local.name_prefix}-api-irsa"
+  role = aws_iam_role.api_irsa.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -935,24 +948,51 @@ resource "aws_cloudwatch_dashboard" "main" {
   })
 }
 
-# --- Staging uses production EKS cluster ---
+# --- Dedicated staging EKS cluster (decoupled from production) ---
 
-data "aws_eks_cluster" "main" {
-  name = "${var.project_name}-production"
+module "eks" {
+  source = "../modules/pico-eks"
+
+  project_name       = var.project_name
+  environment        = var.environment
+  vpc_id             = module.vpc.vpc_id
+  private_subnet_ids = module.vpc.private_subnet_ids
+
+  fargate_namespaces = ["api", "monitoring"]
+
+  common_tags = local.common_tags
 }
 
-data "aws_ecr_repository" "api" {
-  name = "${var.project_name}-api-production"
+# API token comes from SSM at apply time and is projected into the pod
+# via a Kubernetes secret. The container reads PICO_API_TOKEN directly.
+data "aws_ssm_parameter" "api_token" {
+  name            = var.pico_api_token_parameter_name
+  with_decryption = true
 }
 
 # --- Kubernetes Resources ---
 
 resource "kubernetes_namespace" "api" {
   metadata {
-    name = "api-stg"
+    name = "api"
   }
 
-  depends_on = [data.aws_eks_cluster.main]
+  depends_on = [module.eks]
+}
+
+resource "kubernetes_secret" "api" {
+  metadata {
+    name      = "api"
+    namespace = kubernetes_namespace.api.metadata[0].name
+  }
+
+  data = {
+    PICO_API_TOKEN = data.aws_ssm_parameter.api_token.value
+  }
+
+  type = "Opaque"
+
+  depends_on = [module.eks]
 }
 
 resource "kubernetes_deployment" "api" {
@@ -979,8 +1019,10 @@ resource "kubernetes_deployment" "api" {
       spec {
         service_account_name = kubernetes_service_account.api.metadata[0].name
         container {
-          name  = "api"
-          image = "${data.aws_ecr_repository.api.repository_url}:latest"
+          name = "api"
+          # Immutable per-revision tag. CI must push
+          # ${module.eks.ecr_repository_url}:${var.commit} before apply.
+          image = "${module.eks.ecr_repository_url}:${var.commit}"
           port {
             container_port = 8080
           }
@@ -994,20 +1036,43 @@ resource "kubernetes_deployment" "api" {
             }
           }
           env {
-            name  = "ENVIRONMENT"
-            value = var.environment
+            name  = "RUN_ENV"
+            value = "production"
+          }
+          env {
+            name  = "PICO_RUNTIME"
+            value = var.runtime
+          }
+          env {
+            name  = "PICO_IDLE_TIMEOUT_SECS"
+            value = tostring(var.idle_timeout_secs)
+          }
+          env {
+            name = "PICO_API_TOKEN"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.api.metadata[0].name
+                key  = "PICO_API_TOKEN"
+              }
+            }
           }
           env {
             name  = "API_TOKEN_PARAM"
             value = var.pico_api_token_parameter_name
           }
           env {
+            # Reserved for future DB-backed control plane. Unused by pico-api today.
             name  = "DB_SECRET_ARN"
             value = aws_rds_cluster.main.master_user_secret[0].secret_arn
           }
           env {
             name  = "DB_PORT"
             value = "5432"
+          }
+          env {
+            # OTLP collector in monitoring namespace. Empty keeps local no-export.
+            name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
+            value = var.otel_endpoint
           }
           liveness_probe {
             http_get {
@@ -1019,7 +1084,7 @@ resource "kubernetes_deployment" "api" {
           }
           readiness_probe {
             http_get {
-              path = "/v1/livez"
+              path = "/v1/readyz"
               port = 8080
             }
             initial_delay_seconds = 10
@@ -1030,7 +1095,7 @@ resource "kubernetes_deployment" "api" {
     }
   }
 
-  depends_on = [data.aws_eks_cluster.main]
+  depends_on = [module.eks]
 }
 
 resource "kubernetes_service_account" "api" {
@@ -1090,7 +1155,7 @@ resource "kubernetes_ingress_v1" "api" {
     }
   }
 
-  depends_on = [data.aws_eks_cluster.main]
+  depends_on = [module.eks]
 }
 
 resource "kubernetes_service" "api_nlb" {
@@ -1115,7 +1180,196 @@ resource "kubernetes_service" "api_nlb" {
     }
   }
 
-  depends_on = [data.aws_eks_cluster.main]
+  depends_on = [module.eks]
+}
+
+# --- Observability stack (staging self-hosted) ---
+# Prometheus + Grafana via kube-prometheus-stack, OTLP via
+# opentelemetry-collector. The collector Service is an internal NLB so
+# EC2 compute hosts (outside the cluster) can export OTLP; in-cluster
+# pods use the ClusterIP DNS via var.otel_endpoint.
+
+resource "kubernetes_namespace" "monitoring" {
+  count = var.enable_observability ? 1 : 0
+
+  metadata {
+    name = "monitoring"
+  }
+
+  depends_on = [module.eks]
+}
+
+resource "helm_release" "kube_prometheus_stack" {
+  count = var.enable_observability ? 1 : 0
+
+  name       = "kube-prometheus-stack"
+  namespace  = kubernetes_namespace.monitoring[0].metadata[0].name
+  repository = "https://prometheus-community.github.io/helm-charts"
+  chart      = "kube-prometheus-stack"
+
+  # Fargate-compatible staging defaults: no hostPath persistence,
+  # short retention, Grafana sidecar loads pico dashboards from ConfigMaps.
+  values = [yamlencode({
+    prometheus = {
+      prometheusSpec = {
+        retention                               = "6h"
+        storageSpec                             = null
+        serviceMonitorSelectorNilUsesHelmValues = false
+        podMonitorSelectorNilUsesHelmValues     = false
+        ruleSelectorNilUsesHelmValues           = false
+      }
+    }
+    alertmanager = {
+      enabled = true
+    }
+    grafana = {
+      enabled = true
+      sidecar = {
+        dashboards = {
+          enabled    = true
+          label      = "grafana_dashboard"
+          labelValue = "pico"
+        }
+      }
+    }
+  })]
+
+  depends_on = [module.eks]
+}
+
+resource "helm_release" "opentelemetry_collector" {
+  count = var.enable_observability ? 1 : 0
+
+  name       = "opentelemetry-collector"
+  namespace  = kubernetes_namespace.monitoring[0].metadata[0].name
+  repository = "https://open-telemetry.github.io/opentelemetry-helm-charts"
+  chart      = "opentelemetry-collector"
+
+  # OTLP in (4317/4318), Prometheus out (8889). The Service is an
+  # internal NLB so EC2 compute hosts can reach OTLP from outside the
+  # cluster; in-cluster pods keep using the ClusterIP DNS.
+  values = [yamlencode({
+    mode = "deployment"
+    service = {
+      enabled = true
+      type    = "LoadBalancer"
+      annotations = {
+        "service.beta.kubernetes.io/aws-load-balancer-type"   = "nlb"
+        "service.beta.kubernetes.io/aws-load-balancer-scheme" = "internal"
+        "service.beta.kubernetes.io/aws-load-balancer-name"   = "${local.name_prefix}-otel"
+      }
+    }
+    config = {
+      receivers = {
+        otlp = {
+          protocols = {
+            grpc = { endpoint = "0.0.0.0:4317" }
+            http = { endpoint = "0.0.0.0:4318" }
+          }
+        }
+      }
+      processors = {
+        batch = {}
+        memory_limiter = {
+          check_interval = "5s"
+          limit_mib      = 512
+        }
+      }
+      exporters = {
+        prometheus = {
+          endpoint = "0.0.0.0:8889"
+        }
+      }
+      service = {
+        pipelines = {
+          metrics = {
+            receivers  = ["otlp"]
+            processors = ["memory_limiter", "batch"]
+            exporters  = ["prometheus"]
+          }
+          traces = {
+            receivers  = ["otlp"]
+            processors = ["memory_limiter", "batch"]
+            exporters  = ["prometheus"]
+          }
+        }
+      }
+    }
+    ports = {
+      otlp-grpc = {
+        enabled       = true
+        containerPort = 4317
+        servicePort   = 4317
+        protocol      = "TCP"
+      }
+      prometheus = {
+        enabled       = true
+        containerPort = 8889
+        servicePort   = 8889
+        protocol      = "TCP"
+      }
+    }
+  })]
+
+  depends_on = [module.eks]
+}
+
+# Grafana sidecar picks up ConfigMaps labelled grafana_dashboard=pico.
+resource "kubernetes_config_map" "grafana_dashboards" {
+  count = var.enable_observability ? 1 : 0
+
+  metadata {
+    name      = "pico-dashboards"
+    namespace = kubernetes_namespace.monitoring[0].metadata[0].name
+    labels = {
+      grafana_dashboard = "pico"
+    }
+  }
+
+  data = {
+    for f in fileset("${path.module}/../../../o11y", "*.json") :
+    f => file("${path.module}/../../../o11y/${f}")
+  }
+
+  depends_on = [module.eks]
+}
+
+# Recording and burn alerts. The prometheus-operator picks up
+# PrometheusRule CRs when ruleSelectorNilUsesHelmValues is false.
+resource "kubernetes_manifest" "pico_recording_rules" {
+  count = var.enable_observability ? 1 : 0
+
+  manifest = yamldecode(file("${path.module}/../../../o11y/rules/pico-recording-rules.yaml"))
+
+  depends_on = [helm_release.kube_prometheus_stack]
+}
+
+# Internal NLB fronting the collector (created by the chart Service).
+# Same wait pattern as the API NLB: the LB controller provisions async.
+resource "time_sleep" "wait_for_otel" {
+  count = var.enable_observability ? 1 : 0
+
+  depends_on      = [helm_release.opentelemetry_collector]
+  create_duration = "120s"
+}
+
+data "aws_lb" "otel" {
+  count = var.enable_observability ? 1 : 0
+
+  depends_on = [time_sleep.wait_for_otel]
+  name       = "${local.name_prefix}-otel"
+}
+
+# OTLP gRPC from compute hosts to the cluster (Fargate pod ENIs).
+resource "aws_vpc_security_group_ingress_rule" "otel_otlp_from_compute" {
+  count = var.enable_observability ? 1 : 0
+
+  security_group_id            = module.eks.cluster_security_group_id
+  description                  = "OTLP gRPC from compute hosts"
+  from_port                    = 4317
+  to_port                      = 4317
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = module.compute_host.security_group_id
 }
 
 # --- Compute Host Module ---
@@ -1149,7 +1403,10 @@ module "compute_host" {
   idle_timeout_secs       = var.idle_timeout_secs
   additional_kms_key_arns = [aws_kms_key.artifacts.arn, aws_kms_key.snapshots.arn]
 
-  control_plane_security_group_id = data.aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+  # Host OTLP via the internal collector NLB. Empty keeps local no-export.
+  otel_endpoint = var.enable_observability ? "http://${data.aws_lb.otel[0].dns_name}:4317" : ""
+
+  control_plane_security_group_id = module.eks.cluster_security_group_id
   alarm_sns_topic_arn             = aws_sns_topic.alarms.arn
 }
 
@@ -1161,7 +1418,7 @@ resource "aws_vpc_security_group_ingress_rule" "db_postgres_from_eks" {
   from_port                    = 5432
   to_port                      = 5432
   ip_protocol                  = "tcp"
-  referenced_security_group_id = data.aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+  referenced_security_group_id = module.eks.cluster_security_group_id
 }
 
 # --- API Gateway (REST) ---

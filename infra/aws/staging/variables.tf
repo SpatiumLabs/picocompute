@@ -135,7 +135,7 @@ variable "idle_timeout_secs" {
 variable "enable_detective_controls" {
   description = "Enable GuardDuty, Security Hub, CloudTrail, and AWS Config."
   type        = bool
-  default     = false
+  default     = true
 }
 
 # --- Database (Aurora PostgreSQL) ---
@@ -194,4 +194,16 @@ variable "enable_dashboard" {
   description = "Create the CloudWatch ops dashboard."
   type        = bool
   default     = true
+}
+
+variable "enable_observability" {
+  description = "Deploy kube-prometheus-stack and OTel collector into the staging cluster."
+  type        = bool
+  default     = true
+}
+
+variable "otel_endpoint" {
+  description = "OTLP gRPC endpoint for pico-api export. Must include scheme; use http:// for plaintext in-cluster collectors."
+  type        = string
+  default     = "http://opentelemetry-collector.monitoring.svc.cluster.local:4317"
 }

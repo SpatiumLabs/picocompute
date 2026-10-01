@@ -31,6 +31,7 @@ write_files:
       ASSET_CACHE_BUCKET="${asset_cache_bucket}"
       ASSET_CACHE_PREFIX="${asset_cache_prefix}"
       COMMIT="${commit}"
+      OTEL_ENDPOINT="${otel_endpoint}"
 
       mkdir -p "$PICO_BIN" "$PICO_IMAGE_DIR" /var/lib/pico/workspaces /etc/pico
 
@@ -65,6 +66,7 @@ write_files:
       PICO_FIRECRACKER_BIN=/usr/local/bin/firecracker
       PICO_SANDBOXD_BIN=$PICO_BIN/pico-sandboxd
       RUN_ENV=${environment}
+      OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_ENDPOINT
       EOF_ENV
       chmod 0600 "/etc/pico/host-agent.env"
 

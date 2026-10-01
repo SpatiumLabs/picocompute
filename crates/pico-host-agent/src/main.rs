@@ -45,9 +45,18 @@ async fn main() -> Result<()> {
             },
             metrics: pico_telemetry::MetricsSettings {
                 service_name: "pico-host-agent".to_string(),
-                ..Default::default()
+                otlp_endpoint: otlp_endpoint_from_env(),
+                export_interval_secs: 60,
+                resource_attributes: vec![
+                    ("host_id".to_string(), config.identity.host_id.clone()),
+                    ("cell_id".to_string(), config.identity.cell_id.clone()),
+                    ("region".to_string(), config.identity.region.clone()),
+                ],
             },
-            ..Default::default()
+            tracing: pico_telemetry::TracingSettings {
+                otlp_endpoint: otlp_endpoint_from_env(),
+                sample_rate: 1.0,
+            },
         },
     };
 
@@ -365,6 +374,13 @@ fn init_seccomp() {
     // Network agent still co-resides; runtime adapters no longer link into
     // host-agent after the sandboxd cutover.
     pico_network_agent::init_seccomp();
+}
+
+/// OTLP gRPC collector endpoint. Empty means no export (local dev default).
+fn otlp_endpoint_from_env() -> String {
+    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
 }
 
 async fn shutdown_signal(agent: AppState, drain_timeout_secs: u64) {

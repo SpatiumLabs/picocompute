@@ -136,7 +136,7 @@ variable "idle_timeout_secs" {
 variable "enable_detective_controls" {
   description = "Enable GuardDuty, Security Hub, CloudTrail, and AWS Config."
   type        = bool
-  default     = false
+  default     = true
 }
 
 # --- Database (Aurora PostgreSQL) ---

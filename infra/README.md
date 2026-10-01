@@ -18,9 +18,9 @@ pip install diagrams
 python infra/docs/diagrams/aws-architecture.py
 ```
 
-### Staging on Production EKS
+### Staging on Dedicated EKS
 
-Staging reuses the production EKS cluster (discovered via `data.aws_eks_cluster`) with namespace `api-stg`. This saves ~$72/month but creates a coupling risk — a production EKS outage affects staging. For isolated staging, deploy a dedicated EKS cluster.
+Staging runs a dedicated EKS cluster (`picocompute-staging`) with namespace `api` and its own ECR repository (`picocompute-api-staging`). Production no longer hosts the staging namespace. API images are pinned per revision (`${ecr_url}:${var.commit}`); CI must push that tag before apply. The API token is read from SSM at apply time into a Kubernetes secret (`PICO_API_TOKEN`); the container no longer boots on dead `API_TOKEN_PARAM` alone.
 
 ### Architecture Evolution
 
@@ -118,12 +118,18 @@ Each environment directory is a standalone Terraform root module with its own st
 | API runtime | EKS Fargate (256m CPU / 512 MiB) | EKS Fargate (256m CPU / 512 MiB) |
 | API entry | REST API Gateway → VPC Link → NLB | REST API Gateway → VPC Link → NLB |
 | API desired count | 1 | 2 |
-| EKS cluster | Shared with production | Dedicated pico-production |
+| EKS cluster | Dedicated pico-staging | Dedicated pico-production |
+| ECR repository | Dedicated pico-api-staging (`:${var.commit}`) | Dedicated pico-api-production (`:${var.commit}`) |
 | Compute host instance | `m7i-flex.large` (spot) | `m7i.4xlarge` (spot) |
 | Compute ASG sizing | 1/1/3 | 1/1/9 |
 | Database | Aurora Serverless v2 (0.5-4 ACU) | Aurora PostgreSQL 18 (2 instances) |
 | NAT Gateway | Regional | Regional |
 | VPC CIDR | `10.1.0.0/16` | `10.0.0.0/16` |
+| Observability | kube-prometheus-stack + OTel collector (`monitoring` ns) | CloudWatch only |
+
+## Observability (staging)
+
+Staging deploys `kube-prometheus-stack` and `opentelemetry-collector` into namespace `monitoring` when `enable_observability=true`. Grafana dashboards load from `o11y/*.json` via ConfigMap, alerts from `o11y/rules/pico-recording-rules.yaml` via `PrometheusRule`. `pico-api` exports OTLP to `var.otel_endpoint` (ClusterIP DNS, in-cluster). Compute hosts export via an internal NLB fronting the collector (`${project}-staging-otel:4317`, SG-gated to the cluster SG); the NLB DNS is injected into `host-agent.env` as `OTEL_EXPORTER_OTLP_ENDPOINT`. Empty endpoint keeps local no-export.
 
 ## Prerequisites
 
@@ -185,11 +191,15 @@ Note the state key path includes the environment name (`aws/production/` or `aws
 ```bash
 cd infra/aws/production  # or infra/aws/staging
 
+# Copy and fill inputs (no secrets in the sample)
+cp terraform.tfvars.sample terraform.tfvars
+# Edit commit, domain_name, cloudflare_zone_id, token param, sizing
+
 # Initialize with backend config
-terraform init -backend-config=backend.r2.hcl
+terraform init -backend-config=backend.s3.hcl
 
 # Create or migrate state
-terraform init -backend-config=backend.r2.hcl -migrate-state
+terraform init -backend-config=backend.s3.hcl -migrate-state
 
 # Review the plan
 terraform fmt && terraform validate && terraform plan

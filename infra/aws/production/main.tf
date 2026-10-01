@@ -942,7 +942,7 @@ module "eks" {
   vpc_id             = module.vpc.vpc_id
   private_subnet_ids = module.vpc.private_subnet_ids
 
-  fargate_namespaces = ["api", "api-stg"]
+  fargate_namespaces = ["api"]
 
   common_tags = local.common_tags
 }
@@ -953,6 +953,28 @@ resource "kubernetes_namespace" "api" {
   metadata {
     name = "api"
   }
+
+  depends_on = [module.eks]
+}
+
+# API token comes from SSM at apply time and is projected into the pod
+# via a Kubernetes secret. The container reads PICO_API_TOKEN directly.
+data "aws_ssm_parameter" "api_token" {
+  name            = var.pico_api_token_parameter_name
+  with_decryption = true
+}
+
+resource "kubernetes_secret" "api" {
+  metadata {
+    name      = "api"
+    namespace = kubernetes_namespace.api.metadata[0].name
+  }
+
+  data = {
+    PICO_API_TOKEN = data.aws_ssm_parameter.api_token.value
+  }
+
+  type = "Opaque"
 
   depends_on = [module.eks]
 }
@@ -981,8 +1003,10 @@ resource "kubernetes_deployment" "api" {
       spec {
         service_account_name = kubernetes_service_account.api.metadata[0].name
         container {
-          name  = "api"
-          image = "${module.eks.ecr_repository_url}:latest"
+          name = "api"
+          # Immutable per-revision tag. CI must push
+          # ${module.eks.ecr_repository_url}:${var.commit} before apply.
+          image = "${module.eks.ecr_repository_url}:${var.commit}"
           port {
             container_port = 8080
           }
@@ -996,14 +1020,32 @@ resource "kubernetes_deployment" "api" {
             }
           }
           env {
-            name  = "ENVIRONMENT"
-            value = var.environment
+            name  = "RUN_ENV"
+            value = "production"
+          }
+          env {
+            name  = "PICO_RUNTIME"
+            value = var.runtime
+          }
+          env {
+            name  = "PICO_IDLE_TIMEOUT_SECS"
+            value = tostring(var.idle_timeout_secs)
+          }
+          env {
+            name = "PICO_API_TOKEN"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.api.metadata[0].name
+                key  = "PICO_API_TOKEN"
+              }
+            }
           }
           env {
             name  = "API_TOKEN_PARAM"
             value = var.pico_api_token_parameter_name
           }
           env {
+            # Reserved for future DB-backed control plane. Unused by pico-api today.
             name  = "DB_SECRET_ARN"
             value = aws_rds_cluster.main.master_user_secret[0].secret_arn
           }
@@ -1021,7 +1063,7 @@ resource "kubernetes_deployment" "api" {
           }
           readiness_probe {
             http_get {
-              path = "/v1/livez"
+              path = "/v1/readyz"
               port = 8080
             }
             initial_delay_seconds = 10

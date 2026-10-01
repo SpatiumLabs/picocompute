@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
         RunEnv::Production => "warn,pico_api=info,tower_http=info",
     };
 
+    let otlp_endpoint = otlp_endpoint_from_env();
     let telemetry_config = pico_telemetry::TelemetryConfig {
         settings: &pico_telemetry::TelemetrySettings {
             log: pico_telemetry::LogSettings {
@@ -41,9 +42,17 @@ async fn main() -> Result<()> {
             },
             metrics: pico_telemetry::MetricsSettings {
                 service_name: "pico-api".to_string(),
-                ..Default::default()
+                otlp_endpoint: otlp_endpoint.clone(),
+                export_interval_secs: 60,
+                resource_attributes: vec![(
+                    "environment".to_string(),
+                    config.run_env.as_str().to_string(),
+                )],
             },
-            ..Default::default()
+            tracing: pico_telemetry::TracingSettings {
+                otlp_endpoint,
+                sample_rate: 1.0,
+            },
         },
     };
 
@@ -309,4 +318,12 @@ fn print_app_info(config: &AppConfig) {
         config.bind_addr,
         config.runtime
     );
+}
+
+/// OTLP gRPC collector endpoint. Empty means no export (local dev default).
+/// Must include an explicit scheme; use `http://` for plaintext collectors.
+fn otlp_endpoint_from_env() -> String {
+    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
 }

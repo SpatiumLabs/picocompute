@@ -63,45 +63,69 @@ run = { task = "rust:test" }
 
 # Infrastructure operations
 
-[tasks."infra:validate"]
-description = "Run Terraform validate"
-run = "terraform -chdir=infra validate"
+[tasks."infra:validate:staging"]
+description = "Validate staging Terraform"
+run = "terraform -chdir=infra/aws/staging validate"
 
-[tasks."infra:init"]
-description = "Initialize the infrastructure with Cloudflare R2 backend"
-run = "terraform -chdir=infra init -backend-config=backend.r2.hcl"
+[tasks."infra:validate:production"]
+description = "Validate production Terraform"
+run = "terraform -chdir=infra/aws/production validate"
 
-[tasks."infra:plan"]
-description = "Run Terraform plan"
-run = "terraform -chdir=infra plan"
+[tasks."infra:init:staging"]
+description = "Initialize staging with Cloudflare R2 backend"
+run = "terraform -chdir=infra/aws/staging init -backend-config=backend.s3.hcl"
 
-[tasks."infra:apply"]
-description = "Run Terraform apply"
-run = "terraform -chdir=infra apply --auto-approve"
+[tasks."infra:init:production"]
+description = "Initialize production with Cloudflare R2 backend"
+run = "terraform -chdir=infra/aws/production init -backend-config=backend.s3.hcl"
 
-[tasks."infra:replace_api_instance"]
-description = "Run Terraform apply to replace the API instance"
-run = "terraform -chdir=infra apply -replace=aws_instance.api --auto-approve"
+[tasks."infra:plan:staging"]
+description = "Plan staging Terraform"
+run = "terraform -chdir=infra/aws/staging plan"
 
-[tasks."infra:destroy"]
-description = "Run Terraform destroy"
-run = "terraform -chdir=infra destroy --auto-approve"
+[tasks."infra:plan:production"]
+description = "Plan production Terraform"
+run = "terraform -chdir=infra/aws/production plan"
+
+[tasks."infra:apply:staging"]
+description = "Apply staging Terraform"
+run = "terraform -chdir=infra/aws/staging apply"
+
+[tasks."infra:apply:production"]
+description = "Apply production Terraform"
+run = "terraform -chdir=infra/aws/production apply"
+
+[tasks."infra:destroy:staging"]
+description = "Destroy staging Terraform"
+run = "terraform -chdir=infra/aws/staging destroy"
+
+[tasks."infra:destroy:production"]
+description = "Destroy production Terraform"
+run = "terraform -chdir=infra/aws/production destroy"
 
 [tasks."prod:livez"]
 description = "Verify the production API liveness"
-run = "curl -v $(terraform -chdir=infra output -raw api_url)/v1/livez"
+run = "curl -v $(terraform -chdir=infra/aws/production output -raw api_url)/v1/livez"
 
 [tasks."prod:create_sandbox"]
 description = "Create a new production sandbox"
-run = "cargo run --bin pc create --ssh-key \"$(cat ~/.ssh/id_ed25519.pub)\" --api-url $(terraform -chdir=infra output -raw api_url)"
+run = "cargo run --bin pc create --ssh-key \"$(cat ~/.ssh/id_ed25519.pub)\" --api-url $(terraform -chdir=infra/aws/production output -raw api_url)"
 
 [tasks."prod:list"]
 description = "List all production sandboxes"
-run = "cargo run --bin pc list --api-url $(terraform -chdir=infra output -raw api_url)"
+run = "cargo run --bin pc list --api-url $(terraform -chdir=infra/aws/production output -raw api_url)"
 
 [tasks."prod:ssh"]
 description = "SSH into a specific production sandbox"
 usage = '''
 arg "sandbox_id" help="Target sandbox ID"
 '''
-run = "cargo run --bin pc -vv ssh {{ usage.sandbox_id }} --api-url $(terraform -chdir=infra output -raw api_url)"
+run = "cargo run --bin pc -vv ssh {{ usage.sandbox_id }} --api-url $(terraform -chdir=infra/aws/production output -raw api_url)"
+
+[tasks."stg:livez"]
+description = "Verify the staging API liveness"
+run = "curl -v $(terraform -chdir=infra/aws/staging output -raw api_url)/v1/livez"
+
+[tasks."stg:create_sandbox"]
+description = "Create a new staging sandbox"
+run = "cargo run --bin pc create --ssh-key \"$(cat ~/.ssh/id_ed25519.pub)\" --api-url $(terraform -chdir=infra/aws/staging output -raw api_url)"
