@@ -67,6 +67,8 @@ write_files:
       PICO_SANDBOXD_BIN=$PICO_BIN/pico-sandboxd
       RUN_ENV=${environment}
       OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_ENDPOINT
+      # Collector is metrics-only. Skip span export so hosts do not retry traces.
+      OTEL_TRACES_EXPORTER=none
       EOF_ENV
       chmod 0600 "/etc/pico/host-agent.env"
 

@@ -20,7 +20,17 @@ python infra/docs/diagrams/aws-architecture.py
 
 ### Staging on Dedicated EKS
 
-Staging runs a dedicated EKS cluster (`picocompute-staging`) with namespace `api` and its own ECR repository (`picocompute-api-staging`). Production no longer hosts the staging namespace. API images are pinned per revision (`${ecr_url}:${var.commit}`); CI must push that tag before apply. The API token is read from SSM at apply time into a Kubernetes secret (`PICO_API_TOKEN`); the container no longer boots on dead `API_TOKEN_PARAM` alone.
+Staging runs a dedicated EKS cluster (`picocompute-staging`) with namespace `api` and its own ECR repository (`picocompute-api-staging`). Production no longer hosts the staging namespace. API images are pinned per revision (`${ecr_url}:${var.commit}`); CI must push that tag before apply. The API token is read from SSM at pod start via IRSA (`PICO_API_TOKEN_FILE`); Terraform does not decrypt it into state.
+
+### Cut over from shared staging
+
+Staging state used to own namespace `api-stg` on the production cluster. Applying the staging root module retargets the Kubernetes provider at the new cluster, so Terraform will not delete those objects. Production keeps the `api-stg` Fargate selector until `retire_shared_staging_namespace=true`.
+
+1. Apply staging and confirm the new API and collector are healthy.
+2. Delete the old namespace: `scripts/retire-shared-staging.sh`
+3. Set `retire_shared_staging_namespace=true` in production tfvars and apply production.
+
+Do not set that flag before step 2. Removing the selector while `api-stg` still runs leaves rescheduled pods Pending.
 
 ### Architecture Evolution
 
@@ -129,7 +139,7 @@ Each environment directory is a standalone Terraform root module with its own st
 
 ## Observability (staging)
 
-Staging deploys `kube-prometheus-stack` and `opentelemetry-collector` into namespace `monitoring` when `enable_observability=true`. Grafana dashboards load from `o11y/*.json` via ConfigMap, alerts from `o11y/rules/pico-recording-rules.yaml` via `PrometheusRule`. `pico-api` exports OTLP to `var.otel_endpoint` (ClusterIP DNS, in-cluster). Compute hosts export via an internal NLB fronting the collector (`${project}-staging-otel:4317`, SG-gated to the cluster SG); the NLB DNS is injected into `host-agent.env` as `OTEL_EXPORTER_OTLP_ENDPOINT`. Empty endpoint keeps local no-export.
+Staging deploys `kube-prometheus-stack` (chart 77.0.0) and `opentelemetry-collector` (chart 0.122.0) into namespace `monitoring` when `enable_observability=true`. The Fargate profile always includes `kube-system` so CoreDNS and the load balancer controller can schedule. Grafana dashboards load from `o11y/*.json` via ConfigMap. Recording rules from `o11y/rules/pico-recording-rules.yaml` are installed by the kube-prometheus-stack chart (not a standalone manifest, which cannot plan before the CRD exists). The collector is metrics-only: OTLP metrics are exposed on `:8889` and scraped by a ServiceMonitor. Span export is disabled (`OTEL_TRACES_EXPORTER=none`). `pico-api` exports OTLP to `var.otel_endpoint` (ClusterIP DNS, in-cluster) only when observability is enabled. Compute hosts export via an internal IP-mode NLB (`${project}-staging-otel:4317`). The controller opens the pod security group to that NLB; the internal scheme allows the VPC CIDR. Empty endpoint keeps local no-export.
 
 ## Prerequisites
 

@@ -54,8 +54,7 @@ impl RunEnv {
 impl AppConfig {
     /// Loads API configuration from the process environment.
     pub fn from_env() -> anyhow::Result<Self> {
-        let token = std::env::var("PICO_API_TOKEN")
-            .map_err(|_| anyhow::anyhow!("PICO_API_TOKEN must be set"))?;
+        let token = load_api_token()?;
         Self::from_env_with_token(token)
     }
 
@@ -140,6 +139,39 @@ fn read_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|value| !value.is_empty())
 }
 
+/// Bearer token from `PICO_API_TOKEN`, or from the file at `PICO_API_TOKEN_FILE`.
+///
+/// The file path is how pods load the token from SSM at start without copying
+/// it into Terraform state.
+fn load_api_token() -> anyhow::Result<String> {
+    token_from_sources(read_env("PICO_API_TOKEN"), read_env("PICO_API_TOKEN_FILE"))
+}
+
+fn token_from_sources(
+    env_token: Option<String>,
+    file_path: Option<String>,
+) -> anyhow::Result<String> {
+    if let Some(token) = env_token {
+        return Ok(token);
+    }
+    let Some(path) = file_path else {
+        anyhow::bail!("PICO_API_TOKEN must be set");
+    };
+    let token = std::fs::read_to_string(&path)
+        .map_err(|err| anyhow::anyhow!("failed to read PICO_API_TOKEN_FILE {path}: {err}"))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("PICO_API_TOKEN_FILE {path} is empty");
+    }
+    Ok(token)
+}
+
+/// Deployment label for telemetry. `PICO_ENVIRONMENT` is the stack name
+/// (`staging`, `production`). `RUN_ENV` is only the log-level mode.
+pub fn telemetry_environment(run_env: RunEnv) -> String {
+    read_env("PICO_ENVIRONMENT").unwrap_or_else(|| run_env.as_str().to_string())
+}
+
 fn read_env_os(key: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(key).filter(|value| !value.is_empty())
 }
@@ -159,5 +191,26 @@ mod tests {
     fn run_env_formats_as_stable_string() {
         assert_eq!(RunEnv::Development.as_str(), "development");
         assert_eq!(RunEnv::Production.as_str(), "production");
+    }
+
+    #[test]
+    fn token_file_is_used_when_env_token_is_absent() {
+        let path = std::env::temp_dir().join("pico-api-token-test");
+        std::fs::write(&path, " file-token \n").unwrap();
+        let token = token_from_sources(None, Some(path.to_string_lossy().into_owned())).unwrap();
+        assert_eq!(token, "file-token");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn env_token_wins_over_file() {
+        let token = token_from_sources(Some("env-token".into()), Some("/missing".into())).unwrap();
+        assert_eq!(token, "env-token");
+    }
+
+    #[test]
+    fn missing_token_is_an_error() {
+        let err = token_from_sources(None, None).unwrap_err();
+        assert!(err.to_string().contains("PICO_API_TOKEN"));
     }
 }

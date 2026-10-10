@@ -37,6 +37,9 @@ idle_timeout_secs  = 3600
 
 enable_detective_controls = true
 
+# Keep false until the dedicated staging cluster is serving and api-stg is deleted.
+retire_shared_staging_namespace = false
+
 db_cluster_instance_class    = "db.r6g.large"
 db_engine_version            = "18.0"
 db_cluster_instance_count    = 2

@@ -46,11 +46,11 @@ async fn main() -> Result<()> {
                 export_interval_secs: 60,
                 resource_attributes: vec![(
                     "environment".to_string(),
-                    config.run_env.as_str().to_string(),
+                    pico_api::telemetry_environment(config.run_env),
                 )],
             },
             tracing: pico_telemetry::TracingSettings {
-                otlp_endpoint,
+                otlp_endpoint: tracing_endpoint_from_env(&otlp_endpoint),
                 sample_rate: 1.0,
             },
         },
@@ -326,4 +326,13 @@ fn otlp_endpoint_from_env() -> String {
     std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .map(|v| v.trim().to_string())
         .unwrap_or_default()
+}
+
+/// Span export uses the metrics endpoint unless `OTEL_TRACES_EXPORTER=none`.
+/// Staging has a metrics-only collector, so it sets that to avoid retry storms.
+fn tracing_endpoint_from_env(metrics_endpoint: &str) -> String {
+    match std::env::var("OTEL_TRACES_EXPORTER") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("none") => String::new(),
+        _ => metrics_endpoint.to_string(),
+    }
 }

@@ -136,7 +136,13 @@ variable "idle_timeout_secs" {
 variable "enable_detective_controls" {
   description = "Enable GuardDuty, Security Hub, CloudTrail, and AWS Config."
   type        = bool
-  default     = true
+  default     = false
+}
+
+variable "retire_shared_staging_namespace" {
+  description = "Drop the api-stg Fargate selector left from shared staging. Set true only after scripts/retire-shared-staging.sh deletes that namespace."
+  type        = bool
+  default     = false
 }
 
 # --- Database (Aurora PostgreSQL) ---
