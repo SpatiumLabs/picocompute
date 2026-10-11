@@ -135,3 +135,9 @@ variable "alarm_sns_topic_arn" {
   type        = string
   default     = ""
 }
+
+variable "otel_endpoint" {
+  description = "OTLP gRPC endpoint for host-agent export. Empty means no export."
+  type        = string
+  default     = ""
+}

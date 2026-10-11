@@ -3,6 +3,9 @@ data "aws_caller_identity" "current" {}
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
+  # CoreDNS and the AWS Load Balancer Controller addon run in kube-system.
+  # A Fargate-only cluster leaves those pods Pending without this selector.
+  fargate_namespaces = distinct(concat(var.fargate_namespaces, ["kube-system"]))
 }
 
 # --- IAM: EKS Cluster Role ---
@@ -13,9 +16,9 @@ resource "aws_iam_role" "cluster" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Service = "eks.amazonaws.com" }
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 
@@ -35,9 +38,9 @@ resource "aws_iam_role" "fargate" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Service = "eks-fargate-pods.amazonaws.com" }
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 
@@ -100,7 +103,7 @@ resource "aws_eks_fargate_profile" "api" {
   subnet_ids             = var.private_subnet_ids
 
   dynamic "selector" {
-    for_each = var.fargate_namespaces
+    for_each = local.fargate_namespaces
     content {
       namespace = selector.value
     }
@@ -141,10 +144,14 @@ resource "aws_eks_addon" "kube_proxy" {
 resource "aws_eks_addon" "lb_controller" {
   cluster_name                = aws_eks_cluster.main.name
   addon_name                  = "aws-load-balancer-controller"
+  service_account_role_arn    = aws_iam_role.lb_controller.arn
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"
 
-  depends_on = [aws_eks_fargate_profile.api]
+  depends_on = [
+    aws_eks_fargate_profile.api,
+    aws_iam_role_policy.lb_controller,
+  ]
 }
 
 # --- ECR ---
@@ -169,7 +176,9 @@ resource "aws_cloudwatch_log_group" "cluster" {
   tags              = var.common_tags
 }
 
-# --- IAM: API Service Account (for AWS LB Controller) ---
+# --- IAM: AWS Load Balancer Controller ---
+# Official controller policy. The addon annotates the kube-system service
+# account with this role; without it the controller cannot create NLBs.
 
 resource "aws_iam_role" "lb_controller" {
   name = "${local.name_prefix}-eks-lb-controller"
@@ -177,9 +186,9 @@ resource "aws_iam_role" "lb_controller" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Federated = aws_iam_openid_connect_provider.main.arn }
-      Action = "sts:AssumeRoleWithWebIdentity"
+      Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringEquals = {
           "${replace(aws_iam_openid_connect_provider.main.url, "https://", "")}:aud" = "sts.amazonaws.com"
@@ -196,30 +205,9 @@ resource "aws_iam_role_policy" "lb_controller" {
   name = "${local.name_prefix}-eks-lb-controller"
   role = aws_iam_role.lb_controller.id
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "ec2:DescribeSecurityGroups",
-          "ec2:DescribeSubnets",
-          "ec2:DescribeVpcs",
-          "ec2:DescribeInstances",
-          "ec2:DescribeAccountAttributes",
-          "ec2:DescribeInternetGateways",
-        ]
-        Resource = ["*"]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "elasticloadbalancing:*",
-        ]
-        Resource = ["*"]
-      },
-    ]
-  })
+  # Upstream policy from kubernetes-sigs/aws-load-balancer-controller.
+  # Includes security-group management required for IP-mode NLB targets.
+  policy = file("${path.module}/iam-lb-controller.json")
 }
 
 resource "aws_iam_openid_connect_provider" "main" {

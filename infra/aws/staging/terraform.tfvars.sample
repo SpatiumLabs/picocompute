@@ -1,0 +1,51 @@
+aws_region   = "us-east-1"
+project_name = "picocompute"
+environment  = "staging"
+vpc_cidr     = "10.1.0.0/16"
+
+# Single revision for API image tag and compute-host assets.
+# CI must push ${ecr_url}:${commit} before apply.
+commit  = "CHANGEME-commit-sha"
+runtime = "firecracker"
+
+api_desired_count = 1
+
+instance_type = "m7i-flex.large"
+use_spot      = true
+
+ebs_volume_size = 50
+asg_min_size    = 1
+asg_max_size    = 3
+asg_desired_size = 1
+cpu_target_tracking_value = 70
+
+domain_name        = "api-stg.example.com"
+cloudflare_zone_id = "CHANGEME-zone-id"
+cloudflare_proxy_api = false
+
+alerts_email = ""
+
+key_pair_name     = null
+ssh_allowed_cidrs = []
+enable_ssm        = true
+
+# Must exist before apply. See infra/README.md SSM section.
+pico_api_token_parameter_name = "/pico/staging/api-token"
+
+asset_cache_prefix = "assets"
+idle_timeout_secs  = 3600
+
+enable_detective_controls = true
+
+db_engine_version              = "18.0"
+db_cluster_instance_count      = 1
+db_backup_retention_days       = 7
+db_auto_minor_version_upgrade  = true
+db_deletion_protection         = false
+performance_insights_retention_period = 7
+db_monitoring_interval         = 30
+
+enable_dashboard = true
+
+enable_observability = true
+otel_endpoint = "http://opentelemetry-collector.monitoring.svc.cluster.local:4317"

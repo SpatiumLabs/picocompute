@@ -5,13 +5,26 @@ provider "aws" {
 provider "cloudflare" {}
 
 provider "kubernetes" {
-  host                   = data.aws_eks_cluster.main.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.main.certificate_authority[0].data)
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
 
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
-    args        = ["eks", "get-token", "--cluster-name", data.aws_eks_cluster.main.name]
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
     command     = "aws"
+  }
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+      command     = "aws"
+    }
   }
 }
 
@@ -27,6 +40,22 @@ data "aws_partition" "current" {}
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
+  # Retries stay in the init container so a transient SSM error does not
+  # print the token. The file is what pico-api reads.
+  api_token_init_script = <<-EOT
+    set -eu
+    i=1
+    while [ "$i" -le 5 ]; do
+      if aws ssm get-parameter --name "$API_TOKEN_PARAM" --with-decryption --query Parameter.Value --output text --region "$AWS_REGION" > /token/value; then
+        chmod 0444 /token/value
+        exit 0
+      fi
+      sleep $((i * 2))
+      i=$((i + 1))
+    done
+    exit 1
+  EOT
+  pico_recording_rules  = yamldecode(file("${path.module}/../../../o11y/rules/pico-recording-rules.yaml")).spec
   common_tags = {
     Project     = var.project_name
     Environment = var.environment
@@ -807,13 +836,13 @@ resource "aws_iam_role" "api_irsa" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
-      Principal = { Federated = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${replace(data.aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}" }
-      Action = "sts:AssumeRoleWithWebIdentity"
+      Effect    = "Allow"
+      Principal = { Federated = module.eks.oidc_provider_arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringEquals = {
-          "${replace(data.aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:aud" = "sts.amazonaws.com"
-          "${replace(data.aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:api-stg:api"
+          "${replace(module.eks.oidc_provider_url, "https://", "")}:aud" = "sts.amazonaws.com"
+          "${replace(module.eks.oidc_provider_url, "https://", "")}:sub" = "system:serviceaccount:api:api"
         }
       }
     }]
@@ -823,8 +852,8 @@ resource "aws_iam_role" "api_irsa" {
 }
 
 resource "aws_iam_role_policy" "api_irsa" {
-  name   = "${local.name_prefix}-api-irsa"
-  role   = aws_iam_role.api_irsa.id
+  name = "${local.name_prefix}-api-irsa"
+  role = aws_iam_role.api_irsa.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -837,6 +866,17 @@ resource "aws_iam_role_policy" "api_irsa" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter"]
         Resource = ["arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter${var.pico_api_token_parameter_name}"]
+      },
+      {
+        # SecureString decrypt happens inside SSM. Do not copy the token into state.
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = ["*"]
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "ssm.${data.aws_region.current.region}.amazonaws.com"
+          }
+        }
       },
     ]
   })
@@ -935,24 +975,32 @@ resource "aws_cloudwatch_dashboard" "main" {
   })
 }
 
-# --- Staging uses production EKS cluster ---
+# --- Dedicated staging EKS cluster (decoupled from production) ---
 
-data "aws_eks_cluster" "main" {
-  name = "${var.project_name}-production"
-}
+module "eks" {
+  source = "../modules/pico-eks"
 
-data "aws_ecr_repository" "api" {
-  name = "${var.project_name}-api-production"
+  project_name       = var.project_name
+  environment        = var.environment
+  vpc_id             = module.vpc.vpc_id
+  private_subnet_ids = module.vpc.private_subnet_ids
+
+  fargate_namespaces = ["api", "monitoring"]
+
+  common_tags = local.common_tags
 }
 
 # --- Kubernetes Resources ---
+# Applying this root module retargets the Kubernetes provider at the new
+# cluster. It will not delete namespace api-stg on the production cluster.
+# Keep that namespace until scripts/retire-shared-staging.sh runs.
 
 resource "kubernetes_namespace" "api" {
   metadata {
-    name = "api-stg"
+    name = "api"
   }
 
-  depends_on = [data.aws_eks_cluster.main]
+  depends_on = [module.eks]
 }
 
 resource "kubernetes_deployment" "api" {
@@ -978,9 +1026,38 @@ resource "kubernetes_deployment" "api" {
       }
       spec {
         service_account_name = kubernetes_service_account.api.metadata[0].name
+        init_container {
+          name    = "api-token"
+          image   = "public.ecr.aws/aws-cli/aws-cli:2.22.35"
+          command = ["/bin/sh", "-c", local.api_token_init_script]
+          env {
+            name  = "API_TOKEN_PARAM"
+            value = var.pico_api_token_parameter_name
+          }
+          env {
+            name  = "AWS_REGION"
+            value = data.aws_region.current.region
+          }
+          env {
+            name  = "AWS_DEFAULT_REGION"
+            value = data.aws_region.current.region
+          }
+          resources {
+            requests = {
+              cpu    = "128m"
+              memory = "256Mi"
+            }
+          }
+          volume_mount {
+            name       = "api-token"
+            mount_path = "/token"
+          }
+        }
         container {
-          name  = "api"
-          image = "${data.aws_ecr_repository.api.repository_url}:latest"
+          name = "api"
+          # Immutable per-revision tag. CI must push
+          # ${module.eks.ecr_repository_url}:${var.commit} before apply.
+          image = "${module.eks.ecr_repository_url}:${var.commit}"
           port {
             container_port = 8080
           }
@@ -994,20 +1071,48 @@ resource "kubernetes_deployment" "api" {
             }
           }
           env {
-            name  = "ENVIRONMENT"
+            name  = "RUN_ENV"
+            value = "production"
+          }
+          env {
+            name  = "PICO_ENVIRONMENT"
             value = var.environment
           }
           env {
-            name  = "API_TOKEN_PARAM"
-            value = var.pico_api_token_parameter_name
+            name  = "PICO_RUNTIME"
+            value = var.runtime
           }
           env {
+            name  = "PICO_IDLE_TIMEOUT_SECS"
+            value = tostring(var.idle_timeout_secs)
+          }
+          env {
+            name  = "PICO_API_TOKEN_FILE"
+            value = "/token/value"
+          }
+          env {
+            # Metrics-only collector. Skip span export so the API does not retry traces.
+            name  = "OTEL_TRACES_EXPORTER"
+            value = "none"
+          }
+          volume_mount {
+            name       = "api-token"
+            mount_path = "/token"
+            read_only  = true
+          }
+          env {
+            # Reserved for future DB-backed control plane. Unused by pico-api today.
             name  = "DB_SECRET_ARN"
             value = aws_rds_cluster.main.master_user_secret[0].secret_arn
           }
           env {
             name  = "DB_PORT"
             value = "5432"
+          }
+          env {
+            # Empty when observability is off so the API does not export to a missing collector.
+            name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
+            value = var.enable_observability ? var.otel_endpoint : ""
           }
           liveness_probe {
             http_get {
@@ -1019,18 +1124,22 @@ resource "kubernetes_deployment" "api" {
           }
           readiness_probe {
             http_get {
-              path = "/v1/livez"
+              path = "/v1/readyz"
               port = 8080
             }
             initial_delay_seconds = 10
             period_seconds        = 5
           }
         }
+        volume {
+          name = "api-token"
+          empty_dir {}
+        }
       }
     }
   }
 
-  depends_on = [data.aws_eks_cluster.main]
+  depends_on = [module.eks]
 }
 
 resource "kubernetes_service_account" "api" {
@@ -1090,7 +1199,7 @@ resource "kubernetes_ingress_v1" "api" {
     }
   }
 
-  depends_on = [data.aws_eks_cluster.main]
+  depends_on = [module.eks]
 }
 
 resource "kubernetes_service" "api_nlb" {
@@ -1098,9 +1207,12 @@ resource "kubernetes_service" "api_nlb" {
     name      = "api-nlb"
     namespace = kubernetes_namespace.api.metadata[0].name
     annotations = {
-      "service.beta.kubernetes.io/aws-load-balancer-type"   = "nlb"
-      "service.beta.kubernetes.io/aws-load-balancer-scheme" = "internal"
-      "service.beta.kubernetes.io/aws-load-balancer-name"   = "${local.name_prefix}-api-nlb"
+      # external + ip registers Fargate pod IPs. type=nlb is the legacy
+      # instance/NodePort path, which has no targets on a Fargate-only cluster.
+      "service.beta.kubernetes.io/aws-load-balancer-type"            = "external"
+      "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type" = "ip"
+      "service.beta.kubernetes.io/aws-load-balancer-scheme"          = "internal"
+      "service.beta.kubernetes.io/aws-load-balancer-name"            = "${local.name_prefix}-api-nlb"
     }
   }
   spec {
@@ -1115,7 +1227,229 @@ resource "kubernetes_service" "api_nlb" {
     }
   }
 
-  depends_on = [data.aws_eks_cluster.main]
+  depends_on = [module.eks]
+}
+
+# --- Observability stack (staging self-hosted) ---
+# Prometheus + Grafana via kube-prometheus-stack. The collector accepts
+# OTLP metrics only. In-cluster pods use ClusterIP DNS. Compute hosts use
+# an internal IP-mode NLB. The controller manages the NLB-to-pod security
+# group; the internal NLB allows the VPC CIDR, which includes compute hosts.
+
+resource "kubernetes_namespace" "monitoring" {
+  count = var.enable_observability ? 1 : 0
+
+  metadata {
+    name = "monitoring"
+  }
+
+  depends_on = [module.eks]
+}
+
+resource "helm_release" "kube_prometheus_stack" {
+  count = var.enable_observability ? 1 : 0
+
+  name       = "kube-prometheus-stack"
+  namespace  = kubernetes_namespace.monitoring[0].metadata[0].name
+  repository = "https://prometheus-community.github.io/helm-charts"
+  chart      = "kube-prometheus-stack"
+  version    = "77.0.0"
+  timeout    = 900
+
+  # Fargate-compatible staging defaults: no DaemonSet node-exporter, no
+  # hostPath persistence, short retention. Recording rules are installed
+  # by this chart so plan does not need the PrometheusRule CRD up front.
+  values = [yamlencode({
+    nodeExporter = {
+      enabled = false
+    }
+    prometheus = {
+      prometheusSpec = {
+        retention                               = "6h"
+        storageSpec                             = null
+        serviceMonitorSelectorNilUsesHelmValues = false
+        podMonitorSelectorNilUsesHelmValues     = false
+        ruleSelectorNilUsesHelmValues           = false
+        resources = {
+          requests = {
+            cpu    = "200m"
+            memory = "512Mi"
+          }
+        }
+      }
+    }
+    alertmanager = {
+      enabled = true
+      alertmanagerSpec = {
+        resources = {
+          requests = {
+            cpu    = "50m"
+            memory = "128Mi"
+          }
+        }
+      }
+    }
+    grafana = {
+      enabled = true
+      resources = {
+        requests = {
+          cpu    = "100m"
+          memory = "256Mi"
+        }
+      }
+      sidecar = {
+        dashboards = {
+          enabled    = true
+          label      = "grafana_dashboard"
+          labelValue = "pico"
+        }
+      }
+    }
+    additionalPrometheusRulesMap = {
+      pico = local.pico_recording_rules
+    }
+  })]
+
+  depends_on = [module.eks]
+}
+
+resource "helm_release" "opentelemetry_collector" {
+  count = var.enable_observability ? 1 : 0
+
+  name       = "opentelemetry-collector"
+  namespace  = kubernetes_namespace.monitoring[0].metadata[0].name
+  repository = "https://open-telemetry.github.io/opentelemetry-helm-charts"
+  chart      = "opentelemetry-collector"
+  version    = "0.122.0"
+  timeout    = 600
+
+  # alternateConfig replaces chart defaults. config is merged, so a traces
+  # pipeline pointed at the metrics-only prometheus exporter would not start.
+  values = [yamlencode({
+    mode = "deployment"
+    resources = {
+      requests = {
+        cpu    = "100m"
+        memory = "256Mi"
+      }
+      limits = {
+        memory = "512Mi"
+      }
+    }
+    service = {
+      enabled = true
+      type    = "LoadBalancer"
+      annotations = {
+        "service.beta.kubernetes.io/aws-load-balancer-type"            = "external"
+        "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type" = "ip"
+        "service.beta.kubernetes.io/aws-load-balancer-scheme"          = "internal"
+        "service.beta.kubernetes.io/aws-load-balancer-name"            = "${local.name_prefix}-otel"
+      }
+    }
+    alternateConfig = {
+      extensions = {
+        health_check = {
+          endpoint = "0.0.0.0:13133"
+        }
+      }
+      receivers = {
+        otlp = {
+          protocols = {
+            grpc = { endpoint = "0.0.0.0:4317" }
+            http = { endpoint = "0.0.0.0:4318" }
+          }
+        }
+      }
+      processors = {
+        batch = {}
+        memory_limiter = {
+          check_interval         = "5s"
+          limit_percentage       = 80
+          spike_limit_percentage = 25
+        }
+      }
+      exporters = {
+        prometheus = {
+          endpoint            = "0.0.0.0:8889"
+          add_metric_suffixes = false
+        }
+      }
+      service = {
+        extensions = ["health_check"]
+        pipelines = {
+          metrics = {
+            receivers  = ["otlp"]
+            processors = ["memory_limiter", "batch"]
+            exporters  = ["prometheus"]
+          }
+        }
+      }
+    }
+    ports = {
+      jaeger-compact = { enabled = false }
+      jaeger-thrift  = { enabled = false }
+      jaeger-grpc    = { enabled = false }
+      zipkin         = { enabled = false }
+      prometheus = {
+        enabled       = true
+        containerPort = 8889
+        servicePort   = 8889
+        protocol      = "TCP"
+      }
+    }
+    serviceMonitor = {
+      enabled = true
+      metricsEndpoints = [
+        {
+          port = "prometheus"
+          path = "/metrics"
+        },
+      ]
+      extraLabels = {
+        release = "kube-prometheus-stack"
+      }
+    }
+  })]
+
+  # ServiceMonitor CRD comes from kube-prometheus-stack. Helm does not
+  # plan-time check CRDs, but the release fails if the CRD is missing.
+  depends_on = [helm_release.kube_prometheus_stack]
+}
+
+# Grafana sidecar picks up ConfigMaps labelled grafana_dashboard=pico.
+resource "kubernetes_config_map" "grafana_dashboards" {
+  count = var.enable_observability ? 1 : 0
+
+  metadata {
+    name      = "pico-dashboards"
+    namespace = kubernetes_namespace.monitoring[0].metadata[0].name
+    labels = {
+      grafana_dashboard = "pico"
+    }
+  }
+
+  data = {
+    for f in fileset("${path.module}/../../../o11y", "*.json") :
+    f => file("${path.module}/../../../o11y/${f}")
+  }
+
+  depends_on = [module.eks]
+}
+
+# Internal NLB fronting the collector (created by the chart Service).
+# The LB controller provisions asynchronously.
+resource "time_sleep" "wait_for_otel" {
+  count = var.enable_observability ? 1 : 0
+
+  depends_on      = [helm_release.opentelemetry_collector]
+  create_duration = "120s"
+}
+
+data "aws_lb" "otel" {
+  count = var.enable_observability ? 1 : 0
+
+  depends_on = [time_sleep.wait_for_otel]
+  name       = "${local.name_prefix}-otel"
 }
 
 # --- Compute Host Module ---
@@ -1149,7 +1483,12 @@ module "compute_host" {
   idle_timeout_secs       = var.idle_timeout_secs
   additional_kms_key_arns = [aws_kms_key.artifacts.arn, aws_kms_key.snapshots.arn]
 
-  control_plane_security_group_id = data.aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+  # Host OTLP via the internal collector NLB. Empty keeps local no-export.
+  # IP-mode NLB, client IP not preserved. Controller opens the pod security
+  # group to the NLB. Internal scheme allows the VPC CIDR, including hosts.
+  otel_endpoint = var.enable_observability ? "http://${data.aws_lb.otel[0].dns_name}:4317" : ""
+
+  control_plane_security_group_id = module.eks.cluster_security_group_id
   alarm_sns_topic_arn             = aws_sns_topic.alarms.arn
 }
 
@@ -1161,7 +1500,7 @@ resource "aws_vpc_security_group_ingress_rule" "db_postgres_from_eks" {
   from_port                    = 5432
   to_port                      = 5432
   ip_protocol                  = "tcp"
-  referenced_security_group_id = data.aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+  referenced_security_group_id = module.eks.cluster_security_group_id
 }
 
 # --- API Gateway (REST) ---

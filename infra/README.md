@@ -18,9 +18,19 @@ pip install diagrams
 python infra/docs/diagrams/aws-architecture.py
 ```
 
-### Staging on Production EKS
+### Staging on Dedicated EKS
 
-Staging reuses the production EKS cluster (discovered via `data.aws_eks_cluster`) with namespace `api-stg`. This saves ~$72/month but creates a coupling risk — a production EKS outage affects staging. For isolated staging, deploy a dedicated EKS cluster.
+Staging runs a dedicated EKS cluster (`picocompute-staging`) with namespace `api` and its own ECR repository (`picocompute-api-staging`). Production no longer hosts the staging namespace. API images are pinned per revision (`${ecr_url}:${var.commit}`); CI must push that tag before apply. The API token is read from SSM at pod start via IRSA (`PICO_API_TOKEN_FILE`); Terraform does not decrypt it into state.
+
+### Cut over from shared staging
+
+Staging state used to own namespace `api-stg` on the production cluster. Applying the staging root module retargets the Kubernetes provider at the new cluster, so Terraform will not delete those objects. Production keeps the `api-stg` Fargate selector until `retire_shared_staging_namespace=true`.
+
+1. Apply staging and confirm the new API and collector are healthy.
+2. Delete the old namespace: `scripts/retire-shared-staging.sh`
+3. Set `retire_shared_staging_namespace=true` in production tfvars and apply production.
+
+Do not set that flag before step 2. Removing the selector while `api-stg` still runs leaves rescheduled pods Pending.
 
 ### Architecture Evolution
 
@@ -118,12 +128,18 @@ Each environment directory is a standalone Terraform root module with its own st
 | API runtime | EKS Fargate (256m CPU / 512 MiB) | EKS Fargate (256m CPU / 512 MiB) |
 | API entry | REST API Gateway → VPC Link → NLB | REST API Gateway → VPC Link → NLB |
 | API desired count | 1 | 2 |
-| EKS cluster | Shared with production | Dedicated pico-production |
+| EKS cluster | Dedicated pico-staging | Dedicated pico-production |
+| ECR repository | Dedicated pico-api-staging (`:${var.commit}`) | Dedicated pico-api-production (`:${var.commit}`) |
 | Compute host instance | `m7i-flex.large` (spot) | `m7i.4xlarge` (spot) |
 | Compute ASG sizing | 1/1/3 | 1/1/9 |
 | Database | Aurora Serverless v2 (0.5-4 ACU) | Aurora PostgreSQL 18 (2 instances) |
 | NAT Gateway | Regional | Regional |
 | VPC CIDR | `10.1.0.0/16` | `10.0.0.0/16` |
+| Observability | kube-prometheus-stack + OTel collector (`monitoring` ns) | CloudWatch only |
+
+## Observability (staging)
+
+Staging deploys `kube-prometheus-stack` (chart 77.0.0) and `opentelemetry-collector` (chart 0.122.0) into namespace `monitoring` when `enable_observability=true`. The Fargate profile always includes `kube-system` so CoreDNS and the load balancer controller can schedule. Grafana dashboards load from `o11y/*.json` via ConfigMap. Recording rules from `o11y/rules/pico-recording-rules.yaml` are installed by the kube-prometheus-stack chart (not a standalone manifest, which cannot plan before the CRD exists). The collector is metrics-only: OTLP metrics are exposed on `:8889` and scraped by a ServiceMonitor. Span export is disabled (`OTEL_TRACES_EXPORTER=none`). `pico-api` exports OTLP to `var.otel_endpoint` (ClusterIP DNS, in-cluster) only when observability is enabled. Compute hosts export via an internal IP-mode NLB (`${project}-staging-otel:4317`). The controller opens the pod security group to that NLB; the internal scheme allows the VPC CIDR. Empty endpoint keeps local no-export.
 
 ## Prerequisites
 
@@ -185,11 +201,15 @@ Note the state key path includes the environment name (`aws/production/` or `aws
 ```bash
 cd infra/aws/production  # or infra/aws/staging
 
+# Copy and fill inputs (no secrets in the sample)
+cp terraform.tfvars.sample terraform.tfvars
+# Edit commit, domain_name, cloudflare_zone_id, token param, sizing
+
 # Initialize with backend config
-terraform init -backend-config=backend.r2.hcl
+terraform init -backend-config=backend.s3.hcl
 
 # Create or migrate state
-terraform init -backend-config=backend.r2.hcl -migrate-state
+terraform init -backend-config=backend.s3.hcl -migrate-state
 
 # Review the plan
 terraform fmt && terraform validate && terraform plan

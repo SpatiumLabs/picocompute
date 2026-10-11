@@ -92,3 +92,13 @@ output "cloudtrail_arn" {
   description = "CloudTrail ARN."
   value       = try(aws_cloudtrail.main[0].arn, null)
 }
+
+output "api_url" {
+  description = "API Gateway stage URL."
+  value       = aws_api_gateway_stage.main.invoke_url
+}
+
+output "api_custom_domain" {
+  description = "Custom domain for the API."
+  value       = var.domain_name
+}

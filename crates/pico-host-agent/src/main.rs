@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
     let config =
         HostAgentConfig::from_file_or_env().context("failed to load host-agent configuration")?;
 
+    let otlp_endpoint = otlp_endpoint_from_env();
     let telemetry_config = pico_telemetry::TelemetryConfig {
         settings: &pico_telemetry::TelemetrySettings {
             log: pico_telemetry::LogSettings {
@@ -45,9 +46,18 @@ async fn main() -> Result<()> {
             },
             metrics: pico_telemetry::MetricsSettings {
                 service_name: "pico-host-agent".to_string(),
-                ..Default::default()
+                otlp_endpoint: otlp_endpoint.clone(),
+                export_interval_secs: 60,
+                resource_attributes: vec![
+                    ("host_id".to_string(), config.identity.host_id.clone()),
+                    ("cell_id".to_string(), config.identity.cell_id.clone()),
+                    ("region".to_string(), config.identity.region.clone()),
+                ],
             },
-            ..Default::default()
+            tracing: pico_telemetry::TracingSettings {
+                otlp_endpoint: tracing_endpoint_from_env(&otlp_endpoint),
+                sample_rate: 1.0,
+            },
         },
     };
 
@@ -365,6 +375,21 @@ fn init_seccomp() {
     // Network agent still co-resides; runtime adapters no longer link into
     // host-agent after the sandboxd cutover.
     pico_network_agent::init_seccomp();
+}
+
+/// OTLP gRPC collector endpoint. Empty means no export (local dev default).
+fn otlp_endpoint_from_env() -> String {
+    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Span export uses the metrics endpoint unless `OTEL_TRACES_EXPORTER=none`.
+fn tracing_endpoint_from_env(metrics_endpoint: &str) -> String {
+    match std::env::var("OTEL_TRACES_EXPORTER") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("none") => String::new(),
+        _ => metrics_endpoint.to_string(),
+    }
 }
 
 async fn shutdown_signal(agent: AppState, drain_timeout_secs: u64) {

@@ -27,6 +27,21 @@ data "aws_partition" "current" {}
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
+  # Retries stay in the init container so a transient SSM error does not
+  # print the token. The file is what pico-api reads.
+  api_token_init_script = <<-EOT
+    set -eu
+    i=1
+    while [ "$i" -le 5 ]; do
+      if aws ssm get-parameter --name "$API_TOKEN_PARAM" --with-decryption --query Parameter.Value --output text --region "$AWS_REGION" > /token/value; then
+        chmod 0444 /token/value
+        exit 0
+      fi
+      sleep $((i * 2))
+      i=$((i + 1))
+    done
+    exit 1
+  EOT
   common_tags = {
     Project     = var.project_name
     Environment = var.environment
@@ -835,6 +850,17 @@ resource "aws_iam_role_policy" "api_irsa" {
         Action   = ["ssm:GetParameter"]
         Resource = ["arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter${var.pico_api_token_parameter_name}"]
       },
+      {
+        # SecureString decrypt happens inside SSM. Do not copy the token into state.
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = ["*"]
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "ssm.${data.aws_region.current.region}.amazonaws.com"
+          }
+        }
+      },
     ]
   })
 }
@@ -942,7 +968,12 @@ module "eks" {
   vpc_id             = module.vpc.vpc_id
   private_subnet_ids = module.vpc.private_subnet_ids
 
-  fargate_namespaces = ["api", "api-stg"]
+  # api-stg stays until the dedicated staging cluster is serving and
+  # scripts/retire-shared-staging.sh has deleted that namespace.
+  fargate_namespaces = concat(
+    ["api"],
+    var.retire_shared_staging_namespace ? [] : ["api-stg"],
+  )
 
   common_tags = local.common_tags
 }
@@ -957,6 +988,8 @@ resource "kubernetes_namespace" "api" {
   depends_on = [module.eks]
 }
 
+# API token is read from SSM at pod start via IRSA. Terraform never
+# decrypts it, so the bearer token is not stored in state.
 resource "kubernetes_deployment" "api" {
   metadata {
     name      = "api"
@@ -980,9 +1013,38 @@ resource "kubernetes_deployment" "api" {
       }
       spec {
         service_account_name = kubernetes_service_account.api.metadata[0].name
+        init_container {
+          name    = "api-token"
+          image   = "public.ecr.aws/aws-cli/aws-cli:2.22.35"
+          command = ["/bin/sh", "-c", local.api_token_init_script]
+          env {
+            name  = "API_TOKEN_PARAM"
+            value = var.pico_api_token_parameter_name
+          }
+          env {
+            name  = "AWS_REGION"
+            value = data.aws_region.current.region
+          }
+          env {
+            name  = "AWS_DEFAULT_REGION"
+            value = data.aws_region.current.region
+          }
+          resources {
+            requests = {
+              cpu    = "128m"
+              memory = "256Mi"
+            }
+          }
+          volume_mount {
+            name       = "api-token"
+            mount_path = "/token"
+          }
+        }
         container {
-          name  = "api"
-          image = "${module.eks.ecr_repository_url}:latest"
+          name = "api"
+          # Immutable per-revision tag. CI must push
+          # ${module.eks.ecr_repository_url}:${var.commit} before apply.
+          image = "${module.eks.ecr_repository_url}:${var.commit}"
           port {
             container_port = 8080
           }
@@ -996,14 +1058,32 @@ resource "kubernetes_deployment" "api" {
             }
           }
           env {
-            name  = "ENVIRONMENT"
+            name  = "RUN_ENV"
+            value = "production"
+          }
+          env {
+            name  = "PICO_ENVIRONMENT"
             value = var.environment
           }
           env {
-            name  = "API_TOKEN_PARAM"
-            value = var.pico_api_token_parameter_name
+            name  = "PICO_RUNTIME"
+            value = var.runtime
           }
           env {
+            name  = "PICO_IDLE_TIMEOUT_SECS"
+            value = tostring(var.idle_timeout_secs)
+          }
+          env {
+            name  = "PICO_API_TOKEN_FILE"
+            value = "/token/value"
+          }
+          volume_mount {
+            name       = "api-token"
+            mount_path = "/token"
+            read_only  = true
+          }
+          env {
+            # Reserved for future DB-backed control plane. Unused by pico-api today.
             name  = "DB_SECRET_ARN"
             value = aws_rds_cluster.main.master_user_secret[0].secret_arn
           }
@@ -1021,12 +1101,16 @@ resource "kubernetes_deployment" "api" {
           }
           readiness_probe {
             http_get {
-              path = "/v1/livez"
+              path = "/v1/readyz"
               port = 8080
             }
             initial_delay_seconds = 10
             period_seconds        = 5
           }
+        }
+        volume {
+          name = "api-token"
+          empty_dir {}
         }
       }
     }
@@ -1100,9 +1184,12 @@ resource "kubernetes_service" "api_nlb" {
     name      = "api-nlb"
     namespace = kubernetes_namespace.api.metadata[0].name
     annotations = {
-      "service.beta.kubernetes.io/aws-load-balancer-type"   = "nlb"
-      "service.beta.kubernetes.io/aws-load-balancer-scheme" = "internal"
-      "service.beta.kubernetes.io/aws-load-balancer-name"   = "${local.name_prefix}-api-nlb"
+      # external + ip registers Fargate pod IPs. type=nlb is the legacy
+      # instance/NodePort path, which has no targets on a Fargate-only cluster.
+      "service.beta.kubernetes.io/aws-load-balancer-type"            = "external"
+      "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type" = "ip"
+      "service.beta.kubernetes.io/aws-load-balancer-scheme"          = "internal"
+      "service.beta.kubernetes.io/aws-load-balancer-name"            = "${local.name_prefix}-api-nlb"
     }
   }
   spec {

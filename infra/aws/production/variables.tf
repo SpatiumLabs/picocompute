@@ -139,6 +139,12 @@ variable "enable_detective_controls" {
   default     = false
 }
 
+variable "retire_shared_staging_namespace" {
+  description = "Drop the api-stg Fargate selector left from shared staging. Set true only after scripts/retire-shared-staging.sh deletes that namespace."
+  type        = bool
+  default     = false
+}
+
 # --- Database (Aurora PostgreSQL) ---
 
 variable "db_cluster_instance_class" {

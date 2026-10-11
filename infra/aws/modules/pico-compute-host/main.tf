@@ -19,6 +19,7 @@ locals {
     asset_cache_prefix = var.asset_cache_prefix
     commit             = var.commit
     environment        = var.environment
+    otel_endpoint      = var.otel_endpoint
   })
 }
 
@@ -73,7 +74,10 @@ data "aws_ami" "ubuntu" {
 }
 
 locals {
-  ami_id = data.aws_ami.pico.id != "" ? data.aws_ami.pico.id : data.aws_ami.ubuntu.id
+  # Fail closed when the Packer AMI is missing. Do not silently fall back
+  # to vanilla Ubuntu: it lacks Firecracker/KVM setup and would fail
+  # bootstrap preconditions. Build infra/packer/compute-host.pkr.hcl first.
+  ami_id = data.aws_ami.picocompute.id
 }
 
 # --- Security Group ---
