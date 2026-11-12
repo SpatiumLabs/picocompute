@@ -141,3 +141,15 @@ variable "otel_endpoint" {
   type        = string
   default     = ""
 }
+
+variable "cell_id" {
+  description = "Cell identifier exported to the host agent as PICO_CELL_ID."
+  type        = string
+  default     = "default-cell"
+}
+
+variable "region" {
+  description = "Region identifier exported to the host agent as PICO_REGION. Empty uses the provider region."
+  type        = string
+  default     = ""
+}

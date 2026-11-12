@@ -20,6 +20,8 @@ locals {
     commit             = var.commit
     environment        = var.environment
     otel_endpoint      = var.otel_endpoint
+    cell_id            = var.cell_id
+    region             = var.region != "" ? var.region : data.aws_region.current.region
   })
 }
 

@@ -40,6 +40,8 @@ data "aws_partition" "current" {}
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
+  # Shared by the API and compute hosts so telemetry joins on the same cell.
+  cell_id = "cel_${var.environment}"
   # Retries stay in the init container so a transient SSM error does not
   # print the token. The file is what pico-api reads.
   api_token_init_script = <<-EOT
@@ -1079,6 +1081,14 @@ resource "kubernetes_deployment" "api" {
             value = var.environment
           }
           env {
+            name  = "PICO_CELL_ID"
+            value = local.cell_id
+          }
+          env {
+            name  = "PICO_REGION"
+            value = var.aws_region
+          }
+          env {
             name  = "PICO_RUNTIME"
             value = var.runtime
           }
@@ -1372,6 +1382,11 @@ resource "helm_release" "opentelemetry_collector" {
         prometheus = {
           endpoint            = "0.0.0.0:8889"
           add_metric_suffixes = false
+          # Promote cell, region, service.instance.id (and the rest of the
+          # OTLP resource) to Prometheus labels so hosts do not collapse.
+          resource_to_telemetry_conversion = {
+            enabled = true
+          }
         }
       }
       service = {
@@ -1441,7 +1456,11 @@ resource "kubernetes_config_map" "grafana_dashboards" {
 resource "time_sleep" "wait_for_otel" {
   count = var.enable_observability ? 1 : 0
 
-  depends_on      = [helm_release.opentelemetry_collector]
+  depends_on = [helm_release.opentelemetry_collector]
+  # Wait again after a chart or values change, not just on first create.
+  triggers = {
+    manifest_sha = sha1(helm_release.opentelemetry_collector[0].manifest)
+  }
   create_duration = "120s"
 }
 
@@ -1477,6 +1496,8 @@ module "compute_host" {
   domain_name = var.domain_name
   runtime     = var.runtime
   commit      = var.commit
+  cell_id     = local.cell_id
+  region      = var.aws_region
 
   asset_cache_bucket      = aws_s3_bucket.artifacts.id
   asset_cache_prefix      = var.asset_cache_prefix
@@ -1514,7 +1535,12 @@ resource "aws_api_gateway_rest_api" "main" {
 }
 
 resource "time_sleep" "wait_for_nlb" {
-  depends_on      = [kubernetes_service.api_nlb]
+  depends_on = [kubernetes_service.api_nlb]
+  # Re-read the LB after the Service changes so a controller migration does
+  # not pin the VPC link to the old NLB ARN.
+  triggers = {
+    service_resource_version = kubernetes_service.api_nlb.metadata[0].resource_version
+  }
   create_duration = "120s"
 }
 
@@ -1524,9 +1550,14 @@ data "aws_lb" "api_nlb" {
 }
 
 resource "aws_api_gateway_vpc_link" "main" {
-  name        = "${local.name_prefix}-vpc-link"
+  # Name tracks the NLB so the replacement and the old link can coexist.
+  name        = "${local.name_prefix}-vpc-link-${substr(sha1(data.aws_lb.api_nlb.arn), 0, 8)}"
   target_arns = [data.aws_lb.api_nlb.arn]
   tags        = local.common_tags
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_api_gateway_resource" "proxy" {
@@ -1581,6 +1612,8 @@ resource "aws_api_gateway_deployment" "main" {
     redeployment = sha1(jsonencode([
       aws_api_gateway_integration.root.id,
       aws_api_gateway_integration.proxy.id,
+      aws_api_gateway_vpc_link.main.id,
+      data.aws_lb.api_nlb.arn,
     ]))
   }
 }

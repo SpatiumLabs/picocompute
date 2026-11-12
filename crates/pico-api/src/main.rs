@@ -44,10 +44,18 @@ async fn main() -> Result<()> {
                 service_name: "pico-api".to_string(),
                 otlp_endpoint: otlp_endpoint.clone(),
                 export_interval_secs: 60,
-                resource_attributes: vec![(
-                    "environment".to_string(),
-                    pico_api::telemetry_environment(config.run_env),
-                )],
+                resource_attributes: vec![
+                    (
+                        "environment".to_string(),
+                        pico_api::telemetry_environment(config.run_env),
+                    ),
+                    ("cell".to_string(), pico_api::telemetry_cell_id()),
+                    ("region".to_string(), pico_api::telemetry_region()),
+                    (
+                        "service.instance.id".to_string(),
+                        pico_api::telemetry_instance_id(),
+                    ),
+                ],
             },
             tracing: pico_telemetry::TracingSettings {
                 otlp_endpoint: tracing_endpoint_from_env(&otlp_endpoint),
@@ -159,10 +167,12 @@ async fn build_state(config: &AppConfig) -> Result<Arc<dyn SandboxService>> {
 /// Generous static capacity so local development keeps admitting without
 /// host reports.
 fn seed_stub_registry(gate: &Arc<PlacementGate>) {
+    let cell_id = pico_api::telemetry_cell_id();
+    let region = pico_api::telemetry_region();
     let registry = gate.registry();
     registry.upsert_cell(CellInfo {
-        cell_id: CellId::from_string("cel_default"),
-        region_id: RegionId::from_string("default-region"),
+        cell_id: CellId::from_string(&cell_id),
+        region_id: RegionId::from_string(&region),
         health: CellHealth::Healthy,
         capacity: CellCapacity {
             total_vcpus: 64,
@@ -174,7 +184,7 @@ fn seed_stub_registry(gate: &Arc<PlacementGate>) {
             be_pool: None,
         },
         supported_runtimes: vec![RuntimeType::Firecracker, RuntimeType::Qemu],
-        failure_domain: "fd-cel_default".into(),
+        failure_domain: format!("fd-{cell_id}"),
         cache: CacheLocality {
             cached_images: Vec::new(),
             cached_snapshots: Vec::new(),
@@ -185,8 +195,8 @@ fn seed_stub_registry(gate: &Arc<PlacementGate>) {
     gate.report_host(
         &HostCapacityReport {
             host_id: "hst_stub".into(),
-            cell_id: "cel_default".into(),
-            region: Some("default-region".into()),
+            cell_id: cell_id.clone(),
+            region: Some(region.clone()),
             health: HostHealth::Healthy,
             capacity: HostCapacity {
                 total_vcpus: 32,

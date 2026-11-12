@@ -172,6 +172,24 @@ pub fn telemetry_environment(run_env: RunEnv) -> String {
     read_env("PICO_ENVIRONMENT").unwrap_or_else(|| run_env.as_str().to_string())
 }
 
+/// Cell identifier attached to API telemetry and the stub placement registry.
+pub fn telemetry_cell_id() -> String {
+    read_env("PICO_CELL_ID").unwrap_or_else(|| "cel_default".into())
+}
+
+/// Region identifier attached to API telemetry and the stub placement registry.
+pub fn telemetry_region() -> String {
+    read_env("PICO_REGION").unwrap_or_else(|| "default-region".into())
+}
+
+/// Unique process instance for `service.instance.id`.
+///
+/// Kubernetes sets `HOSTNAME` to the pod name, so replicas stay distinct.
+/// Local runs fall back to the process ID.
+pub fn telemetry_instance_id() -> String {
+    read_env("HOSTNAME").unwrap_or_else(|| format!("pico-api-{}", std::process::id()))
+}
+
 fn read_env_os(key: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(key).filter(|value| !value.is_empty())
 }

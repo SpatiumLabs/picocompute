@@ -4,7 +4,8 @@ environment  = "staging"
 vpc_cidr     = "10.1.0.0/16"
 
 # Single revision for API image tag and compute-host assets.
-# CI must push ${ecr_url}:${commit} before apply.
+# Run `mise run infra:bootstrap:staging` to create the ECR repository, then
+# push ${ecr_url}:${commit} before the full apply.
 commit  = "CHANGEME-commit-sha"
 runtime = "firecracker"
 

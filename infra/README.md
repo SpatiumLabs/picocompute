@@ -20,17 +20,24 @@ python infra/docs/diagrams/aws-architecture.py
 
 ### Staging on Dedicated EKS
 
-Staging runs a dedicated EKS cluster (`picocompute-staging`) with namespace `api` and its own ECR repository (`picocompute-api-staging`). Production no longer hosts the staging namespace. API images are pinned per revision (`${ecr_url}:${var.commit}`); CI must push that tag before apply. The API token is read from SSM at pod start via IRSA (`PICO_API_TOKEN_FILE`); Terraform does not decrypt it into state.
+Staging runs a dedicated EKS cluster (`picocompute-staging`) with namespace `api` and its own ECR repository (`picocompute-api-staging`). Production no longer hosts the staging namespace after cutover. API images are pinned per revision (`${ecr_url}:${var.commit}`); CI must push that tag before apply. The API token is read from SSM at pod start via IRSA (`PICO_API_TOKEN_FILE`); Terraform does not decrypt it into state.
+
+### Bootstrap staging ECR
+
+The API deployment uses an immutable revision tag, so the staging ECR repository must exist before the first full apply:
+
+1. Create the repository without creating the cluster or API deployment: `mise run infra:bootstrap:staging`
+2. Build and push `${ecr_url}:${commit}` (CI does this normally). Read the URL with `terraform -chdir=infra/aws/staging output -raw ecr_repository_url`.
+3. Run the full apply: `mise run infra:apply:staging`
+
+The targeted bootstrap apply manages only `module.eks.aws_ecr_repository.api`; the full apply later creates the cluster and pulls the tag pushed in step 2.
 
 ### Cut over from shared staging
 
-Staging state used to own namespace `api-stg` on the production cluster. Applying the staging root module retargets the Kubernetes provider at the new cluster, so Terraform will not delete those objects. Production keeps the `api-stg` Fargate selector until `retire_shared_staging_namespace=true`.
+Staging state used to own namespace `api-stg` on the production cluster. Applying the staging root module retargets the Kubernetes provider at the new cluster, so Terraform will not delete those objects. Production keeps `api-stg` in its Fargate selectors permanently: selecting a namespace that no longer exists has no effect, and a stable selector list avoids replacing the profile that runs the production API.
 
 1. Apply staging and confirm the new API and collector are healthy.
 2. Delete the old namespace: `scripts/retire-shared-staging.sh`
-3. Set `retire_shared_staging_namespace=true` in production tfvars and apply production.
-
-Do not set that flag before step 2. Removing the selector while `api-stg` still runs leaves rescheduled pods Pending.
 
 ### Architecture Evolution
 
@@ -139,7 +146,7 @@ Each environment directory is a standalone Terraform root module with its own st
 
 ## Observability (staging)
 
-Staging deploys `kube-prometheus-stack` (chart 77.0.0) and `opentelemetry-collector` (chart 0.122.0) into namespace `monitoring` when `enable_observability=true`. The Fargate profile always includes `kube-system` so CoreDNS and the load balancer controller can schedule. Grafana dashboards load from `o11y/*.json` via ConfigMap. Recording rules from `o11y/rules/pico-recording-rules.yaml` are installed by the kube-prometheus-stack chart (not a standalone manifest, which cannot plan before the CRD exists). The collector is metrics-only: OTLP metrics are exposed on `:8889` and scraped by a ServiceMonitor. Span export is disabled (`OTEL_TRACES_EXPORTER=none`). `pico-api` exports OTLP to `var.otel_endpoint` (ClusterIP DNS, in-cluster) only when observability is enabled. Compute hosts export via an internal IP-mode NLB (`${project}-staging-otel:4317`). The controller opens the pod security group to that NLB; the internal scheme allows the VPC CIDR. Empty endpoint keeps local no-export.
+Staging deploys `kube-prometheus-stack` (chart 77.0.0) and `opentelemetry-collector` (chart 0.122.0) into namespace `monitoring` when `enable_observability=true`. A dedicated `system` Fargate profile always includes `kube-system` so CoreDNS and the load balancer controller can schedule; the workload profile keeps only application namespaces (production `api` and `api-stg`, staging `api` and `monitoring`). Grafana dashboards load from `o11y/*.json` via ConfigMap. Recording rules from `o11y/rules/pico-recording-rules.yaml` are installed by the kube-prometheus-stack chart (not a standalone manifest, which cannot plan before the CRD exists). The collector is metrics-only: OTLP metrics are exposed on `:8889` and scraped by a ServiceMonitor. Span export is disabled (`OTEL_TRACES_EXPORTER=none`). API and host-agent resources carry `cell`, `region`, and `service.instance.id`; the collector promotes resource attributes to Prometheus labels so replicas and hosts stay distinct. `pico-api` exports OTLP to `var.otel_endpoint` (ClusterIP DNS, in-cluster) only when observability is enabled. Compute hosts export via an internal IP-mode NLB (`${project}-staging-otel:4317`). The controller opens the pod security group to that NLB; the internal scheme allows the VPC CIDR. Empty endpoint keeps local no-export.
 
 ## Prerequisites
 
@@ -167,27 +174,21 @@ aws ssm put-parameter --region us-east-1 --name /pico/staging/github-deploy-key 
 
 ### Cloudflare R2 Backend
 
-Create a Cloudflare R2 API token with object read/write access. Store it in a separate AWS credentials profile:
+Create a Cloudflare R2 API token with object read/write access. Store it in an AWS credentials profile named `r2`, which is what the tracked backend files reference:
 
 ```ini
-[cloudflare-r2]
+[r2]
 aws_access_key_id = <r2-access-key-id>
 aws_secret_access_key = <r2-secret-access-key>
 ```
 
-Copy the per-environment backend config and set your Cloudflare account ID:
-
-```bash
-cp infra/aws/production/backend.s3.hcl infra/aws/production/backend.r2.hcl
-```
-
-Edit the `backend.r2.hcl` per environment:
+Each environment has a tracked `backend.s3.hcl` with its own state key and the R2 endpoint. If you fork the repository for another Cloudflare account, update the `bucket` and `endpoints` values in both files. The remaining settings are:
 
 ```hcl
-bucket = "pico-terraform-state"
-key    = "aws/production/terraform.tfstate"
-region = "auto"
-profile = "cloudflare-r2"
+bucket  = "pico-terraform-state"
+key     = "aws/production/terraform.tfstate"
+region  = "auto"
+profile = "r2"
 shared_credentials_files = ["~/.aws/credentials"]
 endpoints = {
   s3 = "https://<cloudflare-account-id>.r2.cloudflarestorage.com"

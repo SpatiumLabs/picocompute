@@ -27,6 +27,8 @@ data "aws_partition" "current" {}
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
+  # Shared by the API and compute hosts so telemetry joins on the same cell.
+  cell_id = "cel_${var.environment}"
   # Retries stay in the init container so a transient SSM error does not
   # print the token. The file is what pico-api reads.
   api_token_init_script = <<-EOT
@@ -968,12 +970,10 @@ module "eks" {
   vpc_id             = module.vpc.vpc_id
   private_subnet_ids = module.vpc.private_subnet_ids
 
-  # api-stg stays until the dedicated staging cluster is serving and
-  # scripts/retire-shared-staging.sh has deleted that namespace.
-  fargate_namespaces = concat(
-    ["api"],
-    var.retire_shared_staging_namespace ? [] : ["api-stg"],
-  )
+  # api-stg is retained after the dedicated staging cutover. Selecting a
+  # deleted namespace has no effect, and keeping the list stable avoids a
+  # ForceNew replacement of the profile that runs the production API.
+  fargate_namespaces = ["api", "api-stg"]
 
   common_tags = local.common_tags
 }
@@ -1064,6 +1064,14 @@ resource "kubernetes_deployment" "api" {
           env {
             name  = "PICO_ENVIRONMENT"
             value = var.environment
+          }
+          env {
+            name  = "PICO_CELL_ID"
+            value = local.cell_id
+          }
+          env {
+            name  = "PICO_REGION"
+            value = var.aws_region
           }
           env {
             name  = "PICO_RUNTIME"
@@ -1232,6 +1240,8 @@ module "compute_host" {
   domain_name = var.domain_name
   runtime     = var.runtime
   commit      = var.commit
+  cell_id     = local.cell_id
+  region      = var.aws_region
 
   asset_cache_bucket      = aws_s3_bucket.artifacts.id
   asset_cache_prefix      = var.asset_cache_prefix
@@ -1264,7 +1274,12 @@ resource "aws_api_gateway_rest_api" "main" {
 }
 
 resource "time_sleep" "wait_for_nlb" {
-  depends_on      = [kubernetes_service.api_nlb]
+  depends_on = [kubernetes_service.api_nlb]
+  # Re-read the LB after the Service changes so a controller migration does
+  # not pin the VPC link to the old NLB ARN.
+  triggers = {
+    service_resource_version = kubernetes_service.api_nlb.metadata[0].resource_version
+  }
   create_duration = "120s"
 }
 
@@ -1274,9 +1289,14 @@ data "aws_lb" "api_nlb" {
 }
 
 resource "aws_api_gateway_vpc_link" "main" {
-  name        = "${local.name_prefix}-vpc-link"
+  # Name tracks the NLB so the replacement and the old link can coexist.
+  name        = "${local.name_prefix}-vpc-link-${substr(sha1(data.aws_lb.api_nlb.arn), 0, 8)}"
   target_arns = [data.aws_lb.api_nlb.arn]
   tags        = local.common_tags
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_api_gateway_resource" "proxy" {
@@ -1331,6 +1351,8 @@ resource "aws_api_gateway_deployment" "main" {
     redeployment = sha1(jsonencode([
       aws_api_gateway_integration.root.id,
       aws_api_gateway_integration.proxy.id,
+      aws_api_gateway_vpc_link.main.id,
+      data.aws_lb.api_nlb.arn,
     ]))
   }
 }

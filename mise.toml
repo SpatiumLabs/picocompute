@@ -79,6 +79,10 @@ run = "terraform -chdir=infra/aws/staging init -backend-config=backend.s3.hcl"
 description = "Initialize production with Cloudflare R2 backend"
 run = "terraform -chdir=infra/aws/production init -backend-config=backend.s3.hcl"
 
+[tasks."infra:bootstrap:staging"]
+description = "Create the staging ECR repository before pushing the API image"
+run = "terraform -chdir=infra/aws/staging apply -target=module.eks.aws_ecr_repository.api"
+
 [tasks."infra:plan:staging"]
 description = "Plan staging Terraform"
 run = "terraform -chdir=infra/aws/staging plan"

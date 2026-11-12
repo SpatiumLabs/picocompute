@@ -60,6 +60,8 @@ write_files:
       cat >"/etc/pico/host-agent.env" <<EOF_ENV
       PICO_RUNTIME=$RUNTIME
       PICO_PUBLIC_HOST=$DOMAIN_NAME
+      PICO_CELL_ID=${cell_id}
+      PICO_REGION=${region}
       PICO_IDLE_TIMEOUT_SECS=$IDLE_TIMEOUT_SECS
       PICO_WORKSPACE_ROOT=/var/lib/pico/workspaces
       PICO_IMAGE_DIR=$PICO_IMAGE_DIR

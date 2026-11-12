@@ -50,8 +50,12 @@ async fn main() -> Result<()> {
                 export_interval_secs: 60,
                 resource_attributes: vec![
                     ("host_id".to_string(), config.identity.host_id.clone()),
-                    ("cell_id".to_string(), config.identity.cell_id.clone()),
+                    ("cell".to_string(), config.identity.cell_id.clone()),
                     ("region".to_string(), config.identity.region.clone()),
+                    (
+                        "service.instance.id".to_string(),
+                        config.identity.host_id.clone(),
+                    ),
                 ],
             },
             tracing: pico_telemetry::TracingSettings {

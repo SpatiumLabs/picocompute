@@ -3,9 +3,6 @@ data "aws_caller_identity" "current" {}
 
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
-  # CoreDNS and the AWS Load Balancer Controller addon run in kube-system.
-  # A Fargate-only cluster leaves those pods Pending without this selector.
-  fargate_namespaces = distinct(concat(var.fargate_namespaces, ["kube-system"]))
 }
 
 # --- IAM: EKS Cluster Role ---
@@ -94,7 +91,7 @@ resource "aws_eks_cluster" "main" {
   ]
 }
 
-# --- Fargate Profile ---
+# --- Fargate Profiles ---
 
 resource "aws_eks_fargate_profile" "api" {
   cluster_name           = aws_eks_cluster.main.name
@@ -103,10 +100,27 @@ resource "aws_eks_fargate_profile" "api" {
   subnet_ids             = var.private_subnet_ids
 
   dynamic "selector" {
-    for_each = local.fargate_namespaces
+    for_each = var.fargate_namespaces
     content {
       namespace = selector.value
     }
+  }
+
+  tags = var.common_tags
+}
+
+# CoreDNS and the AWS Load Balancer Controller addon run in kube-system.
+# A Fargate-only cluster leaves those pods Pending without a selector.
+# Keep this profile separate from the api profile: selectors are ForceNew,
+# so mixing them would replace the profile that runs the API pods.
+resource "aws_eks_fargate_profile" "system" {
+  cluster_name           = aws_eks_cluster.main.name
+  fargate_profile_name   = "system"
+  pod_execution_role_arn = aws_iam_role.fargate.arn
+  subnet_ids             = var.private_subnet_ids
+
+  selector {
+    namespace = "kube-system"
   }
 
   tags = var.common_tags
@@ -120,7 +134,10 @@ resource "aws_eks_addon" "vpc_cni" {
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"
 
-  depends_on = [aws_eks_fargate_profile.api]
+  depends_on = [
+    aws_eks_fargate_profile.api,
+    aws_eks_fargate_profile.system,
+  ]
 }
 
 resource "aws_eks_addon" "coredns" {
@@ -129,7 +146,10 @@ resource "aws_eks_addon" "coredns" {
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"
 
-  depends_on = [aws_eks_fargate_profile.api]
+  depends_on = [
+    aws_eks_fargate_profile.api,
+    aws_eks_fargate_profile.system,
+  ]
 }
 
 resource "aws_eks_addon" "kube_proxy" {
@@ -138,7 +158,10 @@ resource "aws_eks_addon" "kube_proxy" {
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"
 
-  depends_on = [aws_eks_fargate_profile.api]
+  depends_on = [
+    aws_eks_fargate_profile.api,
+    aws_eks_fargate_profile.system,
+  ]
 }
 
 resource "aws_eks_addon" "lb_controller" {
@@ -150,6 +173,7 @@ resource "aws_eks_addon" "lb_controller" {
 
   depends_on = [
     aws_eks_fargate_profile.api,
+    aws_eks_fargate_profile.system,
     aws_iam_role_policy.lb_controller,
   ]
 }
