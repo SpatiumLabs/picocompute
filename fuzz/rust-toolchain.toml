@@ -1,0 +1,8 @@
+# Fuzz targets must build with a nightly toolchain: cargo-fuzz passes -Z
+# flags (libFuzzer instrumentation, sanitizers) that a stable toolchain
+# rejects. This file scopes nightly to the fuzz crate only and overrides
+# the repo-root stable pin for anything built under fuzz/. Keep the
+# workspace root toolchain untouched.
+[toolchain]
+channel = "nightly"
+profile = "minimal"

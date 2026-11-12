@@ -36,3 +36,7 @@ jobs:
         uses: rustsec/audit-check@main
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Vulnerability-level exceptions; keep in sync with .cargo/audit.toml.
+          # RUSTSEC-2026-0459 is tracked in .cargo/audit.toml; passing it here
+          # keeps the check green even if this action only honors its input.
+          ignore: RUSTSEC-2026-0459

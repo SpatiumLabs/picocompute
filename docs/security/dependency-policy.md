@@ -44,7 +44,9 @@ mirrors them for review.
 |---|---|---|---|
 | `RUSTSEC-2024-0388` (`derivative` 2.2.0 unmaintained, transitive via `pingora-core`) | No safe upgrade available; pingora has not migrated | Security | 2027-01-01 |
 | `RUSTSEC-2023-0071` (`rsa` 0.9.10, parity with `.cargo/audit.toml`) | Unused transitive of `ssh-key`; currently not in deny graph, kept for future feature resolution | Security | 2027-01-01 |
-| `RUSTSEC-2024-0437` (`protobuf` 2.x, parity with `.cargo/audit.toml`) | Pingora pins `prometheus` ^0.13 which pins `protobuf` 2.x; metrics-only use, not untrusted input | Security | 2027-01-01 |
+| `RUSTSEC-2024-0437` (`protobuf` 2.x, parity with `.cargo/audit.toml`) | Pingora pins `prometheus` ^0.13 which pins `protobuf` 2.x when that feature is enabled; metrics-only use, not untrusted input. Currently not in the deny graph, kept for future feature resolution | Security | 2027-01-01 |
+| `RUSTSEC-2024-0449` (`unsafe-libyaml` 0.2.11 unmaintained, transitive via `pingora-core` -> `serde_yaml`) | No safe upgrade available; pingora-core 0.9.x (latest) still requires `serde_yaml` 0.9; parses trusted local pingora config only | Security | 2027-01-01 |
+| `RUSTSEC-2026-0459` (`libsqlite3-sys` 0.38.x bundles SQLite < 3.54.0, CVE-2026-119375, CVSS 6.8 MEDIUM) | Fix needs `>=0.39.0` but `sqlx-sqlite` 0.9.0 caps the range at `<0.38.0`; upgrade `sqlx` when it widens the range. Exposure limited to locally opened less-trusted db+wal pairs | Security | 2026-12-01 |
 | License `WTFPL` allowed globally | `tun` 0.8.14 (direct dep of `pico-network-agent`) is WTFPL-only; replace `tun` to narrow | Security | 2027-01-01 |
 | `multiple-versions = warn` (43 duplicates) | Upstream-only duplicates from `pingora`/`hickory` trees; promote to `deny` after triage | Security | 2027-01-01 |
 | `openssl`/`openssl-sys` banned | Security policy: use `rustls`/`ring`/`boring` instead | Security | 2027-01-01 |
