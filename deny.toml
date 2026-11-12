@@ -37,8 +37,29 @@ ignore = [
     # RUSTSEC-2024-0437: `protobuf` 2.x crash via uncontrolled recursion.
     # Parity with .cargo/audit.toml. Pingora requires prometheus ^0.13 which
     # pins protobuf 2.x; used only for internal metrics, not untrusted input.
+    # Currently not in the resolved deny graph (kept so a future feature
+    # resolution re-enables the exception), like the rsa entry above.
     # Owner: Security. Next review: 2027-01-01.
     { id = "RUSTSEC-2024-0437", reason = "parity with cargo-audit policy, pingora prometheus pin, metrics-only use" },
+    # RUSTSEC-2024-0449: `unsafe-libyaml` 0.2.11 is unmaintained (repo
+    # archived). Transitive via: pico-edge -> pingora-core 0.9.0 ->
+    # serde_yaml 0.9 -> unsafe-libyaml. No safe upgrade exists and pingora
+    # has not migrated (pingora-core 0.9.x, the latest release, still
+    # requires serde_yaml 0.9). serde_yaml parses only trusted,
+    # locally-authored pingora config, not untrusted input.
+    # Owner: Security. Next review: 2027-01-01.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained transitive via pingora-core serde_yaml, no safe upgrade available" },
+    # RUSTSEC-2026-0459: `libsqlite3-sys` bundles SQLite < 3.54.0; a crafted
+    # database-plus-WAL pair can leak uninitialized memory (CVE-2026-119375,
+    # CVSS 6.8 MEDIUM, local vector). Transitive via: pico-core /
+    # pico-sandboxd / pico-host-agent -> sqlx 0.9.0 -> sqlx-sqlite ->
+    # libsqlite3-sys 0.38.x. Fix needs >=0.39.0 (bundled SQLite 3.54.0) but
+    # sqlx-sqlite 0.9.0 caps the range at <0.38.0, so no compatible release
+    # exists yet. Upgrade sqlx as soon as it widens the libsqlite3-sys
+    # range; exposure is limited to locally-opened less-trusted db+wal
+    # pairs against the bundled build.
+    # Owner: Security. Next review: 2026-12-01.
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys via sqlx 0.9.0 range cap, fix needs sqlx widening to >=0.39.0" },
 ]
 
 [licenses]
