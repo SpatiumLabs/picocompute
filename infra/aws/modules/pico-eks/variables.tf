@@ -32,7 +32,7 @@ variable "common_tags" {
 }
 
 variable "fargate_namespaces" {
-  description = "Kubernetes namespaces for the Fargate profile."
+  description = "Workload namespaces for the api Fargate profile. A separate system profile always selects kube-system so CoreDNS and the load balancer controller can schedule."
   type        = list(string)
   default     = ["api"]
 }
