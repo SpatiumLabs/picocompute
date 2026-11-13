@@ -18,4 +18,13 @@ ignore = [
     # needs >=0.39.0, so no compatible release exists yet. Upgrade sqlx when it
     # widens the range. cargo-deny carries the same exception in deny.toml.
     "RUSTSEC-2026-0459",
+    # RUSTSEC-2026-0387: crypto-bigint < 0.7.6 has constant-time timing
+    # variability issues. Lockfile-only entry via ssh-key 0.6.7 -> p256/p384/p521
+    # 0.13.x -> elliptic-curve 0.13.8, which pins crypto-bigint ^0.5. None of
+    # the workspace crates enable those ssh-key features, so the crate is
+    # never compiled (absent from the cargo-deny graph). Fix requires the
+    # major-version chain ssh-key 0.7 -> p-curves 0.14 -> elliptic-curve 0.14;
+    # upgrade when ssh-key ships it. Tracked as an exception in deny.toml and
+    # docs/security/dependency-policy.md.
+    "RUSTSEC-2026-0387",
 ]
