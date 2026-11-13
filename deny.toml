@@ -60,6 +60,18 @@ ignore = [
     # pairs against the bundled build.
     # Owner: Security. Next review: 2026-12-01.
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys via sqlx 0.9.0 range cap, fix needs sqlx widening to >=0.39.0" },
+    # RUSTSEC-2026-0387: `crypto-bigint` < 0.7.6 constant-time timing
+    # variability. Lockfile-only optional chain of ssh-key 0.6.7 ->
+    # p256/p384/p521 0.13.x -> elliptic-curve 0.13.8, which pins
+    # crypto-bigint ^0.5. Parity with cargo-audit policy: no workspace crate
+    # enables those ssh-key features, so the crate is never compiled and the
+    # advisory does not match the deny graph (kept so a future feature
+    # resolution re-enables the exception, like the rsa entry above).
+    # Real fix needs the major-version chain ssh-key 0.7 -> p-curves 0.14 ->
+    # elliptic-curve 0.14 (crypto-bigint >=0.7.6); upgrade when ssh-key
+    # ships it.
+    # Owner: Security. Next review: 2026-12-01.
+    { id = "RUSTSEC-2026-0387", reason = "parity with cargo-audit policy, lockfile-only optional chain of ssh-key, not in deny graph" },
 ]
 
 [licenses]
