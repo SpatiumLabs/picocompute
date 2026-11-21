@@ -33,7 +33,6 @@ infra/**/*.tfstate
 infra/**/*.tfstate.backup
 infra/**/.terraform.tfstate.lock.info
 infra/**/*.tfvars
-!infra/**/terraform.tfvars.example
-infra/**/backend.r2.hcl
+!infra/**/terraform.tfvars.sample
 **/*-key
 **/*.pub

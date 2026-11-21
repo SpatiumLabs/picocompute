@@ -4,18 +4,18 @@ output "vpc_id" {
 }
 
 output "eks_cluster_name" {
-  description = "EKS cluster name (shared with production)."
-  value       = data.aws_eks_cluster.main.name
+  description = "EKS cluster name (dedicated staging cluster)."
+  value       = module.eks.cluster_name
 }
 
 output "eks_cluster_endpoint" {
   description = "EKS cluster API server endpoint."
-  value       = data.aws_eks_cluster.main.endpoint
+  value       = module.eks.cluster_endpoint
 }
 
 output "ecr_repository_url" {
   description = "ECR repository URL for the API container image."
-  value       = data.aws_ecr_repository.api.repository_url
+  value       = module.eks.ecr_repository_url
 }
 
 output "artifact_bucket" {
@@ -91,4 +91,14 @@ output "guardduty_detector_id" {
 output "cloudtrail_arn" {
   description = "CloudTrail ARN."
   value       = try(aws_cloudtrail.main[0].arn, null)
+}
+
+output "api_url" {
+  description = "API Gateway stage URL."
+  value       = aws_api_gateway_stage.main.invoke_url
+}
+
+output "api_custom_domain" {
+  description = "Custom domain for the API."
+  value       = var.domain_name
 }

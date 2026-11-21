@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
         RunEnv::Production => "warn,pico_api=info,tower_http=info",
     };
 
+    let otlp_endpoint = otlp_endpoint_from_env();
     let telemetry_config = pico_telemetry::TelemetryConfig {
         settings: &pico_telemetry::TelemetrySettings {
             log: pico_telemetry::LogSettings {
@@ -41,9 +42,25 @@ async fn main() -> Result<()> {
             },
             metrics: pico_telemetry::MetricsSettings {
                 service_name: "pico-api".to_string(),
-                ..Default::default()
+                otlp_endpoint: otlp_endpoint.clone(),
+                export_interval_secs: 60,
+                resource_attributes: vec![
+                    (
+                        "environment".to_string(),
+                        pico_api::telemetry_environment(config.run_env),
+                    ),
+                    ("cell".to_string(), pico_api::telemetry_cell_id()),
+                    ("region".to_string(), pico_api::telemetry_region()),
+                    (
+                        "service.instance.id".to_string(),
+                        pico_api::telemetry_instance_id(),
+                    ),
+                ],
             },
-            ..Default::default()
+            tracing: pico_telemetry::TracingSettings {
+                otlp_endpoint: tracing_endpoint_from_env(&otlp_endpoint),
+                sample_rate: 1.0,
+            },
         },
     };
 
@@ -150,10 +167,12 @@ async fn build_state(config: &AppConfig) -> Result<Arc<dyn SandboxService>> {
 /// Generous static capacity so local development keeps admitting without
 /// host reports.
 fn seed_stub_registry(gate: &Arc<PlacementGate>) {
+    let cell_id = pico_api::telemetry_cell_id();
+    let region = pico_api::telemetry_region();
     let registry = gate.registry();
     registry.upsert_cell(CellInfo {
-        cell_id: CellId::from_string("cel_default"),
-        region_id: RegionId::from_string("default-region"),
+        cell_id: CellId::from_string(&cell_id),
+        region_id: RegionId::from_string(&region),
         health: CellHealth::Healthy,
         capacity: CellCapacity {
             total_vcpus: 64,
@@ -165,7 +184,7 @@ fn seed_stub_registry(gate: &Arc<PlacementGate>) {
             be_pool: None,
         },
         supported_runtimes: vec![RuntimeType::Firecracker, RuntimeType::Qemu],
-        failure_domain: "fd-cel_default".into(),
+        failure_domain: format!("fd-{cell_id}"),
         cache: CacheLocality {
             cached_images: Vec::new(),
             cached_snapshots: Vec::new(),
@@ -176,8 +195,8 @@ fn seed_stub_registry(gate: &Arc<PlacementGate>) {
     gate.report_host(
         &HostCapacityReport {
             host_id: "hst_stub".into(),
-            cell_id: "cel_default".into(),
-            region: Some("default-region".into()),
+            cell_id: cell_id.clone(),
+            region: Some(region.clone()),
             health: HostHealth::Healthy,
             capacity: HostCapacity {
                 total_vcpus: 32,
@@ -309,4 +328,21 @@ fn print_app_info(config: &AppConfig) {
         config.bind_addr,
         config.runtime
     );
+}
+
+/// OTLP gRPC collector endpoint. Empty means no export (local dev default).
+/// Must include an explicit scheme; use `http://` for plaintext collectors.
+fn otlp_endpoint_from_env() -> String {
+    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Span export uses the metrics endpoint unless `OTEL_TRACES_EXPORTER=none`.
+/// Staging has a metrics-only collector, so it sets that to avoid retry storms.
+fn tracing_endpoint_from_env(metrics_endpoint: &str) -> String {
+    match std::env::var("OTEL_TRACES_EXPORTER") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("none") => String::new(),
+        _ => metrics_endpoint.to_string(),
+    }
 }

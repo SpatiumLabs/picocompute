@@ -18,9 +18,26 @@ pip install diagrams
 python infra/docs/diagrams/aws-architecture.py
 ```
 
-### Staging on Production EKS
+### Staging on Dedicated EKS
 
-Staging reuses the production EKS cluster (discovered via `data.aws_eks_cluster`) with namespace `api-stg`. This saves ~$72/month but creates a coupling risk — a production EKS outage affects staging. For isolated staging, deploy a dedicated EKS cluster.
+Staging runs a dedicated EKS cluster (`picocompute-staging`) with namespace `api` and its own ECR repository (`picocompute-api-staging`). Production no longer hosts the staging namespace after cutover. API images are pinned per revision (`${ecr_url}:${var.commit}`); CI must push that tag before apply. The API token is read from SSM at pod start via IRSA (`PICO_API_TOKEN_FILE`); Terraform does not decrypt it into state.
+
+### Bootstrap staging ECR
+
+The API deployment uses an immutable revision tag, so the staging ECR repository must exist before the first full apply:
+
+1. Create the repository without creating the cluster or API deployment: `mise run infra:bootstrap:staging`
+2. Build and push `${ecr_url}:${commit}` (CI does this normally). Read the URL with `terraform -chdir=infra/aws/staging output -raw ecr_repository_url`.
+3. Run the full apply: `mise run infra:apply:staging`
+
+The targeted bootstrap apply manages only `module.eks.aws_ecr_repository.api`; the full apply later creates the cluster and pulls the tag pushed in step 2.
+
+### Cut over from shared staging
+
+Staging state used to own namespace `api-stg` on the production cluster. Applying the staging root module retargets the Kubernetes provider at the new cluster, so Terraform will not delete those objects. Production keeps `api-stg` in its Fargate selectors permanently: selecting a namespace that no longer exists has no effect, and a stable selector list avoids replacing the profile that runs the production API.
+
+1. Apply staging and confirm the new API and collector are healthy.
+2. Delete the old namespace: `scripts/retire-shared-staging.sh`
 
 ### Architecture Evolution
 
@@ -118,12 +135,18 @@ Each environment directory is a standalone Terraform root module with its own st
 | API runtime | EKS Fargate (256m CPU / 512 MiB) | EKS Fargate (256m CPU / 512 MiB) |
 | API entry | REST API Gateway → VPC Link → NLB | REST API Gateway → VPC Link → NLB |
 | API desired count | 1 | 2 |
-| EKS cluster | Shared with production | Dedicated pico-production |
+| EKS cluster | Dedicated pico-staging | Dedicated pico-production |
+| ECR repository | Dedicated pico-api-staging (`:${var.commit}`) | Dedicated pico-api-production (`:${var.commit}`) |
 | Compute host instance | `m7i-flex.large` (spot) | `m7i.4xlarge` (spot) |
 | Compute ASG sizing | 1/1/3 | 1/1/9 |
 | Database | Aurora Serverless v2 (0.5-4 ACU) | Aurora PostgreSQL 18 (2 instances) |
 | NAT Gateway | Regional | Regional |
 | VPC CIDR | `10.1.0.0/16` | `10.0.0.0/16` |
+| Observability | kube-prometheus-stack + OTel collector (`monitoring` ns) | CloudWatch only |
+
+## Observability (staging)
+
+Staging deploys `kube-prometheus-stack` (chart 77.0.0) and `opentelemetry-collector` (chart 0.122.0) into namespace `monitoring` when `enable_observability=true`. A dedicated `system` Fargate profile always includes `kube-system` so CoreDNS and the load balancer controller can schedule; the workload profile keeps only application namespaces (production `api` and `api-stg`, staging `api` and `monitoring`). Grafana dashboards load from `o11y/*.json` via ConfigMap. Recording rules from `o11y/rules/pico-recording-rules.yaml` are installed by the kube-prometheus-stack chart (not a standalone manifest, which cannot plan before the CRD exists). The collector is metrics-only: OTLP metrics are exposed on `:8889` and scraped by a ServiceMonitor. Span export is disabled (`OTEL_TRACES_EXPORTER=none`). API and host-agent resources carry `cell`, `region`, and `service.instance.id`; the collector promotes resource attributes to Prometheus labels so replicas and hosts stay distinct. `pico-api` exports OTLP to `var.otel_endpoint` (ClusterIP DNS, in-cluster) only when observability is enabled. Compute hosts export via an internal IP-mode NLB (`${project}-staging-otel:4317`). The controller opens the pod security group to that NLB; the internal scheme allows the VPC CIDR. Empty endpoint keeps local no-export.
 
 ## Prerequisites
 
@@ -151,27 +174,21 @@ aws ssm put-parameter --region us-east-1 --name /pico/staging/github-deploy-key 
 
 ### Cloudflare R2 Backend
 
-Create a Cloudflare R2 API token with object read/write access. Store it in a separate AWS credentials profile:
+Create a Cloudflare R2 API token with object read/write access. Store it in an AWS credentials profile named `r2`, which is what the tracked backend files reference:
 
 ```ini
-[cloudflare-r2]
+[r2]
 aws_access_key_id = <r2-access-key-id>
 aws_secret_access_key = <r2-secret-access-key>
 ```
 
-Copy the per-environment backend config and set your Cloudflare account ID:
-
-```bash
-cp infra/aws/production/backend.s3.hcl infra/aws/production/backend.r2.hcl
-```
-
-Edit the `backend.r2.hcl` per environment:
+Each environment has a tracked `backend.s3.hcl` with its own state key and the R2 endpoint. If you fork the repository for another Cloudflare account, update the `bucket` and `endpoints` values in both files. The remaining settings are:
 
 ```hcl
-bucket = "pico-terraform-state"
-key    = "aws/production/terraform.tfstate"
-region = "auto"
-profile = "cloudflare-r2"
+bucket  = "pico-terraform-state"
+key     = "aws/production/terraform.tfstate"
+region  = "auto"
+profile = "r2"
 shared_credentials_files = ["~/.aws/credentials"]
 endpoints = {
   s3 = "https://<cloudflare-account-id>.r2.cloudflarestorage.com"
@@ -185,11 +202,15 @@ Note the state key path includes the environment name (`aws/production/` or `aws
 ```bash
 cd infra/aws/production  # or infra/aws/staging
 
+# Copy and fill inputs (no secrets in the sample)
+cp terraform.tfvars.sample terraform.tfvars
+# Edit commit, domain_name, cloudflare_zone_id, token param, sizing
+
 # Initialize with backend config
-terraform init -backend-config=backend.r2.hcl
+terraform init -backend-config=backend.s3.hcl
 
 # Create or migrate state
-terraform init -backend-config=backend.r2.hcl -migrate-state
+terraform init -backend-config=backend.s3.hcl -migrate-state
 
 # Review the plan
 terraform fmt && terraform validate && terraform plan

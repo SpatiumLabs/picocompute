@@ -135,3 +135,21 @@ variable "alarm_sns_topic_arn" {
   type        = string
   default     = ""
 }
+
+variable "otel_endpoint" {
+  description = "OTLP gRPC endpoint for host-agent export. Empty means no export."
+  type        = string
+  default     = ""
+}
+
+variable "cell_id" {
+  description = "Cell identifier exported to the host agent as PICO_CELL_ID."
+  type        = string
+  default     = "default-cell"
+}
+
+variable "region" {
+  description = "Region identifier exported to the host agent as PICO_REGION. Empty uses the provider region."
+  type        = string
+  default     = ""
+}
