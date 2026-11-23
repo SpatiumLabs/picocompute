@@ -34,13 +34,6 @@ ignore = [
     # kept so a future feature resolution re-enables the exception.
     # Owner: Security. Next review: 2027-01-01.
     { id = "RUSTSEC-2023-0071", reason = "parity with cargo-audit policy, unused transitive of ssh-key" },
-    # RUSTSEC-2024-0437: `protobuf` 2.x crash via uncontrolled recursion.
-    # Parity with .cargo/audit.toml. Pingora requires prometheus ^0.13 which
-    # pins protobuf 2.x; used only for internal metrics, not untrusted input.
-    # Currently not in the resolved deny graph (kept so a future feature
-    # resolution re-enables the exception), like the rsa entry above.
-    # Owner: Security. Next review: 2027-01-01.
-    { id = "RUSTSEC-2024-0437", reason = "parity with cargo-audit policy, pingora prometheus pin, metrics-only use" },
     # RUSTSEC-2024-0449: `unsafe-libyaml` 0.2.11 is unmaintained (repo
     # archived). Transitive via: pico-edge -> pingora-core 0.9.0 ->
     # serde_yaml 0.9 -> unsafe-libyaml. No safe upgrade exists and pingora
